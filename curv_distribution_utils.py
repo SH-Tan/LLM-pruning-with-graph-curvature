@@ -68,7 +68,7 @@ def _min_reduce_blocks(blocks):
     return np.minimum.reduce([np.asarray(b, dtype=np.float64) for b in blocks])
 
 
-def _build_node_distribution(node_tensor, node_name, alpha, eps=1e-7):
+def _build_node_distribution(node_tensor, node_name, alpha, eps=1e-7, l2_norm=False):
     if node_tensor is None or node_tensor.numel() == 0:
         return None
 
@@ -79,6 +79,9 @@ def _build_node_distribution(node_tensor, node_name, alpha, eps=1e-7):
                 f"Expected batch size 1 for node tensor, got shape {tuple(node_tensor.shape)}"
             )
         node_tensor = node_tensor.squeeze(0)
+
+    if l2_norm and node_tensor.dim() == 2:
+        node_tensor = torch.norm(node_tensor, p=2, dim=0, keepdim=True)
 
     node_tensor = _normalize_node_value_per_sequence(node_tensor)
     
@@ -99,3 +102,44 @@ def _build_node_distribution(node_tensor, node_name, alpha, eps=1e-7):
     dist = dist * valid_mask
     
     return dist.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+
+def _build_qk_out_node_distribution(l_name, node, alpha, l2_norm=False):
+    if node is None or node.numel() == 0:
+        return None
+
+    if node.dim() != 4:
+        raise ValueError(
+            f"Expected A node shape [B, q_heads, seq, seq], got {tuple(node.shape)}"
+        )
+
+    if node.shape[0] != 1:
+        raise ValueError(
+            f"Expected batch size 1 for A node, got shape {tuple(node.shape)}"
+        )
+        
+    # [1, q_heads, seq, seq] -> [q_heads, seq, seq]
+    A = node.squeeze(0)
+    
+    q_heads, seq_q, seq_k = A.shape
+    
+    seq = seq_q
+    
+    if l_name == "q_proj":
+        out_node = A.permute(1, 0, 2).contiguous()
+        out_node = out_node.view(seq, q_heads * seq)
+    
+    elif l_name == "k_proj":
+        out_node = A.transpose(-1, -2).permute(1, 0, 2).contiguous()
+        out_node = out_node.view(seq, q_heads * seq)
+        
+    else:
+        raise ValueError(f"Unsupported l_name={l_name}")
+    
+    return _build_node_distribution(
+        out_node,
+        node_name=f"{l_name}_A_out",
+        alpha=alpha,
+        l2_norm=l2_norm,
+    )

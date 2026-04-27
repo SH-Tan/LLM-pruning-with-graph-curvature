@@ -212,5 +212,7 @@ def _make_lm_head_op(model, final_hidden):
     final_hidden = final_hidden.to(lm_head_device, non_blocking=True)
     logits = model.lm_head(final_hidden)
     probs = torch.softmax(logits.float(), dim=-1).detach().cpu()
+    result = {"lm_head": probs}
+    del final_hidden, logits, probs
 
-    return {"lm_head": probs}
+    return result

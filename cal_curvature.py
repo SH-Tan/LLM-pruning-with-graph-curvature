@@ -8,6 +8,7 @@ from curv_distribution_utils import (
     _build_node_distribution,
     _edge_distribution,
     _min_reduce_blocks,
+    _build_qk_out_node_distribution
 )
 
 from curv_sequence_utils import (
@@ -491,7 +492,9 @@ def compute_op_curvature(
     seq_len = 1,
     num_q_heads=0, num_kv_heads=0, head_dim=0, repeat=0,
     sample_edge_num = -1,
+    sample_edge_ratio = 1.,
     dataset_name="unknown_dataset",
+    l2_norm=False,
 ):
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
@@ -547,6 +550,7 @@ def compute_op_curvature(
             graph_data["prev_in"],
             graph_data["prev_in_name"],
             alpha,
+            l2_norm=l2_norm,
         )
     
     # if is q, k, v, the next is A or attention out     
@@ -555,8 +559,19 @@ def compute_op_curvature(
             graph_data["next_out"],
             graph_data["next_out_name"],
             alpha,
+            l2_norm=l2_norm,
         ) # [batch, seq, hidden size]
-
+        
+    
+    # build q_proj,k_proj next distribution
+    if (short_name in ["q_proj", "k_proj"]) and (graph_data["next_out"] is not None):
+        next_out_distribution = _build_qk_out_node_distribution(
+            short_name,
+            graph_data["next_out"],
+            alpha,
+            l2_norm=l2_norm,
+        )
+  
     _SHARED_CURR_DIST = curr_dist
     _SHARED_SP = sp
     _SHARED_ALPHA = alpha
@@ -582,11 +597,6 @@ def compute_op_curvature(
         seq_len=seq_len,
         dataset_name=dataset_name,
     )
-    analysis_utils.start_sample_section(
-        analysis_path=analysis_path,
-        sample_idx=sample_idx,
-    )
-
     precomputed_prev_dists = None
     precomputed_next_dists = None
     
@@ -606,7 +616,12 @@ def compute_op_curvature(
             # )
             
             # node distribution for all seq w/o mask
-            precomputed_next_dists = _precompute_vproj_next_distributions(value_map, graph_data["next_out_name"], alpha)
+            precomputed_next_dists = _precompute_vproj_next_distributions(
+                value_map,
+                graph_data["next_out_name"],
+                alpha,
+                l2_norm=l2_norm,
+            )
       
             # x -> Q -> A -> out
             v_cost = operations.get("v_proj", None)
@@ -629,7 +644,7 @@ def compute_op_curvature(
                 graph_data["prev_in"], in_dim, seq_len, head_dim, repeat
             )
             precomputed_prev_dists = _precompute_oproj_prev_distributions(
-                value_map, seq_len, graph_data["prev_in_name"], alpha
+                value_map, seq_len, graph_data["prev_in_name"], alpha, l2_norm=l2_norm
             )
     
     ctx = get_context("fork")
@@ -653,12 +668,20 @@ def compute_op_curvature(
     seq_next_metas, next_seq_shms = _to_shared_seq_metas(precomputed_next_dists)
     seq_owned_shms = prev_seq_shms + next_seq_shms
     
-    # select edge if sample_edge_num > 0
-    if sample_edge_num > 0 and len(finite_edges) > 0:
+    # Select by ratio first, then optionally cap with sample_edge_num.
+    if len(finite_edges) > 0:
         seed = 13
         rng = np.random.default_rng(seed)
-        selected_idx = rng.choice(len(finite_edges), size=sample_edge_num, replace=False)
-        finite_edges = finite_edges[np.sort(selected_idx)]
+
+        if sample_edge_ratio < 1.0:
+            ratio_edge_num = max(1, int(len(finite_edges) * sample_edge_ratio))
+            ratio_edge_num = min(ratio_edge_num, len(finite_edges))
+            selected_idx = rng.choice(len(finite_edges), size=ratio_edge_num, replace=False)
+            finite_edges = finite_edges[np.sort(selected_idx)]
+
+        if sample_edge_num > 0 and sample_edge_num < len(finite_edges):
+            selected_idx = rng.choice(len(finite_edges), size=sample_edge_num, replace=False)
+            finite_edges = finite_edges[np.sort(selected_idx)]
     
     print(
         f'op = {short_name}, sample = {sample_idx}, seq = {seq_len}, '
@@ -669,6 +692,8 @@ def compute_op_curvature(
     mu_len_total = 0.0
     nu_len_total = 0.0
     mu_nu_count = 0
+    cost_has_inf = False
+    cost_inf_count = 0
     
     t1 = time.time()
     
@@ -684,7 +709,6 @@ def compute_op_curvature(
                 seq_v_parts = []
                 seq_u_parts = []
                 seq_curv_parts = []
-                seq_edge_results = []
 
                 for edge_res in pool.imap_unordered(_compute_edge_with_seq, task_iter, chunksize=1):
                     if not edge_res:
@@ -699,7 +723,8 @@ def compute_op_curvature(
                     mu_len_total += float(edge_res["mu_len"])
                     nu_len_total += float(edge_res["nu_len"])
                     mu_nu_count += 1
-                    seq_edge_results.append(edge_res)
+                    cost_has_inf = cost_has_inf or bool(edge_res["cost_has_inf"])
+                    cost_inf_count += int(edge_res["cost_inf_count"])
 
                 if seq_v_parts:
                     seq_v_idx = torch.tensor(seq_v_parts, dtype=torch.long)
@@ -711,11 +736,6 @@ def compute_op_curvature(
                         seq_curv_vals,
                     )
 
-                analysis_utils.append_edge_curvature_details(
-                    analysis_path=analysis_path,
-                    sample_idx=sample_idx,
-                    edge_results=seq_edge_results,
-                )
     finally:
         for shm in seq_owned_shms:
             shm.close()
@@ -740,6 +760,8 @@ def compute_op_curvature(
         avg_nu_len=avg_nu_len,
         curr_dist_finite_edges=curr_dist_finite_edges,
         curr_dist_infinite_edges=curr_dist_infinite_edges,
+        cost_has_inf=cost_has_inf,
+        cost_inf_count=cost_inf_count,
     )
 
     # curvature = _merge_gqa_curvature(curvature, model, layer_id, short_name)

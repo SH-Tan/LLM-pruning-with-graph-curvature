@@ -128,6 +128,8 @@ def _safe_inverse_abs(arr):
     return inv.detach().cpu().numpy().astype("float32", copy=False)
 
 
+
+# TODO A with mask
 def _precompute_vproj_next_distributions(value_map, seq_len, repeat, node_name, alpha):
     out = []
     for s in range(seq_len):
@@ -138,18 +140,18 @@ def _precompute_vproj_next_distributions(value_map, seq_len, repeat, node_name, 
         out.append(_build_node_distribution(masked, node_name, alpha))
     return out
 
-
-def _precompute_vproj_next_distributions(value_map, node_name, alpha):
-    out = _build_node_distribution(value_map, node_name, alpha)
+# A without mask
+def _precompute_vproj_next_distributions(value_map, node_name, alpha, l2_norm=False):
+    out = _build_node_distribution(value_map, node_name, alpha, l2_norm=l2_norm)
     return out
 
 
 
-def _precompute_oproj_prev_distributions(value_map, seq_len, node_name, alpha):
+def _precompute_oproj_prev_distributions(value_map, seq_len, node_name, alpha, l2_norm=False):
     out = []
     for s in range(seq_len):
         masked = masked_oproj_value_map_for_seq(value_map, s, seq_len)
-        out.append(_build_node_distribution(masked, node_name, alpha))
+        out.append(_build_node_distribution(masked, node_name, alpha, l2_norm=l2_norm))
     return out
 
 
@@ -166,5 +168,3 @@ def _build_att_out_to_o_cost(a, s_out, out_idx, head_dim):
     q_head = out_idx // head_dim
     block = _safe_inverse_abs(a[0, q_head, s_out, :])
     return block.reshape(-1)
-
-

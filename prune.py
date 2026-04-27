@@ -10,6 +10,7 @@ from layerwrapper_curv import collect_layer_data, _make_lm_head_op
 from cal_curvature import compute_op_curvature
 from curv_tensor_utils import build_layer_cache
 from curv_shortest_path_utils import build_shortest_path_cache
+import curv_analysis_utils as analysis_utils
 
 
 def find_layers(module, layers=[nn.Linear], name=''):
@@ -217,7 +218,7 @@ def _curvature_save_metadata(args):
         "seed": getattr(args, "seed", None),
         "nsamples": getattr(args, "nsamples", None),
         "alpha": getattr(args, "alpha", None),
-        "sparsity_ratio": getattr(args, "sparsity_ratio", None),
+        "l2_norm": getattr(args, "l2_norm", False),
         "prune_method": getattr(args, "prune_method", None),
     }
 
@@ -402,7 +403,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
     # target_ops = ["prev_down_proj", "q_proj", "k_proj", "v_proj",
     #               "o_proj", "gate_proj", "up_proj", "down_proj"]
     
-    target_ops = ["v_proj"]
+    target_ops = ["q_proj", "k_proj"]
     last_layer_idx = len(layers) - 1
 
     # Store masks and curvature
@@ -438,7 +439,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
         }
         modules_items = list(op_modules.items())
         has_down_proj_target = "down_proj" in op_modules
-
+        
         for short, module in modules_items:
             W = module.weight
             module.min_curvature = torch.full_like(W, float("inf"), device="cpu")
@@ -464,7 +465,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
             x_out = x_out.detach().cpu()
             
             print(f'Finish getting layer data!!!')
-
+            
             if prev_layer_outputs[j] is not None:
                 for name in ["o_proj", "gate_up_out", "down_proj"]:
                     if name in prev_layer_outputs[j]:
@@ -477,6 +478,9 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 layer_cache = build_layer_cache(model, operations, i, layer_cache, device=compute_device)
 
                 for short, _ in modules_items:
+                    if short in {"q_proj", "k_proj"}:
+                        continue
+                    
                     build_shortest_path_cache(
                         operations=operations,
                         layer_cache=layer_cache,
@@ -502,6 +506,11 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         sp_cache=sp_cache,
                         device=compute_device,
                     )
+                    # The CPU shortest-path cache is all we need after this point.
+                    # Keeping the lm_head distance matrix on the compute GPU only
+                    # inflates memory on the last layer.
+                    layer_cache.pop("lm_head__dist", None)
+                    torch.cuda.empty_cache()
 
             for short, module in modules_items:
                 if short == "down_proj" and i != last_layer_idx:
@@ -522,7 +531,9 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, 
                     head_dim=head_dim, repeat=repeat,
                     sample_edge_num=args.sample_edge_num,
+                    sample_edge_ratio=args.sample_edge_ratio,
                     dataset_name=args.calib_data,
+                    l2_norm=args.l2_norm,
                 )
 
                 assert curv is not None, f"{short} curv is None"
@@ -552,7 +563,9 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, 
                     head_dim=head_dim, repeat=repeat,
                     sample_edge_num=args.sample_edge_num,
+                    sample_edge_ratio=args.sample_edge_ratio,
                     dataset_name=args.calib_data,
+                    l2_norm=args.l2_norm,
                 )
 
                 assert curv is not None, "prev_down_proj curv is None"
@@ -586,8 +599,15 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     )
                     if save_path is not None:
                         print(f"Saved curvature pkl: {save_path}")
+                    analysis_utils.append_final_curvature_overall(
+                        layer_id=prev_i,
+                        short_name="down_proj",
+                        curvature=model.curvature_scores[prev_i]["down_proj"],
+                        seq_len=model.seqlen,
+                        dataset_name=args.calib_data,
+                    )
 
-            if i == last_layer_idx:
+            if (i == last_layer_idx) and ("lm_head" in target_ops):
                 lm_curv = compute_op_curvature(
                     operations=operations,
                     short_name="lm_head",
@@ -601,7 +621,9 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, 
                     head_dim=head_dim, repeat=repeat,
                     sample_edge_num=args.sample_edge_num,
+                    sample_edge_ratio=args.sample_edge_ratio,
                     dataset_name=args.calib_data,
+                    l2_norm=args.l2_norm,
                 )
                 assert lm_curv is not None, "lm_head curv is None"
 
@@ -626,6 +648,13 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
         for short, module in modules_items:
             model.curvature_scores[i][short] = module.min_curvature
+            analysis_utils.append_final_curvature_overall(
+                layer_id=i,
+                short_name=short,
+                curvature=module.min_curvature,
+                seq_len=model.seqlen,
+                dataset_name=args.calib_data,
+            )
             del module.min_curvature
 
         save_path = save_layer_curvature_pkl(

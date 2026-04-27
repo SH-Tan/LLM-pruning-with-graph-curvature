@@ -1,10 +1,12 @@
 import os
-
 import numpy as np
 import torch
 
 
-def _analysis_file_path(layer_id, short_name, sample_idx, seq_len, dataset_name):
+_AGGREGATE_MARKER = "overall:\n"
+
+
+def _analysis_file_path(layer_id, short_name, seq_len, dataset_name):
     analysis_dir = os.path.join(
         os.path.dirname(__file__),
         "curv_analysis",
@@ -16,7 +18,7 @@ def _analysis_file_path(layer_id, short_name, sample_idx, seq_len, dataset_name)
     return os.path.join(
         analysis_dir,
         f"layer_{int(layer_id):03d}_{short_name}_"
-        f"{safe_dataset_name}_seq_{int(seq_len):04d}_sample_{int(sample_idx):03d}_"
+        f"{safe_dataset_name}_seq_{int(seq_len):04d}_"
         "min_curv_summary.txt",
     )
 
@@ -46,58 +48,51 @@ def _summarize_curvatures(curvature):
     }
 
 
+def _strip_aggregate_footer(content):
+    marker_idx = content.find(_AGGREGATE_MARKER)
+    if marker_idx != -1:
+        return content[:marker_idx].rstrip() + "\n"
+    return content
+
+
+def _write_final_curvature_footer(analysis_path, summary):
+    with open(analysis_path, "r", encoding="utf-8") as f:
+        content = _strip_aggregate_footer(f.read())
+
+    footer = (
+        "\n"
+        f"{_AGGREGATE_MARKER}"
+        + (
+            "source=final_min_curvature_matrix, "
+            f"finite_entries={summary['finite_count']}, "
+            f"positive_edges={summary['positive_count']}, "
+            f"negative_edges={summary['negative_count']}, "
+            f"zero_edges={summary['zero_count']}, "
+            f"min_curv={summary['min_curv']:.8f}, "
+            f"max_curv={summary['max_curv']:.8f}\n"
+        )
+    )
+
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.write(footer)
+
+
 def start_curvature_analysis(layer_id, short_name, sample_idx, curvature_shape, seq_len, dataset_name):
-    analysis_path = _analysis_file_path(layer_id, short_name, sample_idx, seq_len, dataset_name)
+    analysis_path = _analysis_file_path(layer_id, short_name, seq_len, dataset_name)
     header = (
         f"layer_id: {int(layer_id)}\n"
         f"op_name: {short_name}\n"
         f"dataset_name: {dataset_name}\n"
-        f"sample_idx: {int(sample_idx)}\n"
         f"curvature_shape: {tuple(curvature_shape)}\n"
         f"seq_len: {int(seq_len)}\n"
         "\n"
-        "Per-edge curvature details\n"
-        + "=" * 80
-        + "\n"
-        "Fields: sample_idx, seq_idx, edge=[u_idx,v_idx], W_dist, sp_uv, curvature, "
-        "len(mu), len(nu), cost_has_inf, cost_inf_count\n"
-        + "\n"
-        "Final minimum curvature results for each example\n"
-        + "=" * 80
-        + "\n"
     )
 
-    with open(analysis_path, "w", encoding="utf-8") as f:
-        f.write(header)
+    if not os.path.exists(analysis_path):
+        with open(analysis_path, "w", encoding="utf-8") as f:
+            f.write(header)
     return analysis_path
-
-
-def start_sample_section(analysis_path, sample_idx):
-    with open(analysis_path, "a", encoding="utf-8") as f:
-        f.write("\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"Sample {int(sample_idx)}\n")
-        f.write("-" * 80 + "\n")
-
-
-def append_edge_curvature_details(analysis_path, sample_idx, edge_results):
-    if not edge_results:
-        return
-
-    with open(analysis_path, "a", encoding="utf-8") as f:
-        for edge_res in edge_results:
-            f.write(
-                f"sample_idx={int(sample_idx)}, "
-                f"seq_idx={int(edge_res['seq_idx'])}, "
-                f"edge=[{int(edge_res['u_idx'])}, {int(edge_res['v_idx'])}], "
-                f"W_dist={float(edge_res['w_dist']):.8f}, "
-                f"sp_uv={float(edge_res['sp_uv']):.8f}, "
-                f"curvature={float(edge_res['curv']):.8f}, "
-                f"len(mu)={int(edge_res['mu_len'])}, "
-                f"len(nu)={int(edge_res['nu_len'])}, "
-                f"cost_has_inf={bool(edge_res['cost_has_inf'])}, "
-                f"cost_inf_count={int(edge_res['cost_inf_count'])}\n"
-            )
 
 
 def append_final_min_curvature_summary(
@@ -108,6 +103,8 @@ def append_final_min_curvature_summary(
     avg_nu_len,
     curr_dist_finite_edges,
     curr_dist_infinite_edges,
+    cost_has_inf,
+    cost_inf_count,
 ):
     if torch.is_tensor(curvature):
         curvature = curvature.detach().cpu().numpy()
@@ -116,11 +113,15 @@ def append_final_min_curvature_summary(
 
     summary = _summarize_curvatures(curvature)
 
+    with open(analysis_path, "r", encoding="utf-8") as f:
+        content = _strip_aggregate_footer(f.read())
+
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
     with open(analysis_path, "a", encoding="utf-8") as f:
-        f.write("\n")
-        f.write("Sample summary\n")
         f.write(
-            f"sample_idx={int(sample_idx)}, "
+            f"example {int(sample_idx)}: "
             f"curr_dist_finite_edges={int(curr_dist_finite_edges)}, "
             f"curr_dist_infinite_edges={int(curr_dist_infinite_edges)}, "
             f"finite_entries={summary['finite_count']}, "
@@ -129,7 +130,31 @@ def append_final_min_curvature_summary(
             f"zero_edges={summary['zero_count']}, "
             f"avg_len(mu)={float(avg_mu_len):.8f}, "
             f"avg_len(nu)={float(avg_nu_len):.8f}, "
+            f"cost_has_inf={bool(cost_has_inf)}, "
+            f"cost_inf_count={int(cost_inf_count)}, "
             f"min_curv={summary['min_curv']:.8f}, "
             f"max_curv={summary['max_curv']:.8f}\n"
         )
-        f.write("-" * 80 + "\n")
+
+
+def append_final_curvature_overall(layer_id, short_name, curvature, seq_len, dataset_name):
+    if torch.is_tensor(curvature):
+        curvature = curvature.detach().cpu().numpy()
+    else:
+        curvature = np.asarray(curvature)
+
+    analysis_path = _analysis_file_path(layer_id, short_name, seq_len, dataset_name)
+    if not os.path.exists(analysis_path):
+        header = (
+            f"layer_id: {int(layer_id)}\n"
+            f"op_name: {short_name}\n"
+            f"dataset_name: {dataset_name}\n"
+            f"curvature_shape: {tuple(curvature.shape)}\n"
+            f"seq_len: {int(seq_len)}\n"
+            "\n"
+        )
+        with open(analysis_path, "w", encoding="utf-8") as f:
+            f.write(header)
+
+    summary = _summarize_curvatures(curvature)
+    _write_final_curvature_footer(analysis_path, summary)

@@ -1,12 +1,12 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from collections import defaultdict
 import numpy as np
 import random
 import os
 import argparse
-from prune import prune_wanda, prune_magnitude, check_sparsity, find_layers, prune_curvature
-from eval import eval_ppl, eval_zero_shot
+import copy
+from prune import prune_wanda, prune_magnitude, check_sparsity, prune_curvature
+from eval import eval_ppl
 from curv_prune_utils import prune_global_curvature
 
 
@@ -41,6 +41,113 @@ def _is_network_error(exc):
 safe_hf_login()
 
 print('# of gpus: ', torch.cuda.device_count())
+
+
+def _log_path(args):
+    save_dir = os.path.join(args.save, f"seq_len_{args.seqlen}")
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    return os.path.join(save_dir, f"eval_out_{args.prune_method}.txt")
+
+
+def _curvature_dir(args):
+    if args.save is None:
+        return None
+    save_dir = os.path.join(args.save, args.calib_data, f"seq_len_{args.seqlen}")
+    os.makedirs(save_dir, exist_ok=True)
+    return save_dir
+
+
+def _append_curvature_prune_summary(log_path, prune_summary, target_ratio=None, score_order=None):
+    if not prune_summary:
+        return
+
+    total_pruned = sum(row["pruned_edges"] for row in prune_summary)
+    total_edges = sum(row["total_edges"] for row in prune_summary)
+
+    with open(log_path, "a+") as f:
+        summary_header = "\nPruned edges by layer and op"
+        if target_ratio is not None:
+            summary_header += f" (target_sparsity={target_ratio:.4f}"
+            if score_order is not None:
+                summary_header += f", score_order={score_order}"
+            summary_header += ")"
+        print(summary_header, file=f, flush=True)
+        print(
+            f"{'layer':<8}{'op':<16}{'pruned_edges':<18}"
+            f"{'total_edges':<18}",
+            file=f,
+            flush=True,
+        )
+        for row in prune_summary:
+            print(
+                f"{row['layer_idx']:<8}{row['op_name']:<16}"
+                f"{row['pruned_edges']:<18}{row['total_edges']:<18}",
+                file=f,
+                flush=True,
+            )
+        print(
+            f"{'overall':<8}{'all_ops':<16}{total_pruned:<18}"
+            f"{total_edges:<18}",
+            file=f,
+            flush=True,
+        )
+
+
+def _resolve_sparsity_ratios(args):
+    ratios = [float(ratio) for ratio in args.sparsity_ratio]
+    if not ratios:
+        ratios = [0.0]
+
+    deduped = []
+    seen = set()
+    for ratio in ratios:
+        if ratio < 0 or ratio > 1:
+            raise ValueError(f"sparsity_ratio must be in [0, 1], got {ratio}")
+        if ratio not in seen:
+            deduped.append(ratio)
+            seen.add(ratio)
+
+    if args.sparsity_schedule == "low_to_high":
+        deduped.sort()
+    elif args.sparsity_schedule == "high_to_low":
+        deduped.sort(reverse=True)
+
+    return deduped
+
+
+def _format_sparsity_tag(ratio):
+    return f"{ratio:.4f}".rstrip("0").rstrip(".").replace(".", "p") or "0"
+
+
+def _save_model_path(base_path, ratio, total_runs):
+    if not base_path or total_runs <= 1:
+        return base_path
+    return f"{base_path}_sparsity_{_format_sparsity_tag(ratio)}"
+
+
+def _collect_pruned_edge_summary(model):
+    prune_summary = []
+    for layer_idx, layer_masks in enumerate(getattr(model, "removal_mask", [])):
+        for op_name in sorted(layer_masks):
+            keep_mask = layer_masks[op_name]
+            if torch.is_tensor(keep_mask):
+                keep_mask_cpu = keep_mask.detach().cpu().bool()
+            else:
+                keep_mask_cpu = torch.as_tensor(keep_mask, dtype=torch.bool)
+
+            total_edges = int(keep_mask_cpu.numel())
+            kept_edges = int(keep_mask_cpu.sum().item())
+            prune_summary.append(
+                {
+                    "layer_idx": int(layer_idx),
+                    "op_name": op_name,
+                    "pruned_edges": total_edges - kept_edges,
+                    "total_edges": total_edges,
+                }
+            )
+    return prune_summary
+
 
 def get_llm(model_name, cache_dir="llm_weights", device = "cpu", seqlen = "1024"):
     print("Loading model:", model_name)
@@ -84,23 +191,61 @@ def main():
     parser.add_argument('--model', type=str, help='LLaMA model')
     parser.add_argument('--seed', type=int, default=13, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
-    parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
+    parser.add_argument(
+        '--sparsity_ratio',
+        type=float,
+        nargs='+',
+        default=[0.0],
+        help='One or more sparsity levels, e.g. --sparsity_ratio 0.1 0.3 0.5',
+    )
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
     parser.add_argument("--prune_method", type=str, choices=["curvature", "wanda", "magnitude"])
+    parser.add_argument("--use_variant", action="store_true", help="Use the WANDA variant pruning threshold search.")
+    parser.add_argument(
+        "--prune_score_order",
+        type=str,
+        choices=["high_to_low", "low_to_high"],
+        default="high_to_low",
+        help="For score-based pruning, remove highest scores first or lowest scores first.",
+    )
+    parser.add_argument(
+        "--sparsity_schedule",
+        type=str,
+        choices=["input", "low_to_high", "high_to_low"],
+        default="input",
+        help="Order used when sweeping multiple sparsity ratios.",
+    )
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument('--model_device', type=str, default="cuda:0", help='Device for model load.')
     parser.add_argument('--compute_device', type=str, default="cuda:1", help='Device for curvature computing.')
     parser.add_argument('--alpha', type=float, default=0., required=False, help='Alpha used for distribution')
+    parser.add_argument(
+        '--L2-norm',
+        dest='l2_norm',
+        action='store_true',
+        help='Reduce node tensors of shape [seq, d] to [1, d] using L2 norm across seq before node normalization.',
+    )
     parser.add_argument('--save_curvature_dir',type=str,default=None,help='Directory to save per-layer curvature pkl files.')
     parser.add_argument('--load_curvature_dir',type=str,default=None,help='Directory to load previously saved per-layer curvature pkl files.')
     parser.add_argument('--calib_data',type=str,default="c4_independent",choices=["c4_independent", "c4_dependent"], help='Calibration data for pruning [c4_dependent, c4_independent].')
     parser.add_argument('--sample_edge_num', type=int, default=-1, help='Number of edge samples for curvature calculation.')
+    parser.add_argument('--sample_edge_ratio', type=float, default=1.0, help='Ratio of edge samples for curvature calculation.')
     parser.add_argument('--seqlen', type=int, default=32, help='Input seq len.')
+    parser.add_argument(
+        '--pp_seqlen',
+        type=int,
+        nargs='*',
+        default=[],
+        help='Perplexity eval sequence lengths, e.g. --pp_seqlen 32 128 256.',
+    )
 
     parser.add_argument("--eval_zero_shot", type=int, default=0, help='evaluate on downsteam zero shot tasks')
     args = parser.parse_args()
+    sparsity_ratios = _resolve_sparsity_ratios(args)
+    if args.save_curvature_dir is None:
+        args.save_curvature_dir = _curvature_dir(args)
     
     # set random seed
     seed = args.seed
@@ -125,45 +270,89 @@ def main():
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
     if args.sparsity_type != "unstructured":
-        assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
+        assert all(ratio == 0.5 for ratio in sparsity_ratios), (
+            "sparsity ratio must be 0.5 for structured N:M sparsity"
+        )
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
     
-    # load model
-    print(f"loading llm model {args.model}")
-    model = get_llm(args.model, args.cache_dir, model_device, args.seqlen)
-    model.eval()
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-    except Exception as exc:
-        if not _is_network_error(exc):
-            raise
-        enable_hf_offline_mode()
-        print(f"Falling back to local cached tokenizer files: {exc}")
-        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False, local_files_only=True)
-    
-    if args.sparsity_ratio != 0:
-        print("pruning starts")
-        if args.prune_method == "curvature":
-            prune_curvature(args, model, tokenizer, compute_device, prune_n, prune_m)
-            prune_global_curvature(args, model)
-        
-        
-    ################################################################
-    print("*"*30)
-    sparsity_ratio = check_sparsity(model)
-    print(f"sparsity sanity check {sparsity_ratio:.4f}")
-    print("*"*30)
-    ################################################################
-    ppl_test = eval_ppl(args, model, tokenizer, model_device)
-    print(f"wikitext perplexity {ppl_test}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
-    save_dir = os.path.join(args.save, f"seq_len_{args.seqlen}", args.calib_data)
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    save_filepath = os.path.join(save_dir, f"log_{args.prune_method}.txt")
+    save_filepath = _log_path(args)
+
+    needs_pruning = any(ratio != 0 for ratio in sparsity_ratios)
+    base_curvature_scores = None
+    
+    if needs_pruning and args.prune_method == "curvature":
+        print(f"loading llm model {args.model} for curvature precomputation")
+        model = get_llm(args.model, args.cache_dir, model_device, args.seqlen)
+        model.eval()
+        print("precomputing curvature scores")
+        prune_curvature(args, model, tokenizer, compute_device, prune_n, prune_m)
+        base_curvature_scores = copy.deepcopy(model.curvature_scores)
+        del model
+
+    eval_seq_lens = args.pp_seqlen if len(args.pp_seqlen) >= 1 else [args.seqlen]
+
     with open(save_filepath, "a+") as f:
-        print(f"{'method':<15}{'target_sparsity':<18}{'actual_sparsity':<18}{'calib_data':<20}{'seq_len':<12}{'ppl_test':<12}", file=f, flush=True)
-        print(f"{args.prune_method:<15}{args.sparsity_ratio:<18.4f}{sparsity_ratio:<18.4f}{args.calib_data:<20}{args.seqlen:<12.4f}{ppl_test:<12.4f}", file=f, flush=True)
+        print(
+            f"{'method':<15}{'score_order':<15}{'l2_norm':<10}{'target_sparsity':<18}"
+            f"{'actual_sparsity':<18}{'calib_data':<20}{'seq_len':<12}{'ppl_test':<12}",
+            file=f,
+            flush=True,
+        )
+
+    for run_idx, target_ratio in enumerate(sparsity_ratios):
+        print(f"starting sweep run {run_idx + 1}/{len(sparsity_ratios)} with sparsity={target_ratio:.4f}")
+        current_model = get_llm(args.model, args.cache_dir, model_device, args.seqlen)
+        current_model.eval()
+
+        current_model.seqlen = args.seqlen
+        args.sparsity_ratio = target_ratio
+
+        if target_ratio != 0:
+            print("pruning starts")
+            if args.prune_method == "curvature":
+                current_model.curvature_scores = copy.deepcopy(base_curvature_scores)
+                current_model.removal_mask = [{} for _ in range(len(current_model.model.layers))]
+                prune_global_curvature(args, current_model)
+                prune_summary = _collect_pruned_edge_summary(current_model)
+                _append_curvature_prune_summary(
+                    save_filepath,
+                    prune_summary,
+                    target_ratio=target_ratio,
+                    score_order=args.prune_score_order,
+                )
+            elif args.prune_method == "wanda":
+                prune_wanda(args, current_model, tokenizer, model_device, prune_n, prune_m)
+            elif args.prune_method == "magnitude":
+                prune_magnitude(args, current_model, tokenizer, model_device, prune_n, prune_m)
+
+        print("*" * 30)
+        actual_sparsity_ratio = check_sparsity(current_model)
+        print(f"sparsity sanity check {actual_sparsity_ratio:.4f}")
+        print("*" * 30)
+
+        ppl_results = []
+        for seq in eval_seq_lens:
+            current_model.seqlen = seq
+            ppl_test = eval_ppl(args, current_model, tokenizer, model_device)
+            ppl_results.append((seq, ppl_test))
+            print(f"wikitext perplexity {ppl_test} using seqlen = {seq}")
+
+        with open(save_filepath, "a+") as f:
+            for seq, ppl_test in ppl_results:
+                print(
+                    f"{args.prune_method:<15}{args.prune_score_order:<15}{str(args.l2_norm):<10}{target_ratio:<18.4f}"
+                    f"{actual_sparsity_ratio:<18.4f}{args.calib_data:<20}"
+                    f"{seq:<12d}{ppl_test:<12.4f}",
+                    file=f,
+                    flush=True,
+                )
+
+        if args.save_model:
+            save_model_path = _save_model_path(args.save_model, target_ratio, len(sparsity_ratios))
+            current_model.save_pretrained(save_model_path)
+            tokenizer.save_pretrained(save_model_path)
 
     # if args.eval_zero_shot:
     #     accelerate=False
@@ -177,10 +366,6 @@ def main():
     #         print("\n********************************\n", file=f, flush=True)
     #         print("\nzero_shot evaluation results\n\n", file=f, flush=True)
     #         print(results, file=f, flush=True)
-
-    if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
 
 if __name__ == '__main__':
     main()

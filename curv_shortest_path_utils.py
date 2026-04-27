@@ -54,7 +54,7 @@ def build_shortest_path_cache(
     if graph_data is None:
         graph_data = _resolve_graph_sets(operations, short_name)
 
-    if short_name in sp_cache:
+    if (short_name not in {"q_proj", "k_proj"}) and (short_name in sp_cache):
         return sp_cache[short_name], graph_data
 
     # 1/|w| and transpose shape = (int, out)

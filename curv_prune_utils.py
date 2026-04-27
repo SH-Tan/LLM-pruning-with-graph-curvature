@@ -68,10 +68,17 @@ def prune_global_curvature(args, model):
 
     all_scores = torch.cat([entry["curv"][entry["finite_mask"]].reshape(-1) for entry in score_refs])
     prune_count = min(prune_count, all_scores.numel())
-    topk_indices = torch.topk(all_scores, k=prune_count, largest=True, sorted=False).indices
+    prune_high_scores = getattr(args, "prune_score_order", "high_to_low") == "high_to_low"
+    topk_indices = torch.topk(
+        all_scores,
+        k=prune_count,
+        largest=prune_high_scores,
+        sorted=False,
+    ).indices
     global_prune_mask = torch.zeros(all_scores.numel(), dtype=torch.bool)
     global_prune_mask[topk_indices] = True
-    threshold = all_scores[topk_indices].min()
+    selected_scores = all_scores[topk_indices]
+    threshold = selected_scores.min() if prune_high_scores else selected_scores.max()
 
     total_pruned = 0
     offset = 0
@@ -100,5 +107,7 @@ def prune_global_curvature(args, model):
 
     print(
         f"Global curvature pruning complete: pruned={total_pruned}/{total_finite_params}, "
-        f"finite_curvature_sparsity={args.sparsity_ratio:.6f}, threshold={float(threshold):.6f}"
+        f"finite_curvature_sparsity={args.sparsity_ratio:.6f}, "
+        f"score_order={getattr(args, 'prune_score_order', 'high_to_low')}, "
+        f"threshold={float(threshold):.6f}"
     )
