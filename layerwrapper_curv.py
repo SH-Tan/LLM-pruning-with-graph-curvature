@@ -32,7 +32,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     
     attn_weight += attn_bias
     attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
 
     return attn_weight @ value, attn_weight
 

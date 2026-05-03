@@ -1,12 +1,10 @@
-# Import necessary modules
-import time
 import torch
 import torch.nn as nn
+import gc
 
 # Import get_loaders function from data module within the same directory
 from data import get_loaders 
 
-from collections import defaultdict
 import fnmatch
 
 
@@ -26,6 +24,10 @@ def eval_ppl(args, model, tokenizer, device=torch.device("cuda:0")):
     # Evaluate ppl in no grad context to avoid updating the model
     with torch.no_grad():
         ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
+    del testloader
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return ppl_test 
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
@@ -37,8 +39,8 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
     # nsamples = testenc.numel() // model.seqlen
     nsamples = len(trainloader)
 
-    # List to store negative log likelihoods
-    nlls = []
+    total_nll = 0.0
+    loss_fct = nn.CrossEntropyLoss()
     print(f"nsamples {nsamples}")
 
     # Loop through each batch
@@ -61,21 +63,24 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = inputs[:, 1:]
 
-        # Compute loss
-        loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
         # Calculate negative log likelihood
         neg_log_likelihood = loss.float() * model.seqlen * (j-i)
 
-        # Append to list of negative log likelihoods
-        nlls.append(neg_log_likelihood)
+        total_nll += float(neg_log_likelihood.detach().cpu())
+
+        del inputs, lm_logits, shift_logits, shift_labels, loss, neg_log_likelihood
+        if torch.cuda.is_available() and i % 50 == 0:
+            torch.cuda.empty_cache()
 
     # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+    ppl = torch.exp(torch.tensor(total_nll / (nsamples * model.seqlen)))
 
     # Empty CUDA cache to save memory
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return ppl.item()
 
@@ -87,8 +92,8 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
     # Calculate number of samples
     nsamples = testenc.numel() // model.seqlen
 
-    # List to store negative log likelihoods
-    nlls = []
+    total_nll = 0.0
+    loss_fct = nn.CrossEntropyLoss()
     print(f"nsamples {nsamples}")
 
     # Loop through each batch
@@ -110,21 +115,24 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = inputs[:, 1:]
 
-        # Compute loss
-        loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
         # Calculate negative log likelihood
         neg_log_likelihood = loss.float() * model.seqlen * (j-i)
 
-        # Append to list of negative log likelihoods
-        nlls.append(neg_log_likelihood)
+        total_nll += float(neg_log_likelihood.detach().cpu())
+
+        del inputs, lm_logits, shift_logits, shift_labels, loss, neg_log_likelihood
+        if torch.cuda.is_available() and i % 50 == 0:
+            torch.cuda.empty_cache()
 
     # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+    ppl = torch.exp(torch.tensor(total_nll / (nsamples * model.seqlen)))
 
     # Empty CUDA cache to save memory
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return ppl.item()
 
@@ -132,7 +140,6 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
 def eval_zero_shot(model_name, model, tokenizer, task_list=["bangla","mmlu","hellaswag","winogrande","openbookqa","arc_easy"], 
         num_fewshot=0, use_accelerate=False, device = 'cuda'):
     from lm_eval import evaluator
-    from lm_eval.tasks.manager import TaskManager
     def pattern_match(patterns, source_list):
         task_names = set()
         for pattern in patterns:

@@ -19,8 +19,6 @@ def _get_prunable_module(model, layer_idx, op_name):
 def prune_global_curvature(args, model):
     if not hasattr(model, "curvature_scores"):
         raise AttributeError("Model does not have curvature_scores. Run prune_curvature first.")
-    if not hasattr(model, "removal_mask"):
-        model.removal_mask = [{} for _ in range(len(model.model.layers))]
 
     model.eval()
 
@@ -58,13 +56,13 @@ def prune_global_curvature(args, model):
 
     if total_finite_params == 0:
         print("No finite curvature scores found for global curvature pruning")
-        return
+        return []
 
     # Only parameters with finite curvature scores participate in global pruning.
     prune_count = int(total_finite_params * args.sparsity_ratio)
     if prune_count <= 0:
         print("Global curvature pruning skipped because prune_count is 0")
-        return
+        return []
 
     all_scores = torch.cat([entry["curv"][entry["finite_mask"]].reshape(-1) for entry in score_refs])
     prune_count = min(prune_count, all_scores.numel())
@@ -82,10 +80,10 @@ def prune_global_curvature(args, model):
 
     total_pruned = 0
     offset = 0
+    prune_summary = []
     with torch.no_grad():
         for entry in score_refs:
             module = entry["module"]
-            curv = entry["curv"]
             finite_mask = entry["finite_mask"]
             flat_finite_count = int(finite_mask.sum().item())
             flat_selection = global_prune_mask[offset:offset + flat_finite_count]
@@ -99,11 +97,20 @@ def prune_global_curvature(args, model):
             prune_mask = prune_mask_cpu.to(device=module.weight.data.device)
             module.weight.data[prune_mask] = 0
 
-            model.removal_mask[entry["layer_idx"]][entry["op_name"]] = ~prune_mask_cpu
+            prune_summary.append(
+                {
+                    "layer_idx": entry["layer_idx"],
+                    "op_name": entry["op_name"],
+                    "pruned_edges": layer_pruned,
+                    "total_edges": flat_finite_count,
+                }
+            )
             print(
                 f"Global curvature prune layer {entry['layer_idx']} {entry['op_name']}: "
                 f"pruned={layer_pruned}/{int(finite_mask.sum().item())}"
             )
+
+            del prune_mask, prune_mask_cpu
 
     print(
         f"Global curvature pruning complete: pruned={total_pruned}/{total_finite_params}, "
@@ -111,3 +118,4 @@ def prune_global_curvature(args, model):
         f"score_order={getattr(args, 'prune_score_order', 'high_to_low')}, "
         f"threshold={float(threshold):.6f}"
     )
+    return prune_summary

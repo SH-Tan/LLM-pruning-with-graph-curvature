@@ -1,6 +1,7 @@
 import torch
 
 from graph_relation import _resolve_graph_sets
+from curv_distribution_utils import _min_reduce_blocks
 from curv_tensor_utils import (
     _all_cost_matrices,
     _get_matrix_torch,
@@ -107,6 +108,16 @@ def build_shortest_path_cache(
 
     sp = {
         "curr_dist": curr_dist.cpu().contiguous().numpy(),
+        "prev_to_curr_in": (
+            _min_reduce_blocks([v.cpu().contiguous().numpy() for v in prev_dists.values()])
+            if prev_dists
+            else None
+        ),
+        "curr_out_to_next": (
+            _min_reduce_blocks([v.cpu().contiguous().numpy() for v in next_dists.values()])
+            if next_dists
+            else None
+        ),
         "prev_to_curr_out_all": {
             k: v.cpu().contiguous().numpy() for k, v in prev_to_curr_out_all.items()
         },

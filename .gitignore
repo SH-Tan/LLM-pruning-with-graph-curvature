@@ -277,3 +277,4 @@ curv_pkl/
 *.txt
 *.ipynb
 out/
+.codex

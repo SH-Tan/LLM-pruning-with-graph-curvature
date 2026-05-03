@@ -1,5 +1,4 @@
 import numpy as np
-import os
 import torch
 import ot
 
@@ -21,6 +20,7 @@ from curv_sequence_utils import (
 )
 from curv_shortest_path_utils import build_shortest_path_cache
 from curv_shared_utils import _from_shared_numpy, _to_shared_numpy, _load_worker_seq_distribution, _to_shared_seq_metas
+import curv_metric_utils as metric_utils
 from curv_tensor_utils import _build_v_to_att_out_template, _build_x_to_out_cost
 
 from multiprocessing import get_context
@@ -48,30 +48,23 @@ _SHARED_SHORT_NAME = None
 _SHARED_SAMPLE_IDX = None
 _SHARED_MODEL_META = None
 _SHARED_SEQ_LEN = 1
+_SHARED_TOP_K = 5
 _WORKER_CURR_DIST_SHM = None
 _WORKER_PREV_IN_SHM = None
 _WORKER_NEXT_OUT_SHM = None
+_WORKER_SCORE_SHMS = []
 _WORKER_PREV_SEQ_METAS = None
 _WORKER_NEXT_SEQ_METAS = None
 _WORKER_PREV_SEQ_SHMS = {}
 _WORKER_NEXT_SEQ_SHMS = {}
 _WORKER_PREV_SEQ_CACHE = {}
 _WORKER_NEXT_SEQ_CACHE = {}
-_INF_COST_LOG_DIR = os.path.join(os.path.dirname(__file__), "cost_inf_debug")
 
 
 def _as_index_array(active):
     if active is None:
         return np.empty((0,), dtype=np.int64)
     return np.asarray(active, dtype=np.int64).reshape(-1)
-
-
-def _append_inf_cost_log(lines, u_idx, v_idx):
-    os.makedirs(_INF_COST_LOG_DIR, exist_ok=True)
-    log_path = os.path.join(_INF_COST_LOG_DIR, f"edge_u{u_idx}_v{v_idx}.log")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-        f.write("\n" + "=" * 80 + "\n")
 
 
 def _edge_cost_matrix_base(u_idx, v_idx, prev_active, next_active, sp_uv):
@@ -84,7 +77,7 @@ def _edge_cost_matrix_base(u_idx, v_idx, prev_active, next_active, sp_uv):
     prev_count = int(len(prev_active))
     next_count = int(len(next_active))
 
-    cost = np.full((prev_count + 1, next_count + 1), np.inf, dtype=np.float32)
+    cost = np.full((prev_count + 1, next_count + 1), np.inf, dtype=np.float64)
     sp = _SHARED_SP
 
     prev_to_next_all = sp.get("prev_to_next_all", {})
@@ -150,7 +143,7 @@ def _get_min_QK_A_cost(v_idx, u_idx, s, prev_active):
     shared_end = (s + 1) * repeat
     merged_width = seq_len * repeat
 
-    prev_merged = np.empty((0, merged_width), dtype=np.float32)
+    prev_merged = np.empty((0, merged_width), dtype=np.float64)
 
     if len(prev_active) > 0:
         # previous input -> Q-local-out
@@ -303,43 +296,42 @@ def _edge_cost_matrix_seq_aware(u_idx, v_idx, prev_active, next_active, sp_uv, s
     return cost
 
 
-
-def _compute_single_edge_seq_global(edge_info, seq_info):
-    edge_t0 = time.time()
+def _edge_seq_distributions_and_cost(edge_info, seq_info):
     u_idx, v_idx = edge_info
 
     sp_uv = float(_SHARED_CURR_DIST[u_idx, v_idx])
 
-    # For seq-aware nodes, pick the row for this sequence
+    # For seq-aware nodes, pick the row for this sequence.
     if _SHARED_SHORT_NAME == "v_proj":
         next_row = None if _SHARED_NEXT_OUT is None else _SHARED_NEXT_OUT[v_idx]
     else:
         next_row = None if _SHARED_NEXT_OUT is None else _SHARED_NEXT_OUT[seq_info]
-    
+
     if _SHARED_SHORT_NAME == "o_proj":
         prev_row = None if _SHARED_PREV_IN is None else _SHARED_PREV_IN[u_idx]
     else:
         prev_row = None if _SHARED_PREV_IN is None else _SHARED_PREV_IN[seq_info]
-    
+
     mu, prev_active = _edge_distribution(prev_row, _SHARED_ALPHA)
     nu, next_active = _edge_distribution(next_row, _SHARED_ALPHA)
-    
+
     cost = _edge_cost_matrix_seq_aware(
         u_idx=u_idx,
         v_idx=v_idx,
         prev_active=prev_active,
         next_active=next_active,
         sp_uv=sp_uv,
-        seq = seq_info
+        seq=seq_info,
+    )
+
+    return u_idx, v_idx, sp_uv, mu, prev_active, nu, next_active, cost
+
+
+def _compute_single_edge_seq_global(edge_info, seq_info):
+    u_idx, v_idx, sp_uv, mu, _, nu, _, cost = (
+        _edge_seq_distributions_and_cost(edge_info, seq_info)
     )
     cost_inf_count = int(np.isinf(cost).sum())
-    if cost_inf_count > 0:
-        log_lines = [
-            f"cost has inf value for u_idx={u_idx}, v_idx={v_idx}, seq={seq_info}",
-            f"cost shape={cost.shape}, sp_uv={sp_uv}, short_name={_SHARED_SHORT_NAME}, alpha={_SHARED_ALPHA}",
-            f"mu shape={mu.shape}, nu shape={nu.shape}, prev_active_len={len(prev_active)}, next_active_len={len(next_active)}",
-        ]
-        _append_inf_cost_log(log_lines, u_idx=u_idx, v_idx=v_idx)
 
     try:
         w_dist = float(ot.emd2(mu, nu, cost))
@@ -355,7 +347,6 @@ def _compute_single_edge_seq_global(edge_info, seq_info):
             "sp_uv": sp_uv,
             "cost_has_inf": bool(cost_inf_count > 0),
             "cost_inf_count": cost_inf_count,
-            "edge_time_sec": float(time.time() - edge_t0),
         }
 
     curv = 1.0 - (w_dist / sp_uv)
@@ -365,23 +356,31 @@ def _compute_single_edge_seq_global(edge_info, seq_info):
         "seq_idx": seq_info,
         "v_idx": v_idx,
         "u_idx": u_idx,
-        "curv": np.float32(curv),
+        "curv": np.float64(curv),
         "mu_len": int(len(mu)),
         "nu_len": int(len(nu)),
         "w_dist": w_dist,
         "sp_uv": sp_uv,
         "cost_has_inf": bool(cost_inf_count > 0),
         "cost_inf_count": cost_inf_count,
-        "edge_time_sec": float(time.time() - edge_t0),
     }
 
 
 
 
 
-def _init_worker(curr_dist_meta, prev_meta, next_meta, prev_seq_metas=None, next_seq_metas=None):
+def _init_worker(
+    curr_dist_meta,
+    prev_meta,
+    next_meta,
+    prev_seq_metas=None,
+    next_seq_metas=None,
+    prev_score_meta=None,
+    next_score_meta=None,
+):
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _WORKER_CURR_DIST_SHM, _WORKER_PREV_IN_SHM, _WORKER_NEXT_OUT_SHM
+    global _WORKER_SCORE_SHMS
     global _WORKER_PREV_SEQ_METAS, _WORKER_NEXT_SEQ_METAS
     global _WORKER_PREV_SEQ_SHMS, _WORKER_NEXT_SEQ_SHMS
     global _WORKER_PREV_SEQ_CACHE, _WORKER_NEXT_SEQ_CACHE
@@ -397,6 +396,23 @@ def _init_worker(curr_dist_meta, prev_meta, next_meta, prev_seq_metas=None, next
     _SHARED_NEXT_OUT = None
     if next_meta is not None:
         _WORKER_NEXT_OUT_SHM, _SHARED_NEXT_OUT = _from_shared_numpy(next_meta)
+
+    _WORKER_SCORE_SHMS = []
+    prev_score = None
+    if prev_score_meta is not None:
+        shm, prev_score = _from_shared_numpy(prev_score_meta)
+        _WORKER_SCORE_SHMS.append(shm)
+
+    next_score = None
+    if next_score_meta is not None:
+        shm, next_score = _from_shared_numpy(next_score_meta)
+        _WORKER_SCORE_SHMS.append(shm)
+    metric_utils.set_shared_metric_state(
+        prev_score,
+        next_score,
+        seq_len=_SHARED_SEQ_LEN,
+        top_k=_SHARED_TOP_K,
+    )
 
     _WORKER_PREV_SEQ_METAS = prev_seq_metas
     _WORKER_NEXT_SEQ_METAS = next_seq_metas
@@ -441,10 +457,20 @@ def _compute_edge_with_seq(task):
         _SHARED_NEXT_OUT = old_next
 
 
+def _compute_edge_with_top_seq(edge):
+    results = []
+    for seq_idx in metric_utils.top_seq_for_edge(edge):
+        edge_res = _compute_edge_with_seq((seq_idx, edge))
+        if edge_res:
+            results.append(edge_res)
+    return results
+
+
 def _reset_shared_state():
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
     global _SHARED_SHORT_NAME, _SHARED_SAMPLE_IDX, _SHARED_MODEL_META, _SHARED_SEQ_LEN
+    global _SHARED_TOP_K
 
     _SHARED_CURR_DIST = None
     _SHARED_PREV_IN = None
@@ -459,6 +485,8 @@ def _reset_shared_state():
     _SHARED_SAMPLE_IDX = None
     _SHARED_MODEL_META = None
     _SHARED_SEQ_LEN = 1
+    _SHARED_TOP_K = 5
+    metric_utils.reset_shared_metric_state()
 
 
 def _get_vproj_aux_shortest_paths(operations, layer_cache, sp_cache, device):
@@ -479,6 +507,8 @@ def _get_vproj_aux_shortest_paths(operations, layer_cache, sp_cache, device):
         model_meta=_SHARED_MODEL_META,
     )
     return sp_q, sp_k
+
+
 
 def compute_op_curvature(
     operations,
@@ -521,7 +551,7 @@ def compute_op_curvature(
     )
     if sp is None:
         return None
-
+    
     if short_name == "v_proj":
         sp_q, sp_k = _get_vproj_aux_shortest_paths(
             operations=operations,
@@ -552,7 +582,7 @@ def compute_op_curvature(
             alpha,
             l2_norm=l2_norm,
         )
-    
+        
     # if is q, k, v, the next is A or attention out     
     if (short_name not in ["q_proj", "k_proj", "v_proj"]) and graph_data["next_out"] is not None:
         next_out_distribution = _build_node_distribution(
@@ -571,6 +601,7 @@ def compute_op_curvature(
             alpha,
             l2_norm=l2_norm,
         )
+
   
     _SHARED_CURR_DIST = curr_dist
     _SHARED_SP = sp
@@ -582,7 +613,7 @@ def compute_op_curvature(
     _SHARED_PREV_IN = prev_in_distribution
     _SHARED_NEXT_OUT = next_out_distribution
     
-    curvature = torch.full((out_dim, in_dim), float("inf"), dtype=torch.float32)
+    curvature = torch.full((out_dim, in_dim), float("inf"), dtype=torch.float64)
 
     curr_dist_np = np.asarray(curr_dist, dtype=np.float64)
     curr_dist_finite_edges = int(np.isfinite(curr_dist_np).sum())
@@ -657,11 +688,11 @@ def compute_op_curvature(
     base_next_meta = None
 
     if _SHARED_PREV_IN is not None:
-        shm, base_prev_meta = _to_shared_numpy(np.asarray(_SHARED_PREV_IN, dtype=np.float32))
+        shm, base_prev_meta = _to_shared_numpy(np.asarray(_SHARED_PREV_IN, dtype=np.float64))
         base_owned_shms.append(shm)
 
     if _SHARED_NEXT_OUT is not None:
-        shm, base_next_meta = _to_shared_numpy(np.asarray(_SHARED_NEXT_OUT, dtype=np.float32))
+        shm, base_next_meta = _to_shared_numpy(np.asarray(_SHARED_NEXT_OUT, dtype=np.float64))
         base_owned_shms.append(shm)
 
     seq_prev_metas, prev_seq_shms = _to_shared_seq_metas(precomputed_prev_dists)
@@ -682,59 +713,81 @@ def compute_op_curvature(
         if sample_edge_num > 0 and sample_edge_num < len(finite_edges):
             selected_idx = rng.choice(len(finite_edges), size=sample_edge_num, replace=False)
             finite_edges = finite_edges[np.sort(selected_idx)]
+    finite_edges = np.asarray(finite_edges, dtype=np.int64).reshape(-1, 2)
     
     print(
         f'op = {short_name}, sample = {sample_idx}, seq = {seq_len}, '
         f'total edges = {len(finite_edges)} per seq, cur dist shape = {curr_dist.shape}'
     )
 
-    print(f'Start creating Pool....')
     mu_len_total = 0.0
     nu_len_total = 0.0
     mu_nu_count = 0
     cost_has_inf = False
     cost_inf_count = 0
-    
     t1 = time.time()
     
-    try:
-        with ctx.Pool(processes=proc, initializer=_init_worker,
-            initargs=(curr_meta, base_prev_meta, base_next_meta, seq_prev_metas, seq_next_metas),) as pool:
-            for s in range(seq_len):
-                task_iter = (
-                    (s, edge)
-                    for edge in finite_edges
-                )
-                
-                seq_v_parts = []
-                seq_u_parts = []
-                seq_curv_parts = []
+    if l2_norm:
+        print(_SHARED_NEXT_OUT.shape)
+        seq_len = 1
+        
+    _SHARED_SEQ_LEN = seq_len
+    _SHARED_TOP_K = 10
 
-                for edge_res in pool.imap_unordered(_compute_edge_with_seq, task_iter, chunksize=1):
+    prev_score = None
+    next_score = None
+    if not l2_norm and seq_len > 1:
+        prev_score, next_score = metric_utils.build_neighbor_score_matrices(
+            seq_len=seq_len,
+            sp=sp,
+            alpha=alpha,
+            prev_in_distribution=prev_in_distribution,
+            next_out_distribution=next_out_distribution,
+        )
+
+    prev_score_meta = None
+    next_score_meta = None
+    if prev_score is not None and not np.isscalar(prev_score):
+        shm, prev_score_meta = _to_shared_numpy(np.asarray(prev_score, dtype=np.float64))
+        base_owned_shms.append(shm)
+    if next_score is not None and not np.isscalar(next_score):
+        shm, next_score_meta = _to_shared_numpy(np.asarray(next_score, dtype=np.float64))
+        base_owned_shms.append(shm)
+
+    try:
+        total_edge_seq_tasks = len(finite_edges) * _SHARED_TOP_K
+        print(
+            f"Will evaluate top {min(_SHARED_TOP_K, _SHARED_SEQ_LEN)} score-ranked seq positions "
+            f"for about {total_edge_seq_tasks} edge/seq tasks from {len(finite_edges)} edges."
+        )
+        print(f'Start creating Pool....')
+
+        with ctx.Pool(processes=proc, initializer=_init_worker,
+            initargs=(
+                curr_meta,
+                base_prev_meta,
+                base_next_meta,
+                seq_prev_metas,
+                seq_next_metas,
+                prev_score_meta,
+                next_score_meta,
+            ),) as pool:
+            for edge_results in pool.imap_unordered(_compute_edge_with_top_seq, finite_edges, chunksize=1):
+                if not edge_results:
+                    continue
+                for edge_res in edge_results:
                     if not edge_res:
                         continue
-
                     v_idx = edge_res["v_idx"]
                     u_idx = edge_res["u_idx"]
-                    curv = edge_res["curv"]
-                    seq_v_parts.append(v_idx)
-                    seq_u_parts.append(u_idx)
-                    seq_curv_parts.append(curv)
+                    curv = float(edge_res["curv"])
+                    if curv < float(curvature[v_idx, u_idx]):
+                        curvature[v_idx, u_idx] = curv
                     mu_len_total += float(edge_res["mu_len"])
                     nu_len_total += float(edge_res["nu_len"])
                     mu_nu_count += 1
                     cost_has_inf = cost_has_inf or bool(edge_res["cost_has_inf"])
                     cost_inf_count += int(edge_res["cost_inf_count"])
-
-                if seq_v_parts:
-                    seq_v_idx = torch.tensor(seq_v_parts, dtype=torch.long)
-                    seq_u_idx = torch.tensor(seq_u_parts, dtype=torch.long)
-                    seq_curv_vals = torch.tensor(seq_curv_parts, dtype=torch.float32)
-
-                    curvature[seq_v_idx, seq_u_idx] = torch.minimum(
-                        curvature[seq_v_idx, seq_u_idx],
-                        seq_curv_vals,
-                    )
 
     finally:
         for shm in seq_owned_shms:
@@ -745,7 +798,8 @@ def compute_op_curvature(
             shm.close()
             shm.unlink()
             
-    print(f"sample_idx = {sample_idx}, time = {time.time() - t1} s, ")
+    runtime_sec = time.time() - t1
+    print(f"sample_idx = {sample_idx}, time = {runtime_sec} s, ")
 
     _reset_shared_state()
 
@@ -762,6 +816,7 @@ def compute_op_curvature(
         curr_dist_infinite_edges=curr_dist_infinite_edges,
         cost_has_inf=cost_has_inf,
         cost_inf_count=cost_inf_count,
+        runtime_sec=runtime_sec,
     )
 
     # curvature = _merge_gqa_curvature(curvature, model, layer_id, short_name)
