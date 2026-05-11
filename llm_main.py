@@ -49,19 +49,49 @@ def _log_path(args):
     save_dir = os.path.join(args.save, args.calib_data, _l2_path_tag(args), f"seq_len_{args.seqlen}")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-    return os.path.join(save_dir, f"eval_out_{args.prune_method}.txt")
+    file_name = f"eval_out_{args.prune_method}.txt"
+    if args.prune_method == "curvature":
+        setting_tag = _curvature_seq_tag(
+            args.shared_top_k,
+            args.shared_seq_select,
+            args.curvature_lpf_window,
+        ).removesuffix("_pkl")
+        file_name = f"eval_out_{args.prune_method}_{setting_tag}.txt"
+    return os.path.join(save_dir, file_name)
 
 
-def _contains_curvature_pkls(path):
+def _curvature_seq_tag(shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
+    if shared_top_k is None:
+        return "curvature_pkl"
+    if shared_seq_select == "top" and int(curvature_lpf_window) <= 1:
+        return f"curv_topseq_{int(shared_top_k)}_pkl"
+    tag = f"curv_{shared_seq_select}_seq_{int(shared_top_k)}"
+    if int(curvature_lpf_window) > 1:
+        tag += f"_lpf_{int(curvature_lpf_window)}"
+    return f"{tag}_pkl"
+
+
+def _contains_curvature_pkls(path, shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
     if path is None or not os.path.isdir(path):
         return False
 
-    pkl_dir = os.path.join(path, "curvature_pkl")
-    search_dir = pkl_dir if os.path.isdir(pkl_dir) else path
-    return any(
-        file_name.startswith("layer_") and file_name.endswith("_curvature.pkl")
-        for file_name in os.listdir(search_dir)
-    )
+    search_dirs = [path]
+    if shared_top_k is not None:
+        search_dirs.append(os.path.join(
+            path,
+            _curvature_seq_tag(shared_top_k, shared_seq_select, curvature_lpf_window),
+        ))
+    search_dirs.append(os.path.join(path, "curvature_pkl"))
+
+    for search_dir in search_dirs:
+        if not os.path.isdir(search_dir):
+            continue
+        if any(
+            file_name.startswith("layer_") and file_name.endswith("_curvature.pkl")
+            for file_name in os.listdir(search_dir)
+        ):
+            return True
+    return False
 
 
 def _curvature_dir(args, base_dir, create=False):
@@ -69,7 +99,12 @@ def _curvature_dir(args, base_dir, create=False):
         return None
 
     expected_seq_dir = f"seq_len_{args.seqlen}"
-    if os.path.basename(os.path.normpath(base_dir)) == expected_seq_dir or _contains_curvature_pkls(base_dir):
+    if os.path.basename(os.path.normpath(base_dir)) == expected_seq_dir or _contains_curvature_pkls(
+        base_dir,
+        getattr(args, "shared_top_k", None),
+        getattr(args, "shared_seq_select", "top"),
+        getattr(args, "curvature_lpf_window", 0),
+    ):
         save_dir = base_dir
     else:
         save_dir = os.path.join(base_dir, args.calib_data, _l2_path_tag(args), expected_seq_dir)
@@ -87,11 +122,10 @@ def _append_curvature_prune_summary(log_path, prune_summary, target_ratio=None, 
     if not prune_summary:
         return
 
-    total_pruned = sum(row["pruned_edges"] for row in prune_summary)
-    total_edges = sum(row["total_edges"] for row in prune_summary)
+    total_pruned = sum(row["pruned_params"] for row in prune_summary)
 
     with open(log_path, "a+") as f:
-        summary_header = "\nPruned edges by layer and op"
+        summary_header = "\nPruned parameters total"
         if target_ratio is not None:
             summary_header += f" (target_sparsity={target_ratio:.4f}"
             if score_order is not None:
@@ -99,21 +133,7 @@ def _append_curvature_prune_summary(log_path, prune_summary, target_ratio=None, 
             summary_header += ")"
         print(summary_header, file=f, flush=True)
         print(
-            f"{'layer':<8}{'op':<16}{'pruned_edges':<18}"
-            f"{'total_edges':<18}",
-            file=f,
-            flush=True,
-        )
-        for row in prune_summary:
-            print(
-                f"{row['layer_idx']:<8}{row['op_name']:<16}"
-                f"{row['pruned_edges']:<18}{row['total_edges']:<18}",
-                file=f,
-                flush=True,
-            )
-        print(
-            f"{'overall':<8}{'all_ops':<16}{total_pruned:<18}"
-            f"{total_edges:<18}",
+            f"pruned_params={total_pruned}",
             file=f,
             flush=True,
         )
@@ -128,7 +148,10 @@ def _append_eval_run_header(log_path, args, target_ratio, score_order):
             f"target_sparsity={target_ratio:.4f}, "
             f"score_seq_len={args.seqlen}, "
             f"calib_data={args.calib_data}, "
-            f"l2_norm={args.l2_norm}",
+            f"l2_norm={args.l2_norm}, "
+            f"shared_top_k={args.shared_top_k}, "
+            f"shared_seq_select={args.shared_seq_select}, "
+            f"curvature_lpf_window={args.curvature_lpf_window}",
             file=f,
             flush=True,
         )
@@ -287,6 +310,20 @@ def main():
     parser.add_argument('--calib_data',type=str,default="c4_independent",choices=["c4_independent", "c4_dependent"], help='Calibration data for pruning [c4_dependent, c4_independent].')
     parser.add_argument('--sample_edge_num', type=int, default=-1, help='Number of edge samples for curvature calculation.')
     parser.add_argument('--sample_edge_ratio', type=float, default=1.0, help='Ratio of edge samples for curvature calculation.')
+    parser.add_argument('--shared_top_k', type=int, default=10, help='Top score-ranked seq positions per edge for curvature; -1 evaluates all seq positions.')
+    parser.add_argument(
+        '--shared_seq_select',
+        type=str,
+        choices=["top", "median"],
+        default="top",
+        help='Seq selection mode when shared_top_k > 0: top score-ranked seqs or seqs closest to the median score.',
+    )
+    parser.add_argument(
+        '--curvature_lpf_window',
+        type=int,
+        default=0,
+        help='Sliding median low-pass window for all-seq curvature; active when shared_top_k is -1 and window > 1.',
+    )
     parser.add_argument(
         '--save_parameter_metric_logs',
         action='store_true',
@@ -359,7 +396,12 @@ def main():
     base_wanda_scores = None
     
     if args.load_curvature_dir is not None:
-        if _contains_curvature_pkls(args.load_curvature_dir):
+        if _contains_curvature_pkls(
+            args.load_curvature_dir,
+            args.shared_top_k,
+            args.shared_seq_select,
+            args.curvature_lpf_window,
+        ):
             print(f"using curvature pkls from {args.load_curvature_dir}")
         else:
             print(f"no curvature pkls found at {args.load_curvature_dir}; curvature will be computed if needed")

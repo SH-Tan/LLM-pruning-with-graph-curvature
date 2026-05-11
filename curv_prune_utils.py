@@ -75,8 +75,6 @@ def prune_global_curvature(args, model):
     ).indices
     global_prune_mask = torch.zeros(all_scores.numel(), dtype=torch.bool)
     global_prune_mask[topk_indices] = True
-    selected_scores = all_scores[topk_indices]
-    threshold = selected_scores.min() if prune_high_scores else selected_scores.max()
 
     total_pruned = 0
     offset = 0
@@ -103,19 +101,14 @@ def prune_global_curvature(args, model):
                     "op_name": entry["op_name"],
                     "pruned_edges": layer_pruned,
                     "total_edges": flat_finite_count,
+                    "pruned_params": layer_pruned,
+                    "total_params": flat_finite_count,
                 }
-            )
-            print(
-                f"Global curvature prune layer {entry['layer_idx']} {entry['op_name']}: "
-                f"pruned={layer_pruned}/{int(finite_mask.sum().item())}"
             )
 
             del prune_mask, prune_mask_cpu
 
     print(
-        f"Global curvature pruning complete: pruned={total_pruned}/{total_finite_params}, "
-        f"finite_curvature_sparsity={args.sparsity_ratio:.6f}, "
-        f"score_order={getattr(args, 'prune_score_order', 'high_to_low')}, "
-        f"threshold={float(threshold):.6f}"
+        f"Global curvature pruning complete: pruned={total_pruned}"
     )
     return prune_summary

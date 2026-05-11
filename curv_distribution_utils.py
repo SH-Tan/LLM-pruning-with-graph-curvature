@@ -82,8 +82,9 @@ def _build_node_distribution(node_tensor, node_name, alpha, eps=1e-7, l2_norm=Fa
 
     if l2_norm and node_tensor.dim() == 2:
         node_tensor = torch.norm(node_tensor, p=2, dim=0, keepdim=True)
-
+        
     node_tensor = _normalize_node_value_per_sequence(node_tensor)
+    
     
     valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
     # weights = torch.exp(-(node_tensor)) * valid_mask

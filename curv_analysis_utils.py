@@ -11,13 +11,14 @@ _ACTIVE_PARAMETER_LOGS = set()
 _PYPLOT = None
 
 
-def _analysis_file_path(layer_id, short_name, seq_len, dataset_name):
-    analysis_dir = os.path.join(
-        os.path.dirname(__file__),
-        "curv_analysis",
-        f"seq_len_{int(seq_len)}",
-        str(dataset_name),
-    )
+def _analysis_file_path(layer_id, short_name, seq_len, dataset_name, analysis_dir=None):
+    if analysis_dir is None:
+        analysis_dir = os.path.join(
+            os.path.dirname(__file__),
+            "curv_analysis",
+            f"seq_len_{int(seq_len)}",
+            str(dataset_name),
+        )
     os.makedirs(analysis_dir, exist_ok=True)
     safe_dataset_name = str(dataset_name).replace("/", "_").replace(" ", "_")
     return os.path.join(
@@ -83,8 +84,22 @@ def _write_final_curvature_footer(analysis_path, summary):
         f.write(footer)
 
 
-def start_curvature_analysis(layer_id, short_name, sample_idx, curvature_shape, seq_len, dataset_name):
-    analysis_path = _analysis_file_path(layer_id, short_name, seq_len, dataset_name)
+def start_curvature_analysis(
+    layer_id,
+    short_name,
+    sample_idx,
+    curvature_shape,
+    seq_len,
+    dataset_name,
+    analysis_dir=None,
+):
+    analysis_path = _analysis_file_path(
+        layer_id,
+        short_name,
+        seq_len,
+        dataset_name,
+        analysis_dir=analysis_dir,
+    )
     header = (
         f"layer_id: {int(layer_id)}\n"
         f"op_name: {short_name}\n"
@@ -839,13 +854,19 @@ def append_final_min_curvature_summary(
         )
 
 
-def append_final_curvature_overall(layer_id, short_name, curvature, seq_len, dataset_name):
+def append_final_curvature_overall(layer_id, short_name, curvature, seq_len, dataset_name, analysis_dir=None):
     if torch.is_tensor(curvature):
         curvature = curvature.detach().cpu().numpy()
     else:
         curvature = np.asarray(curvature)
 
-    analysis_path = _analysis_file_path(layer_id, short_name, seq_len, dataset_name)
+    analysis_path = _analysis_file_path(
+        layer_id,
+        short_name,
+        seq_len,
+        dataset_name,
+        analysis_dir=analysis_dir,
+    )
     if not os.path.exists(analysis_path):
         header = (
             f"layer_id: {int(layer_id)}\n"

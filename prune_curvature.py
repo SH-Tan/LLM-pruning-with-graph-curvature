@@ -52,13 +52,23 @@ def _curvature_save_metadata(args):
         "alpha": getattr(args, "alpha", None),
         "l2_norm": getattr(args, "l2_norm", False),
         "prune_method": getattr(args, "prune_method", None),
+        "shared_top_k": getattr(args, "shared_top_k", 10),
+        "shared_seq_select": getattr(args, "shared_seq_select", "top"),
+        "curvature_lpf_window": getattr(args, "curvature_lpf_window", 0),
     }
 
 
-def _curvature_pkl_dir(base_dir):
+def _curvature_pkl_dir(base_dir, shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
     if base_dir is None:
         return None
-    return os.path.join(base_dir, "curvature_pkl")
+    if shared_top_k is None:
+        return os.path.join(base_dir, "curvature_pkl")
+    if shared_seq_select == "top" and int(curvature_lpf_window) <= 1:
+        return os.path.join(base_dir, f"curv_topseq_{int(shared_top_k)}_pkl")
+    tag = f"curv_{shared_seq_select}_seq_{int(shared_top_k)}"
+    if int(curvature_lpf_window) > 1:
+        tag += f"_lpf_{int(curvature_lpf_window)}"
+    return os.path.join(base_dir, f"{tag}_pkl")
 
 
 def _parameter_metric_log_root(base_dir, seq_len, dataset_name):
@@ -120,11 +130,33 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
     last_layer_idx = len(layers) - 1
 
     model.curvature_scores = [{} for _ in range(len(layers))]
+    save_lpf_curvature = (
+        int(getattr(args, "shared_top_k", 10)) == -1
+        and int(getattr(args, "curvature_lpf_window", 0)) > 1
+    )
+    if save_lpf_curvature:
+        model.lpf_curvature_scores = [{} for _ in range(len(layers))]
     curvature_save_dir = getattr(args, "save_curvature_dir", None)
     curvature_load_dir = getattr(args, "load_curvature_dir", None)
-    curvature_pkl_save_dir = _curvature_pkl_dir(curvature_save_dir)
+    curvature_pkl_save_dir = _curvature_pkl_dir(
+        curvature_save_dir,
+        getattr(args, "shared_top_k", 10),
+        getattr(args, "shared_seq_select", "top"),
+        0,
+    )
+    curvature_lpf_pkl_save_dir = None
+    if save_lpf_curvature:
+        curvature_lpf_pkl_save_dir = _curvature_pkl_dir(
+            curvature_save_dir,
+            getattr(args, "shared_top_k", 10),
+            getattr(args, "shared_seq_select", "top"),
+            getattr(args, "curvature_lpf_window", 0),
+        )
+    curvature_analysis_dir = curvature_lpf_pkl_save_dir if save_lpf_curvature else curvature_pkl_save_dir
     curvature_timing_log_path = getattr(args, "curvature_timing_log_path", None)
     curvature_metadata = _curvature_save_metadata(args)
+    raw_curvature_metadata = dict(curvature_metadata)
+    raw_curvature_metadata["curvature_lpf_window"] = 0
     parameter_metric_log_root = None
     if getattr(args, "save_parameter_metric_logs", False) or getattr(args, "draw_parameter_metric_plots", False):
         parameter_metric_log_root = _parameter_metric_log_root(
@@ -134,7 +166,13 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
         )
 
     if curvature_load_dir is not None:
-        model.curvature_scores = load_curvature_pkls(curvature_load_dir, len(layers))
+        model.curvature_scores = load_curvature_pkls(
+            curvature_load_dir,
+            len(layers),
+            shared_top_k=getattr(args, "shared_top_k", 10),
+            shared_seq_select=getattr(args, "shared_seq_select", "top"),
+            curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
+        )
         print(f"Loaded curvature pkls from {curvature_load_dir}")
         model.config.use_cache = use_cache
         return
@@ -149,6 +187,9 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
     try:
         for i, layer in enumerate(layers):
             print(f"Processing layer {i}")
+            
+            if i >= 10:
+                continue
 
             layer_cache = {}
             sp_cache = {}
@@ -166,6 +207,8 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
             for short, module in modules_items:
                 W = module.weight
                 module.min_curvature = torch.full_like(W, float("inf"), device="cpu")
+                if save_lpf_curvature:
+                    module.min_lpf_curvature = torch.full_like(W, float("inf"), device="cpu")
 
             new_inps = torch.empty_like(inps, device="cpu")
 
@@ -242,7 +285,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
                     print(f"Layer {i}, op name = {short}")
 
-                    curv = compute_op_curvature(
+                    curv_result = compute_op_curvature(
                         operations=operations,
                         short_name=short,
                         layer_id=i,
@@ -260,8 +303,14 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         sample_edge_ratio=args.sample_edge_ratio,
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
+                        shared_top_k=getattr(args, "shared_top_k", 10),
+                        shared_seq_select=getattr(args, "shared_seq_select", "top"),
+                        curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
+                        analysis_dir=curvature_analysis_dir,
                     )
 
+                    curv = curv_result["curvature"] if isinstance(curv_result, dict) else curv_result
+                    lpf_curv = curv_result.get("lpf_curvature") if isinstance(curv_result, dict) else None
                     assert curv is not None, f"{short} curv is None"
 
                     param_curv = curv
@@ -275,9 +324,15 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
                     torch.minimum(module.min_curvature, param_curv, out=module.min_curvature)
 
+                    if save_lpf_curvature and lpf_curv is not None:
+                        param_lpf_curv = lpf_curv
+                        if param_lpf_curv.T.shape == module.weight.shape:
+                            param_lpf_curv = param_lpf_curv.T
+                        torch.minimum(module.min_lpf_curvature, param_lpf_curv, out=module.min_lpf_curvature)
+
                 if prev_layer_outputs is not None and prev_layer_outputs[j] is not None and has_down_proj_target:
                     prev_i = i - 1
-                    curv = compute_op_curvature(
+                    curv_result = compute_op_curvature(
                         operations=operations,
                         short_name="prev_down_proj",
                         layer_id=i,
@@ -295,8 +350,14 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         sample_edge_ratio=args.sample_edge_ratio,
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
+                        shared_top_k=getattr(args, "shared_top_k", 10),
+                        shared_seq_select=getattr(args, "shared_seq_select", "top"),
+                        curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
+                        analysis_dir=curvature_analysis_dir,
                     )
 
+                    curv = curv_result["curvature"] if isinstance(curv_result, dict) else curv_result
+                    lpf_curv = curv_result.get("lpf_curvature") if isinstance(curv_result, dict) else None
                     assert curv is not None, "prev_down_proj curv is None"
 
                     if prev_i >= 0:
@@ -319,14 +380,36 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                                 out=model.curvature_scores[prev_i]["down_proj"],
                             )
 
+                        if save_lpf_curvature and lpf_curv is not None:
+                            param_lpf_curv = lpf_curv
+                            if param_lpf_curv.T.shape == prev_weight.shape:
+                                param_lpf_curv = param_lpf_curv.T
+                            if "down_proj" not in model.lpf_curvature_scores[prev_i]:
+                                model.lpf_curvature_scores[prev_i]["down_proj"] = param_lpf_curv
+                            else:
+                                torch.minimum(
+                                    model.lpf_curvature_scores[prev_i]["down_proj"],
+                                    param_lpf_curv,
+                                    out=model.lpf_curvature_scores[prev_i]["down_proj"],
+                                )
+
                         save_path = save_layer_curvature_pkl(
                             layer_idx=prev_i,
                             curvature_scores=model.curvature_scores[prev_i],
                             save_dir=curvature_pkl_save_dir,
-                            metadata=curvature_metadata,
+                            metadata=raw_curvature_metadata,
                         )
                         if save_path is not None:
                             print(f"Saved curvature pkl: {save_path}")
+                        if save_lpf_curvature:
+                            save_path = save_layer_curvature_pkl(
+                                layer_idx=prev_i,
+                                curvature_scores=model.lpf_curvature_scores[prev_i],
+                                save_dir=curvature_lpf_pkl_save_dir,
+                                metadata=curvature_metadata,
+                            )
+                            if save_path is not None:
+                                print(f"Saved LPF curvature pkl: {save_path}")
                             
                         analysis_utils.append_final_curvature_overall(
                             layer_id=prev_i,
@@ -334,10 +417,11 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                             curvature=model.curvature_scores[prev_i]["down_proj"],
                             seq_len=model.seqlen,
                             dataset_name=args.calib_data,
+                            analysis_dir=curvature_analysis_dir,
                         )
 
                 if (i == last_layer_idx) and ("lm_head" in target_ops):
-                    lm_curv = compute_op_curvature(
+                    lm_curv_result = compute_op_curvature(
                         operations=operations,
                         short_name="lm_head",
                         layer_id=i,
@@ -355,12 +439,22 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         sample_edge_ratio=args.sample_edge_ratio,
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
+                        shared_top_k=getattr(args, "shared_top_k", 10),
+                        shared_seq_select=getattr(args, "shared_seq_select", "top"),
+                        curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
+                        analysis_dir=curvature_analysis_dir,
                     )
+                    lm_curv = lm_curv_result["curvature"] if isinstance(lm_curv_result, dict) else lm_curv_result
+                    lm_lpf_curv = lm_curv_result.get("lpf_curvature") if isinstance(lm_curv_result, dict) else None
                     assert lm_curv is not None, "lm_head curv is None"
 
                     if lm_curv.T.shape == model.lm_head.weight.shape:
                         lm_curv = lm_curv.T
                     model.curvature_scores[i]["lm_head"] = lm_curv
+                    if save_lpf_curvature and lm_lpf_curv is not None:
+                        if lm_lpf_curv.T.shape == model.lm_head.weight.shape:
+                            lm_lpf_curv = lm_lpf_curv.T
+                        model.lpf_curvature_scores[i]["lm_head"] = lm_lpf_curv
 
                 if prev_layer_outputs is not None:
                     prev_layer_outputs[j] = {
@@ -398,23 +492,37 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
             for short, module in modules_items:
                 model.curvature_scores[i][short] = module.min_curvature
+                if save_lpf_curvature:
+                    model.lpf_curvature_scores[i][short] = module.min_lpf_curvature
                 analysis_utils.append_final_curvature_overall(
                     layer_id=i,
                     short_name=short,
                     curvature=module.min_curvature,
                     seq_len=model.seqlen,
                     dataset_name=args.calib_data,
+                    analysis_dir=curvature_analysis_dir,
                 )
                 del module.min_curvature
+                if save_lpf_curvature:
+                    del module.min_lpf_curvature
 
             save_path = save_layer_curvature_pkl(
                 layer_idx=i,
                 curvature_scores=model.curvature_scores[i],
                 save_dir=curvature_pkl_save_dir,
-                metadata=curvature_metadata,
+                metadata=raw_curvature_metadata,
             )
             if save_path is not None:
                 print(f"Saved curvature pkl: {save_path}")
+            if save_lpf_curvature:
+                save_path = save_layer_curvature_pkl(
+                    layer_idx=i,
+                    curvature_scores=model.lpf_curvature_scores[i],
+                    save_dir=curvature_lpf_pkl_save_dir,
+                    metadata=curvature_metadata,
+                )
+                if save_path is not None:
+                    print(f"Saved LPF curvature pkl: {save_path}")
 
             if i % 2 == 0:
                 torch.cuda.empty_cache()

@@ -10,15 +10,18 @@ alpha=0.9
 model_device="cuda:0"
 compute_device="cuda:1"
 seq_len=512
-sample_edge_ratio=0.1
+sample_edge_ratio=0.01
 sample_edge_num=-1
 prune_score_orders="high_to_low low_to_high"
 sparsity_schedule="input"
 # pp_seqlen="1024"
 pp_seqlen="$seq_len 1024 2048"
-curvature_dir="out/llama_8b/unstructured/curvature/"
+curvature_dir="out/llama_8b/unstructured/curvature/small_set_p_test/"
 load_curvature_non_curvature=1
-load_curvature_curvature=0
+load_curvature_curvature=1
+top_k_seq=-1
+seq_select="top"
+curvature_lpf_window=0
 # cuda_device=0
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 
@@ -28,7 +31,10 @@ export CUDA_VISIBLE_DEVICES=$cuda_device
 # Define function to run python command
 run_python_command() {
     prune_score_order=${5:-low_to_high}
-    use_l2_norm=${6:-0}
+    shared_top_k=${6:-$top_k_seq}
+    seq_select_arg=${7:-$seq_select}
+    lpf_window=${8:-$curvature_lpf_window}
+    use_l2_norm=${9:-0}
     l2_flag=""
     load_curvature_flag=""
     if [ "$use_l2_norm" = "1" ]; then
@@ -58,27 +64,34 @@ run_python_command() {
     --prune_score_order $prune_score_order \
     --sparsity_schedule $sparsity_schedule \
     --save_curvature_dir $curvature_dir \
+    --shared_top_k $shared_top_k \
+    --shared_seq_select $seq_select_arg \
+    --curvature_lpf_window $lpf_window \
+    $l2_flag \
     $load_curvature_flag
 }
 
 # llama-7b with magnitude pruning method
-echo "Running with graph curvature pruning method"
-run_python_command "curvature" "unstructured" "out/llama_8b/unstructured/curvature/" "c4_independent" "$prune_score_orders"
-# run_python_command "curvature" "unstructured" "out/llama_8b/unstructured/curvature/" "c4_independent" "$prune_score_orders" 1
+# echo "Running with graph curvature pruning method"
+run_python_command "curvature" "unstructured" "$curvature_dir" "c4_independent" "$prune_score_orders" -1 "top" 5
+run_python_command "curvature" "unstructured" "$curvature_dir" "c4_independent" "$prune_score_orders" -1 "top" 0
+# run_python_command "curvature" "unstructured" "$curvature_dir" "c4_independent" "$prune_score_orders" 10 "top"
+# run_python_command "curvature" "unstructured" "$curvature_dir" "c4_independent" "$prune_score_orders" 10 "median"
+# run_python_command "curvature" "unstructured" "$curvature_dir" "c4_independent" "$prune_score_orders" -1 "top" 0 1
 # echo "Finished graph curvature pruning method"
 
 
 # llama-7b with wanda pruning method
-echo "Running with wanda pruning method"
-run_python_command "wanda" "unstructured" "out/llama_8b/unstructured/wanda/" "c4_independent"
+# echo "Running with wanda pruning method"
+# run_python_command "wanda" "unstructured" "out/llama_8b/unstructured/wanda/small_set_p_test/" "c4_independent"
 # run_python_command "wanda" "2:4" "out/llama_8b/2-4/wanda/"
 # run_python_command "wanda" "4:8" "out/llama_8b/4-8/wanda/"
 # echo "Finished wanda pruning method"
 
 
 # llama-7b with magnitude pruning method
-echo "Running with magnitude pruning method"
-run_python_command "magnitude" "unstructured" "out/llama_8b/unstructured/magnitude/" "c4_independent"
+# echo "Running with magnitude pruning method"
+# run_python_command "magnitude" "unstructured" "out/llama_8b/unstructured/magnitude/" "c4_dependent"
 # run_python_command "magnitude" "2:4" "out/llama_8b/2-4/magnitude/"
 # run_python_command "magnitude" "4:8" "out/llama_8b/4-8/magnitude/"
 # echo "Finished magnitude pruning method"

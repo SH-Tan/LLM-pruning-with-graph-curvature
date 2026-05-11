@@ -187,14 +187,39 @@ def load_layer_curvature_pkl(pkl_path):
     return layer_idx, curvature_scores, metadata
 
 
-def load_curvature_pkls(save_dir, num_layers):
+def _curvature_seq_tag(shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
+    if shared_top_k is None:
+        return "curvature_pkl"
+    if shared_seq_select == "top" and int(curvature_lpf_window) <= 1:
+        return f"curv_topseq_{int(shared_top_k)}_pkl"
+    tag = f"curv_{shared_seq_select}_seq_{int(shared_top_k)}"
+    if int(curvature_lpf_window) > 1:
+        tag += f"_lpf_{int(curvature_lpf_window)}"
+    return f"{tag}_pkl"
+
+
+def load_curvature_pkls(
+    save_dir,
+    num_layers,
+    shared_top_k=None,
+    shared_seq_select="top",
+    curvature_lpf_window=0,
+):
     curvature_scores = [{} for _ in range(num_layers)]
     if save_dir is None or not os.path.isdir(save_dir):
         return curvature_scores
 
-    nested_save_dir = os.path.join(save_dir, "curvature_pkl")
-    if os.path.isdir(nested_save_dir):
-        save_dir = nested_save_dir
+    nested_dirs = []
+    if shared_top_k is not None:
+        nested_dirs.append(os.path.join(
+            save_dir,
+            _curvature_seq_tag(shared_top_k, shared_seq_select, curvature_lpf_window),
+        ))
+    nested_dirs.append(os.path.join(save_dir, "curvature_pkl"))
+    for nested_save_dir in nested_dirs:
+        if os.path.isdir(nested_save_dir):
+            save_dir = nested_save_dir
+            break
 
     for file_name in sorted(os.listdir(save_dir)):
         if not (file_name.startswith("layer_") and file_name.endswith("_curvature.pkl")):
@@ -215,7 +240,13 @@ def _ensure_loaded_curvature_scores(args, model):
     if load_dir is None:
         return None
 
-    model.curvature_scores = load_curvature_pkls(load_dir, len(model.model.layers))
+    model.curvature_scores = load_curvature_pkls(
+        load_dir,
+        len(model.model.layers),
+        shared_top_k=getattr(args, "shared_top_k", 10),
+        shared_seq_select=getattr(args, "shared_seq_select", "top"),
+        curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
+    )
     loaded = sum(len(layer_scores) for layer_scores in model.curvature_scores)
     print(f"Loaded {loaded} curvature tensors from {load_dir}")
     return model.curvature_scores

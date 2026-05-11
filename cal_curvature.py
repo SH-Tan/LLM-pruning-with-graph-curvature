@@ -3,6 +3,7 @@ import torch
 import ot
 
 import curv_analysis_utils as analysis_utils
+from curv_filter_utils import sliding_median_low_pass
 from curv_distribution_utils import (
     _build_node_distribution,
     _edge_distribution,
@@ -49,6 +50,8 @@ _SHARED_SAMPLE_IDX = None
 _SHARED_MODEL_META = None
 _SHARED_SEQ_LEN = 1
 _SHARED_TOP_K = 5
+_SHARED_SEQ_SELECT = "top"
+_SHARED_LPF_WINDOW = 0
 _WORKER_CURR_DIST_SHM = None
 _WORKER_PREV_IN_SHM = None
 _WORKER_NEXT_OUT_SHM = None
@@ -412,6 +415,7 @@ def _init_worker(
         next_score,
         seq_len=_SHARED_SEQ_LEN,
         top_k=_SHARED_TOP_K,
+        seq_select=_SHARED_SEQ_SELECT,
     )
 
     _WORKER_PREV_SEQ_METAS = prev_seq_metas
@@ -463,6 +467,15 @@ def _compute_edge_with_top_seq(edge):
         edge_res = _compute_edge_with_seq((seq_idx, edge))
         if edge_res:
             results.append(edge_res)
+    if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1 and results:
+        curvs = np.asarray([float(edge_res["curv"]) for edge_res in results], dtype=np.float64)
+        raw_idx = int(np.argmin(curvs))
+        smoothed_curvs = sliding_median_low_pass(curvs, _SHARED_LPF_WINDOW)
+        lpf_idx = int(np.argmin(smoothed_curvs))
+        best_res = dict(results[raw_idx])
+        best_res["curv"] = np.float64(curvs[raw_idx])
+        best_res["lpf_curv"] = np.float64(smoothed_curvs[lpf_idx])
+        return [best_res]
     return results
 
 
@@ -470,7 +483,7 @@ def _reset_shared_state():
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
     global _SHARED_SHORT_NAME, _SHARED_SAMPLE_IDX, _SHARED_MODEL_META, _SHARED_SEQ_LEN
-    global _SHARED_TOP_K
+    global _SHARED_TOP_K, _SHARED_SEQ_SELECT, _SHARED_LPF_WINDOW
 
     _SHARED_CURR_DIST = None
     _SHARED_PREV_IN = None
@@ -486,6 +499,8 @@ def _reset_shared_state():
     _SHARED_MODEL_META = None
     _SHARED_SEQ_LEN = 1
     _SHARED_TOP_K = 5
+    _SHARED_SEQ_SELECT = "top"
+    _SHARED_LPF_WINDOW = 0
     metric_utils.reset_shared_metric_state()
 
 
@@ -525,10 +540,15 @@ def compute_op_curvature(
     sample_edge_ratio = 1.,
     dataset_name="unknown_dataset",
     l2_norm=False,
+    shared_top_k=10,
+    shared_seq_select="top",
+    curvature_lpf_window=0,
+    analysis_dir=None,
 ):
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
     global _SHARED_SHORT_NAME, _SHARED_SAMPLE_IDX, _SHARED_MODEL_META, _SHARED_SEQ_LEN
+    global _SHARED_TOP_K, _SHARED_SEQ_SELECT, _SHARED_LPF_WINDOW
 
     if operations is None or layer_cache is None:
         return None
@@ -614,6 +634,7 @@ def compute_op_curvature(
     _SHARED_NEXT_OUT = next_out_distribution
     
     curvature = torch.full((out_dim, in_dim), float("inf"), dtype=torch.float64)
+    lpf_curvature = None
 
     curr_dist_np = np.asarray(curr_dist, dtype=np.float64)
     curr_dist_finite_edges = int(np.isfinite(curr_dist_np).sum())
@@ -627,6 +648,7 @@ def compute_op_curvature(
         curvature_shape=curvature.shape,
         seq_len=seq_len,
         dataset_name=dataset_name,
+        analysis_dir=analysis_dir,
     )
     precomputed_prev_dists = None
     precomputed_next_dists = None
@@ -732,11 +754,15 @@ def compute_op_curvature(
         seq_len = 1
         
     _SHARED_SEQ_LEN = seq_len
-    _SHARED_TOP_K = 10
+    _SHARED_TOP_K = int(shared_top_k)
+    _SHARED_SEQ_SELECT = shared_seq_select
+    _SHARED_LPF_WINDOW = int(curvature_lpf_window)
+    if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1:
+        lpf_curvature = torch.full((out_dim, in_dim), float("inf"), dtype=torch.float64)
 
     prev_score = None
     next_score = None
-    if not l2_norm and seq_len > 1:
+    if _SHARED_TOP_K != -1 and not l2_norm and seq_len > 1:
         prev_score, next_score = metric_utils.build_neighbor_score_matrices(
             seq_len=seq_len,
             sp=sp,
@@ -755,11 +781,14 @@ def compute_op_curvature(
         base_owned_shms.append(shm)
 
     try:
-        total_edge_seq_tasks = len(finite_edges) * _SHARED_TOP_K
+        effective_top_k = _SHARED_SEQ_LEN if _SHARED_TOP_K == -1 else min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
+        total_edge_seq_tasks = len(finite_edges) * max(effective_top_k, 0)
         print(
-            f"Will evaluate top {min(_SHARED_TOP_K, _SHARED_SEQ_LEN)} score-ranked seq positions "
+            f"Will evaluate {effective_top_k} seq positions with {_SHARED_SEQ_SELECT} selection "
             f"for about {total_edge_seq_tasks} edge/seq tasks from {len(finite_edges)} edges."
         )
+        if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1:
+            print(f"Using sliding median low-pass filter with window={_SHARED_LPF_WINDOW}.")
         print(f'Start creating Pool....')
 
         with ctx.Pool(processes=proc, initializer=_init_worker,
@@ -783,6 +812,10 @@ def compute_op_curvature(
                     curv = float(edge_res["curv"])
                     if curv < float(curvature[v_idx, u_idx]):
                         curvature[v_idx, u_idx] = curv
+                    if lpf_curvature is not None and "lpf_curv" in edge_res:
+                        lpf_curv = float(edge_res["lpf_curv"])
+                        if lpf_curv < float(lpf_curvature[v_idx, u_idx]):
+                            lpf_curvature[v_idx, u_idx] = lpf_curv
                     mu_len_total += float(edge_res["mu_len"])
                     nu_len_total += float(edge_res["nu_len"])
                     mu_nu_count += 1
@@ -820,4 +853,9 @@ def compute_op_curvature(
     )
 
     # curvature = _merge_gqa_curvature(curvature, model, layer_id, short_name)
+    if lpf_curvature is not None:
+        return {
+            "curvature": curvature,
+            "lpf_curvature": lpf_curvature,
+        }
     return curvature

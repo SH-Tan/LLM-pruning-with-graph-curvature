@@ -4,20 +4,22 @@ _SHARED_PREV_SCORE = None
 _SHARED_NEXT_SCORE = None
 _SHARED_SEQ_LEN = 1
 _SHARED_TOP_K = 5
+_SHARED_SEQ_SELECT = "top"
 
 
-def set_shared_metric_state(prev_score, next_score, seq_len, top_k):
+def set_shared_metric_state(prev_score, next_score, seq_len, top_k, seq_select="top"):
     global _SHARED_PREV_SCORE, _SHARED_NEXT_SCORE
-    global _SHARED_SEQ_LEN, _SHARED_TOP_K
+    global _SHARED_SEQ_LEN, _SHARED_TOP_K, _SHARED_SEQ_SELECT
 
     _SHARED_PREV_SCORE = prev_score
     _SHARED_NEXT_SCORE = next_score
     _SHARED_SEQ_LEN = int(seq_len)
     _SHARED_TOP_K = int(top_k)
+    _SHARED_SEQ_SELECT = seq_select
 
 
 def reset_shared_metric_state():
-    set_shared_metric_state(None, None, 1, 5)
+    set_shared_metric_state(None, None, 1, 5, "top")
 
 
 def _as_seq_distribution_matrix(distribution, seq_len):
@@ -154,11 +156,18 @@ def top_seq_for_edge(edge):
     metric, _, _ = score_components_for_edge(edge)
 
     np.nan_to_num(metric, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    total_count = min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
+    total_count = _SHARED_SEQ_LEN if _SHARED_TOP_K == -1 else min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
     if total_count <= 0:
         return []
 
-    ordered = np.argsort(-metric, kind="stable")
+    if _SHARED_TOP_K == -1:
+        return [int(seq_idx) for seq_idx in range(_SHARED_SEQ_LEN)]
+
+    if _SHARED_SEQ_SELECT == "median":
+        median_value = float(np.median(metric))
+        ordered = np.argsort(np.abs(metric - median_value), kind="stable")
+    else:
+        ordered = np.argsort(-metric, kind="stable")
     return [int(seq_idx) for seq_idx in ordered[:total_count]]
 
 

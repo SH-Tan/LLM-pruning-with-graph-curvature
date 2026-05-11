@@ -1,6 +1,6 @@
 import torch
 
-from data import get_loaders
+from data_c4 import get_loaders_c4
 from layerwrapper import WrappedGPT
 from prune import (
     find_layers,
@@ -36,14 +36,15 @@ def compute_wanda_scores(args, model, tokenizer, device=torch.device("cuda:0")):
     model.config.use_cache = False
 
     print(f"loading calibration data for WANDA scores with seqlen={model.seqlen}")
-    dataloader, _ = get_loaders(
-        "c4",
+    dataloader, _ = get_loaders_c4(
+        args.calib_data,
         nsamples=args.nsamples,
         seed=args.seed,
         seqlen=model.seqlen,
         tokenizer=tokenizer,
     )
     print("dataset loading complete")
+    
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(
             model, dataloader, device, args.nsamples
