@@ -10,6 +10,7 @@ from curv_tensor_utils import build_layer_cache
 from data_c4 import get_loaders_c4
 from layerwrapper_curv import collect_layer_data, _make_lm_head_op
 from prune import (
+    align_curvature_to_weight_shape,
     find_layers,
     load_curvature_pkls,
     prepare_calibration_input,
@@ -51,11 +52,62 @@ def _curvature_save_metadata(args):
         "nsamples": getattr(args, "nsamples", None),
         "alpha": getattr(args, "alpha", None),
         "l2_norm": getattr(args, "l2_norm", False),
+        "l2_norm_mode": getattr(args, "l2_norm_mode", "per_example"),
         "prune_method": getattr(args, "prune_method", None),
         "shared_top_k": getattr(args, "shared_top_k", 10),
         "shared_seq_select": getattr(args, "shared_seq_select", "top"),
         "curvature_lpf_window": getattr(args, "curvature_lpf_window", 0),
+        "curvature_layout": "weight_out_in",
     }
+
+
+def _accumulate_l2_stat(stats, name, node):
+    if name is None or node is None or not torch.is_tensor(node) or node.numel() == 0:
+        return
+
+    node = node.detach().cpu().to(dtype=torch.float64)
+    if node.dim() == 4:
+        return
+    if node.dim() == 3:
+        node = node.reshape(-1, node.shape[-1])
+    elif node.dim() != 2:
+        node = node.reshape(1, -1)
+
+    sumsq = (node ** 2).sum(dim=0)
+    if name in stats:
+        stats[name] += sumsq
+    else:
+        stats[name] = sumsq
+
+
+def _attention_l2_node(attention, short_name):
+    if attention is None or not torch.is_tensor(attention) or attention.dim() != 4:
+        return None
+    if attention.shape[0] != 1:
+        raise ValueError(f"Expected batch size 1 for A node, got shape {tuple(attention.shape)}")
+
+    attention = attention.detach().cpu().squeeze(0)
+    q_heads, seq_q, seq_k = attention.shape
+    if short_name == "q_proj":
+        return attention.permute(1, 0, 2).contiguous().view(seq_q, q_heads * seq_k)
+    if short_name == "k_proj":
+        return attention.transpose(-1, -2).permute(1, 0, 2).contiguous().view(seq_k, q_heads * seq_q)
+    return None
+
+
+def _accumulate_operation_l2_stats(stats, operations, target_ops):
+    for name, node in operations.items():
+        _accumulate_l2_stat(stats, name, node)
+
+    attention = operations.get("A")
+    for short in target_ops:
+        if short not in {"q_proj", "k_proj"}:
+            continue
+        _accumulate_l2_stat(stats, f"{short}_A_out", _attention_l2_node(attention, short))
+
+
+def _finalize_l2_stats(stats):
+    return {name: torch.sqrt(value) for name, value in stats.items()}
 
 
 def _curvature_pkl_dir(base_dir, shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
@@ -238,6 +290,37 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     )
 
             new_inps = torch.empty_like(inps, device="cpu")
+            l2_norm_stats = None
+            if getattr(args, "l2_norm", False) and getattr(args, "l2_norm_mode", "per_example") == "all_examples":
+                print(f"Collecting all-example L2 stats for layer {i}")
+                l2_sumsq = {}
+                for j in range(args.nsamples):
+                    x = inps[j:j + 1].to(model_device, non_blocking=True)
+                    next_layer = layers[i + 1] if i < last_layer_idx else None
+                    with torch.no_grad():
+                        x_out, operations, _, _, _, _ = collect_layer_data(
+                            layer,
+                            x,
+                            attention_mask,
+                            position_ids,
+                            model,
+                            next_layer=next_layer,
+                        )
+
+                    x_out = x_out.detach().cpu()
+                    if prev_layer_outputs is not None and prev_layer_outputs[j] is not None:
+                        for name in ["o_proj", "gate_up_out", "down_proj"]:
+                            if name in prev_layer_outputs[j]:
+                                operations[f"prev_{name}"] = prev_layer_outputs[j][name]
+                    if i == last_layer_idx:
+                        operations.update(_make_lm_head_op(model, x_out))
+
+                    _accumulate_operation_l2_stats(l2_sumsq, operations, target_ops)
+                    del operations, x, x_out
+                    if j % 8 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                l2_norm_stats = _finalize_l2_stats(l2_sumsq)
+                del l2_sumsq
 
             for j in range(args.nsamples):
                 if torch.cuda.is_available():
@@ -330,6 +413,8 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         sample_edge_ratio=args.sample_edge_ratio,
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
+                        l2_norm_mode=getattr(args, "l2_norm_mode", "per_example"),
+                        l2_norm_stats=l2_norm_stats,
                         shared_top_k=getattr(args, "shared_top_k", 10),
                         shared_seq_select=getattr(args, "shared_seq_select", "top"),
                         curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
@@ -341,21 +426,20 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     lpf_curv = curv_result.get("lpf_curvature") if isinstance(curv_result, dict) else None
                     assert curv is not None, f"{short} curv is None"
 
-                    param_curv = curv
-                    assert (
-                        param_curv.shape == module.weight.shape
-                        or param_curv.T.shape == module.weight.shape
-                    ), f"Unexpected curvature shape for {short}: {tuple(param_curv.shape)} vs {tuple(module.weight.shape)}"
-
-                    if param_curv.T.shape == module.weight.shape:
-                        param_curv = param_curv.T
+                    param_curv = align_curvature_to_weight_shape(
+                        curv,
+                        module.weight.shape,
+                        context=f"layer {i} {short} curvature",
+                    )
 
                     torch.minimum(module.min_curvature, param_curv, out=module.min_curvature)
 
                     if save_lpf_curvature and lpf_curv is not None:
-                        param_lpf_curv = lpf_curv
-                        if param_lpf_curv.T.shape == module.weight.shape:
-                            param_lpf_curv = param_lpf_curv.T
+                        param_lpf_curv = align_curvature_to_weight_shape(
+                            lpf_curv,
+                            module.weight.shape,
+                            context=f"layer {i} {short} lpf_curvature",
+                        )
                         torch.minimum(module.min_lpf_curvature, param_lpf_curv, out=module.min_lpf_curvature)
 
                 if prev_layer_outputs is not None and prev_layer_outputs[j] is not None and has_down_proj_target:
@@ -378,6 +462,8 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         sample_edge_ratio=args.sample_edge_ratio,
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
+                        l2_norm_mode=getattr(args, "l2_norm_mode", "per_example"),
+                        l2_norm_stats=l2_norm_stats,
                         shared_top_k=getattr(args, "shared_top_k", 10),
                         shared_seq_select=getattr(args, "shared_seq_select", "top"),
                         curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
@@ -391,14 +477,11 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
                     if prev_i >= 0:
                         prev_weight = model.model.layers[prev_i].mlp.down_proj.weight.detach().cpu()
-                        param_curv = curv
-                        assert (
-                            param_curv.shape == prev_weight.shape
-                            or param_curv.T.shape == prev_weight.shape
-                        ), f"Unexpected curvature shape for prev down_proj: {tuple(param_curv.shape)} vs {tuple(prev_weight.shape)}"
-
-                        if param_curv.T.shape == prev_weight.shape:
-                            param_curv = param_curv.T
+                        param_curv = align_curvature_to_weight_shape(
+                            curv,
+                            prev_weight.shape,
+                            context=f"layer {prev_i} down_proj curvature",
+                        )
 
                         if "down_proj" not in model.curvature_scores[prev_i]:
                             model.curvature_scores[prev_i]["down_proj"] = param_curv
@@ -410,9 +493,11 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                             )
 
                         if save_lpf_curvature and lpf_curv is not None:
-                            param_lpf_curv = lpf_curv
-                            if param_lpf_curv.T.shape == prev_weight.shape:
-                                param_lpf_curv = param_lpf_curv.T
+                            param_lpf_curv = align_curvature_to_weight_shape(
+                                lpf_curv,
+                                prev_weight.shape,
+                                context=f"layer {prev_i} down_proj lpf_curvature",
+                            )
                             if "down_proj" not in model.lpf_curvature_scores[prev_i]:
                                 model.lpf_curvature_scores[prev_i]["down_proj"] = param_lpf_curv
                             else:
@@ -478,6 +563,8 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         sample_edge_ratio=args.sample_edge_ratio,
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
+                        l2_norm_mode=getattr(args, "l2_norm_mode", "per_example"),
+                        l2_norm_stats=l2_norm_stats,
                         shared_top_k=getattr(args, "shared_top_k", 10),
                         shared_seq_select=getattr(args, "shared_seq_select", "top"),
                         curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
@@ -488,12 +575,18 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     lm_lpf_curv = lm_curv_result.get("lpf_curvature") if isinstance(lm_curv_result, dict) else None
                     assert lm_curv is not None, "lm_head curv is None"
 
-                    if lm_curv.T.shape == model.lm_head.weight.shape:
-                        lm_curv = lm_curv.T
+                    lm_curv = align_curvature_to_weight_shape(
+                        lm_curv,
+                        model.lm_head.weight.shape,
+                        context=f"layer {i} lm_head curvature",
+                    )
                     model.curvature_scores[i]["lm_head"] = lm_curv
                     if save_lpf_curvature and lm_lpf_curv is not None:
-                        if lm_lpf_curv.T.shape == model.lm_head.weight.shape:
-                            lm_lpf_curv = lm_lpf_curv.T
+                        lm_lpf_curv = align_curvature_to_weight_shape(
+                            lm_lpf_curv,
+                            model.lm_head.weight.shape,
+                            context=f"layer {i} lm_head lpf_curvature",
+                        )
                         model.lpf_curvature_scores[i]["lm_head"] = lm_lpf_curv
 
                 if prev_layer_outputs is not None:

@@ -33,7 +33,12 @@ def _weight_from_model(model, short_name, layer_id, device=None):
 
 def _operation_distance_matrix_torch(model, operations, short_name, layer_id, device):
     weight = _weight_from_model(model, short_name, layer_id, device=device)
-    abs_w = weight.abs().float()
+    abs_w = weight.abs().to(dtype=torch.float64)
     weight_norm = torch.where(abs_w > 0, 1.0 / abs_w, torch.full_like(abs_w, float("inf")))
-    return weight_norm.transpose(0, 1).contiguous()
-
+    dist = weight_norm.transpose(0, 1).contiguous()
+    if dist.shape != (weight.shape[1], weight.shape[0]):
+        raise ValueError(
+            f"Unexpected cost matrix shape for {short_name}: "
+            f"got {tuple(dist.shape)}, expected {(weight.shape[1], weight.shape[0])}"
+        )
+    return dist

@@ -1,9 +1,11 @@
 import csv
+import glob
 import os
 
 import numpy as np
 import torch
 
+from prune import align_curvature_to_weight_shape
 from curv_prune_utils import _get_prunable_module
 
 
@@ -61,12 +63,11 @@ def _iter_curvature_entries(model):
     for layer_idx, layer_scores in enumerate(getattr(model, "curvature_scores", [])):
         for op_name, curv in layer_scores.items():
             module = _get_prunable_module(model, layer_idx, op_name)
-            curv_cpu = _as_cpu_curvature(curv)
-            if curv_cpu.shape != module.weight.data.shape:
-                raise ValueError(
-                    f"Curvature shape mismatch for layer {layer_idx} {op_name}: "
-                    f"{tuple(curv_cpu.shape)} vs {tuple(module.weight.data.shape)}"
-                )
+            curv_cpu = align_curvature_to_weight_shape(
+                curv,
+                module.weight.data.shape,
+                context=f"layer {layer_idx} {op_name} scoped curvature",
+            ).cpu()
 
             finite_mask = torch.isfinite(curv_cpu)
             finite_count = int(finite_mask.sum().item())
@@ -150,6 +151,7 @@ def save_eval_records_csv(records, csv_path):
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     fieldnames = [
         "method",
+        "method_tag",
         "prune_scope",
         "score_order",
         "target_sparsity",
@@ -164,6 +166,149 @@ def save_eval_records_csv(records, csv_path):
             writer.writerow({name: record.get(name) for name in fieldnames})
 
     return csv_path
+
+
+def _read_eval_records(csv_paths):
+    records_by_key = {}
+    for csv_path in csv_paths:
+        if not os.path.isfile(csv_path):
+            continue
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    record = {
+                        "method": row["method"],
+                        "method_tag": row.get("method_tag") or row["method"],
+                        "prune_scope": row.get("prune_scope", "global"),
+                        "score_order": row["score_order"],
+                        "target_sparsity": float(row["target_sparsity"]),
+                        "pp_seq_len": int(row["pp_seq_len"]),
+                        "ppl_test": float(row["ppl_test"]),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+                key = (
+                    record["method_tag"],
+                    record["prune_scope"],
+                    record["score_order"],
+                    record["target_sparsity"],
+                    record["pp_seq_len"],
+                )
+                records_by_key[key] = record
+    return list(records_by_key.values())
+
+
+def draw_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
+    csv_paths = sorted(glob.glob(os.path.join(compare_dir, "pp_records_*.csv")))
+    records = _read_eval_records(csv_paths)
+    if not records:
+        return None
+
+    try:
+        mpl_config_dir = os.path.join("/tmp", "matplotlib")
+        os.makedirs(mpl_config_dir, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", mpl_config_dir)
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        os.makedirs(plot_dir, exist_ok=True)
+        marker_path = os.path.join(plot_dir, "method_compare_plot_error.txt")
+        with open(marker_path, "w", encoding="utf-8") as f:
+            f.write(f"Could not draw method comparison plot: {exc}\n")
+        return None
+
+    os.makedirs(plot_dir, exist_ok=True)
+    pp_lens = [int(seq) for seq in eval_seq_lens] if eval_seq_lens else []
+    if not pp_lens:
+        pp_lens = sorted({int(record["pp_seq_len"]) for record in records})
+    pp_lens = [seq for seq in pp_lens if any(int(record["pp_seq_len"]) == seq for record in records)]
+    if not pp_lens:
+        return None
+
+    def draw_scope_plot(scope_label, curvature_scope):
+        scope_records = [
+            record for record in records
+            if record["method"] != "curvature" or record["prune_scope"] == curvature_scope
+        ]
+        if not scope_records:
+            return None
+
+        scope_pp_lens = [
+            seq for seq in pp_lens
+            if any(int(record["pp_seq_len"]) == seq for record in scope_records)
+        ]
+        if not scope_pp_lens:
+            return None
+
+        fig, axes = plt.subplots(
+            1,
+            len(scope_pp_lens),
+            figsize=(5.0 * len(scope_pp_lens), 3.6),
+            squeeze=False,
+        )
+        for ax, pp_seq_len in zip(axes[0], scope_pp_lens):
+            seq_records = [
+                record for record in scope_records
+                if int(record["pp_seq_len"]) == pp_seq_len
+            ]
+            grouped = {}
+            for record in seq_records:
+                label = record["method_tag"]
+                if record["method"] == "curvature":
+                    label = label.replace("curvature_", "curv_")
+                    label = f"{label}_{scope_label}_{record['score_order']}"
+                grouped.setdefault(label, []).append(record)
+
+            y_values = []
+            for label, group_records in sorted(grouped.items()):
+                group_records = sorted(group_records, key=lambda item: item["target_sparsity"])
+                xs = np.asarray([item["target_sparsity"] for item in group_records], dtype=np.float64)
+                ys = np.asarray([item["ppl_test"] for item in group_records], dtype=np.float64)
+                finite = np.isfinite(xs) & np.isfinite(ys)
+                if not finite.any():
+                    continue
+                y_values.extend(ys[finite].tolist())
+                ax.plot(
+                    xs[finite],
+                    ys[finite],
+                    marker="o",
+                    linewidth=1.1,
+                    markersize=2.8,
+                    label=label,
+                )
+
+            if y_values:
+                ymin = min(y_values)
+                ymax = max(y_values)
+                pad = max((ymax - ymin) * 0.08, 1e-6)
+                ax.set_ylim(ymin - pad, ymax + pad)
+
+            ax.set_title(f"pp_seqlen={pp_seq_len}")
+            ax.set_xlabel("target sparsity")
+            ax.grid(True, alpha=0.3)
+
+        axes[0][0].set_ylabel("perplexity")
+        handles, labels = axes[0][-1].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 5), fontsize=7)
+        fig.suptitle(f"All-layer method comparison ({scope_label})", y=1.02)
+        fig.tight_layout()
+        plot_path = os.path.join(plot_dir, f"all_layers_method_compare_{scope_label}.png")
+        fig.savefig(plot_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        return plot_path
+
+    plot_paths = [
+        path for path in [
+            draw_scope_plot("global", "global"),
+            draw_scope_plot("local", "per_layer"),
+        ]
+        if path is not None
+    ]
+    return plot_paths or None
 
 
 def draw_ppl_vs_sparsity(records, plot_path):

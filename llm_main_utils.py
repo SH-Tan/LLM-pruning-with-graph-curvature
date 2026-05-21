@@ -3,6 +3,7 @@ import os
 import torch
 
 from curv_layer_prune_utils import (
+    draw_method_comparison,
     draw_ppl_vs_sparsity,
     prune_scoped_curvature,
     save_eval_records_csv,
@@ -10,6 +11,7 @@ from curv_layer_prune_utils import (
 from curv_prune_utils import prune_global_curvature
 from eval import eval_ppl
 from per_layer_eval_utils import (
+    draw_per_layer_method_comparison,
     draw_per_layer_ppl_vs_sparsity,
     layer_sparsity,
     list_curvature_pkl_layers,
@@ -17,6 +19,7 @@ from per_layer_eval_utils import (
     prune_curvature_layer,
     prune_magnitude_layer,
     prune_wanda_layer,
+    save_per_layer_records_csv,
 )
 from prune import check_sparsity
 from prune_magnitude import prune_magnitude
@@ -24,7 +27,10 @@ from prune_wanda import compute_wanda_scores, prune_wanda
 
 
 def l2_path_tag(args):
-    return "L2_norm" if getattr(args, "l2_norm", False) else "no_L2_norm"
+    if not getattr(args, "l2_norm", False):
+        return "no_L2_norm"
+    l2_norm_mode = getattr(args, "l2_norm_mode", "per_example")
+    return "L2_norm" if l2_norm_mode == "per_example" else f"L2_norm_{l2_norm_mode}"
 
 
 def curvature_seq_tag(shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
@@ -121,6 +127,7 @@ def append_eval_run_header(log_file, args, target_ratio, score_order):
             f"score_seq_len={args.seqlen}, "
             f"calib_data={args.calib_data}, "
             f"l2_norm={args.l2_norm}, "
+            f"l2_norm_mode={getattr(args, 'l2_norm_mode', 'per_example')}, "
             f"curvature_prune_scope={getattr(args, 'curvature_prune_scope', 'global')}, "
             f"shared_top_k={args.shared_top_k}, "
             f"shared_seq_select={args.shared_seq_select}, "
@@ -225,10 +232,23 @@ def per_layer_result_tag(args):
         args.shared_seq_select,
         args.curvature_lpf_window,
     ).removesuffix("_pkl")
-    return f"{args.prune_method}_{setting_tag}"
+    return f"{args.prune_method}_{l2_path_tag(args)}_{setting_tag}"
+
+
+def pp_result_tag(args):
+    if args.prune_method != "curvature":
+        return args.prune_method
+    return f"{per_layer_result_tag(args)}_{getattr(args, 'curvature_prune_scope', 'global')}"
 
 
 def reference_layer_indices(args, get_llm_fn, model_device, base_wanda_scores):
+    def selected(layer_ids):
+        requested = getattr(args, "per_layer_ids", None)
+        if requested is None:
+            return layer_ids
+        requested_set = set(int(layer_idx) for layer_idx in requested)
+        return [layer_idx for layer_idx in layer_ids if int(layer_idx) in requested_set]
+
     if args.prune_method == "curvature":
         layer_ids = list_curvature_pkl_layers(
             args.load_curvature_dir or args.save_curvature_dir,
@@ -236,6 +256,7 @@ def reference_layer_indices(args, get_llm_fn, model_device, base_wanda_scores):
             args.shared_seq_select,
             args.curvature_lpf_window,
         )
+        layer_ids = selected(layer_ids)
         if not layer_ids:
             raise ValueError("No curvature layer PKLs found for per-layer evaluation")
         return layer_ids
@@ -247,15 +268,16 @@ def reference_layer_indices(args, get_llm_fn, model_device, base_wanda_scores):
             args.shared_seq_select,
             args.curvature_lpf_window,
         )
+        layer_ids = selected(layer_ids)
         if layer_ids:
             return layer_ids
 
     if args.prune_method == "wanda" and base_wanda_scores is not None:
-        return list(range(len(base_wanda_scores)))
+        return selected(list(range(len(base_wanda_scores))))
 
     ref_model = get_llm_fn(args.model, args.cache_dir, model_device, args.seqlen)
     try:
-        return list(range(len(ref_model.model.layers)))
+        return selected(list(range(len(ref_model.model.layers))))
     finally:
         del ref_model
         if torch.cuda.is_available():
@@ -279,6 +301,9 @@ def run_per_layer_eval(
     result_dir = os.path.dirname(save_filepath)
     result_tag = per_layer_result_tag(args)
     plot_dir = os.path.join(result_dir, f"per_layer_plots_{result_tag}")
+    compare_dir = args.per_layer_compare_dir or result_dir
+    compare_plot_dir = os.path.join(compare_dir, "method_compare_plots")
+    all_records = []
     if args.prune_method == "curvature":
         prune_score_orders = ["high_to_low"]
 
@@ -304,6 +329,7 @@ def run_per_layer_eval(
                     args.curvature_lpf_window,
                 )
 
+            nonzero_sparsity_idx = 0
             for target_ratio in sparsity_ratios:
                 print(
                     f"per-layer eval: layer={layer_idx} sparsity={target_ratio:.4f} "
@@ -315,7 +341,10 @@ def run_per_layer_eval(
                 args.sparsity_ratio = target_ratio
 
                 score_cutoff = None
+                report_rank_offset = None
                 if target_ratio != 0:
+                    report_rank_offset = nonzero_sparsity_idx * 25
+                    nonzero_sparsity_idx += 1
                     if args.prune_method == "curvature":
                         if layer_curvature_scores is None:
                             raise ValueError(
@@ -327,6 +356,7 @@ def run_per_layer_eval(
                             layer_idx,
                             layer_curvature_scores,
                             edge_log_path=save_filepath,
+                            report_rank_offset=report_rank_offset,
                         )
                     elif args.prune_method == "wanda":
                         _, score_cutoff = prune_wanda_layer(
@@ -338,6 +368,7 @@ def run_per_layer_eval(
                             prune_n=prune_n,
                             prune_m=prune_m,
                             edge_log_path=save_filepath,
+                            report_rank_offset=report_rank_offset,
                         )
                     elif args.prune_method == "magnitude":
                         _, score_cutoff = prune_magnitude_layer(
@@ -348,6 +379,7 @@ def run_per_layer_eval(
                             prune_n=prune_n,
                             prune_m=prune_m,
                             edge_log_path=save_filepath,
+                            report_rank_offset=report_rank_offset,
                         )
 
                 model_actual_sparsity = check_sparsity(current_model)
@@ -370,6 +402,7 @@ def run_per_layer_eval(
                     )
                     record = {
                         "method": args.prune_method,
+                        "method_tag": result_tag,
                         "layer_idx": int(layer_idx),
                         "score_order": score_order,
                         "target_sparsity": float(target_ratio),
@@ -383,6 +416,7 @@ def run_per_layer_eval(
                         ),
                     }
                     layer_records.append(record)
+                    all_records.append(record)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
@@ -400,6 +434,26 @@ def run_per_layer_eval(
             )
             if plot_paths:
                 print(f"Saved layer {layer_idx} plot to {plot_paths[-1]}")
+
+            with open(save_filepath, "a+", encoding="utf-8") as f:
+                print("", file=f, flush=True)
+
+    if all_records:
+        layer_tag = "all_layers"
+        requested_layers = getattr(args, "per_layer_ids", None)
+        if requested_layers is not None and len(requested_layers) == 1:
+            layer_tag = f"layer_{int(requested_layers[0]):03d}"
+        csv_path = os.path.join(compare_dir, f"per_layer_records_{result_tag}_{layer_tag}.csv")
+        saved_csv = save_per_layer_records_csv(all_records, csv_path)
+        if saved_csv is not None:
+            print(f"Saved per-layer records: {saved_csv}")
+        compare_paths = draw_per_layer_method_comparison(
+            compare_dir,
+            compare_plot_dir,
+            eval_seq_lens=eval_seq_lens,
+        )
+        if compare_paths:
+            print(f"Saved method comparison plot: {compare_paths[-1]}")
 
 
 def run_pp_eval(
@@ -483,6 +537,7 @@ def run_pp_eval(
                 eval_records.append(
                     {
                         "method": args.prune_method,
+                        "method_tag": per_layer_result_tag(args),
                         "prune_scope": (
                             args.curvature_prune_scope
                             if args.prune_method == "curvature"
@@ -545,13 +600,34 @@ def run_pp_eval(
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
+            with open(save_filepath, "a+", encoding="utf-8") as f:
+                print("", file=f, flush=True)
+
     if eval_records:
         result_dir = os.path.dirname(save_filepath)
-        scope = args.curvature_prune_scope if args.prune_method == "curvature" else "global"
-        result_tag = f"{args.prune_method}_{scope}"
+        result_tag = pp_result_tag(args)
         csv_path = os.path.join(result_dir, f"ppl_vs_sparsity_{result_tag}.csv")
         plot_path = os.path.join(result_dir, f"ppl_vs_sparsity_{result_tag}.png")
         save_eval_records_csv(eval_records, csv_path)
         drawn_path = draw_ppl_vs_sparsity(eval_records, plot_path)
         if drawn_path is not None:
             print(f"Saved PPL vs sparsity plot: {drawn_path}")
+
+        compare_dir = args.per_layer_compare_dir or result_dir
+        compare_plot_dir = os.path.join(compare_dir, "all_layer_method_compare_plots")
+        compare_tag = pp_result_tag(args)
+        compare_csv = os.path.join(compare_dir, f"pp_records_{compare_tag}.csv")
+        saved_compare_csv = save_eval_records_csv(eval_records, compare_csv)
+        if saved_compare_csv is not None:
+            print(f"Saved all-layer comparison records: {saved_compare_csv}")
+        compare_plot = draw_method_comparison(
+            compare_dir,
+            compare_plot_dir,
+            eval_seq_lens=eval_seq_lens,
+        )
+        if compare_plot is not None:
+            if isinstance(compare_plot, list):
+                for plot_path in compare_plot:
+                    print(f"Saved all-layer method comparison plot: {plot_path}")
+            else:
+                print(f"Saved all-layer method comparison plot: {compare_plot}")

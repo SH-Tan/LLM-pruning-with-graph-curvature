@@ -38,13 +38,13 @@ def adaptive_chunksize(max_chunk=512):
 
 def _min_plus_torch(a, b, chunk_k=256, chunk_p=256):
     if a.numel() == 0 or b.numel() == 0:
-        return torch.empty((a.shape[0], b.shape[1]), dtype=torch.float32, device=a.device)
+        return torch.empty((a.shape[0], b.shape[1]), dtype=a.dtype, device=a.device)
 
     m, n = a.shape
     n2, p = b.shape
     assert n == n2, f"Dimension mismatch: {a.shape} vs {b.shape}"
 
-    result = torch.full((m, p), float("inf"), dtype=torch.float32, device=a.device)
+    result = torch.full((m, p), float("inf"), dtype=a.dtype, device=a.device)
 
     for start_k in range(0, n, chunk_k):
         end_k = min(start_k + chunk_k, n)
@@ -60,26 +60,16 @@ def _min_plus_torch(a, b, chunk_k=256, chunk_p=256):
     return result
 
 
-def _to_cpu_numpy(x, dtype=np.float32):
-    if x is None:
-        return None
-    if isinstance(x, np.ndarray):
-        return x.astype(dtype, copy=False)
-    if torch.is_tensor(x):
-        return x.detach().to("cpu", copy=False).numpy().astype(dtype, copy=False)
-    return np.asarray(x, dtype=dtype)
-
-
 def _get_matrix_torch(layer_cache, name, device):
     matrix = layer_cache.get(f"{name}__dist")
     if matrix is None:
         return None
     if torch.is_tensor(matrix):
         return matrix if matrix.device.type == device.split(":")[0] else matrix.to(device, non_blocking=True)
-    arr = np.asarray(matrix, dtype=np.float32)
+    arr = np.asarray(matrix, dtype=np.float64)
     if arr.ndim != 2:
         return None
-    return torch.as_tensor(arr, dtype=torch.float32, device=device)
+    return torch.as_tensor(arr, dtype=torch.float64, device=device)
 
 
 def _all_cost_matrices(layer_cache, names, device):
@@ -127,6 +117,7 @@ def _get_qk_next_cost(cost, name, meta, device = "cpu"):
     num_kv_heads = meta["num_kv_heads"]
     repeat = meta["repeat"]
 
+    cost = cost.to(torch.float64)
     b, seq, d = cost.shape
     dtype = cost.dtype
 

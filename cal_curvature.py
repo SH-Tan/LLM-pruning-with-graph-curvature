@@ -338,6 +338,10 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
     u_idx, v_idx = (int(edge[0]), int(edge[1]))
     metric_score, metric_prev_score, metric_next_score = metric_utils.score_components_for_edge(edge)
 
+    curr_weight_magnitude = _SHARED_SP.get("curr_weight_magnitude") if _SHARED_SP is not None else None
+    original_weight_magnitude = None
+    if curr_weight_magnitude is not None:
+        original_weight_magnitude = float(curr_weight_magnitude[u_idx, v_idx])
     detail = {
         "in_neighbors": [int(idx) for idx in prev_active.tolist()],
         "out_neighbors": [int(idx) for idx in next_active.tolist()],
@@ -347,21 +351,55 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
         "prev_neighbors_to_v_cost": np.asarray(cost[:-1, -1], dtype=np.float64).tolist(),
         "u_to_out_neighbors_cost": np.asarray(cost[-1, :-1], dtype=np.float64).tolist(),
         "prev_neighbors_to_out_neighbors_cost": np.asarray(cost[:-1, :-1], dtype=np.float64).tolist(),
-        "weight_magnitude": float(1.0 / sp_uv) if sp_uv != 0.0 and np.isfinite(sp_uv) else float("inf"),
     }
+    if original_weight_magnitude is not None:
+        detail["original_weight_magnitude"] = original_weight_magnitude
+        detail["weight_magnitude"] = original_weight_magnitude
     prev_to_curr_in = _SHARED_SP.get("prev_to_curr_in") if _SHARED_SP is not None else None
     if prev_to_curr_in is not None and len(prev_active) > 0:
         detail["prev_neighbors_to_u_cost"] = np.asarray(
             prev_to_curr_in[np.asarray(prev_active, dtype=np.int64), u_idx],
             dtype=np.float64,
         ).tolist()
+    prev_to_curr_in_weight_magnitude = (
+        _SHARED_SP.get("prev_to_curr_in_weight_magnitude") if _SHARED_SP is not None else None
+    )
+    if prev_to_curr_in_weight_magnitude is not None and len(prev_active) > 0:
+        detail["prev_neighbors_to_u_weight_magnitude"] = np.asarray(
+            prev_to_curr_in_weight_magnitude[np.asarray(prev_active, dtype=np.int64), u_idx],
+            dtype=np.float64,
+        ).tolist()
+        detail["prev_neighbors_to_u_weight_magnitude_source"] = _SHARED_SP.get(
+            "prev_to_curr_in_weight_magnitude_source"
+        )
 
     curr_out_to_next = _SHARED_SP.get("curr_out_to_next") if _SHARED_SP is not None else None
     if curr_out_to_next is not None and len(next_active) > 0:
-        detail["v_to_out_neighbors_cost"] = np.asarray(
+        v_to_out_neighbors_cost = np.asarray(
             curr_out_to_next[v_idx, np.asarray(next_active, dtype=np.int64)],
             dtype=np.float64,
+        )
+        detail["v_to_out_neighbors_cost"] = v_to_out_neighbors_cost.tolist()
+        inf_mask = np.isinf(v_to_out_neighbors_cost)
+        if np.any(inf_mask):
+            curr_out_row = np.asarray(curr_out_to_next[v_idx], dtype=np.float64)
+            detail["v_to_out_neighbors_inf_nodes"] = [
+                int(node_idx) for node_idx in np.asarray(next_active, dtype=np.int64)[inf_mask].tolist()
+            ]
+            detail["v_to_out_neighbors_finite_count"] = int(np.isfinite(v_to_out_neighbors_cost).sum())
+            detail["v_to_all_out_finite_count"] = int(np.isfinite(curr_out_row).sum())
+            detail["v_to_all_out_count"] = int(curr_out_row.size)
+    curr_out_to_next_weight_magnitude = (
+        _SHARED_SP.get("curr_out_to_next_weight_magnitude") if _SHARED_SP is not None else None
+    )
+    if curr_out_to_next_weight_magnitude is not None and len(next_active) > 0:
+        detail["v_to_out_neighbors_weight_magnitude"] = np.asarray(
+            curr_out_to_next_weight_magnitude[v_idx, np.asarray(next_active, dtype=np.int64)],
+            dtype=np.float64,
         ).tolist()
+        detail["v_to_out_neighbors_weight_magnitude_source"] = _SHARED_SP.get(
+            "curr_out_to_next_weight_magnitude_source"
+        )
 
     if metric_score is not None:
         detail["metric_score"] = float(metric_score[int(seq_idx)])
@@ -631,6 +669,8 @@ def compute_op_curvature(
     sample_edge_ratio = 1.,
     dataset_name="unknown_dataset",
     l2_norm=False,
+    l2_norm_mode="per_example",
+    l2_norm_stats=None,
     shared_top_k=10,
     shared_seq_select="top",
     curvature_lpf_window=0,
@@ -644,6 +684,11 @@ def compute_op_curvature(
 
     if operations is None or layer_cache is None:
         return None
+
+    def l2_reference(name):
+        if not l2_norm or l2_norm_mode != "all_examples" or l2_norm_stats is None:
+            return None
+        return l2_norm_stats.get(name)
 
     _reset_shared_state()
     _SHARED_MODEL_META = {
@@ -693,6 +738,8 @@ def compute_op_curvature(
             graph_data["prev_in_name"],
             alpha,
             l2_norm=l2_norm,
+            l2_norm_mode=l2_norm_mode,
+            l2_reference=l2_reference(graph_data["prev_in_name"]),
         )
         
     # if is q, k, v, the next is A or attention out     
@@ -702,6 +749,8 @@ def compute_op_curvature(
             graph_data["next_out_name"],
             alpha,
             l2_norm=l2_norm,
+            l2_norm_mode=l2_norm_mode,
+            l2_reference=l2_reference(graph_data["next_out_name"]),
         ) # [batch, seq, hidden size]
         
     
@@ -712,6 +761,8 @@ def compute_op_curvature(
             graph_data["next_out"],
             alpha,
             l2_norm=l2_norm,
+            l2_norm_mode=l2_norm_mode,
+            l2_reference=l2_reference(f"{short_name}_A_out"),
         )
 
   
@@ -766,6 +817,8 @@ def compute_op_curvature(
                 graph_data["next_out_name"],
                 alpha,
                 l2_norm=l2_norm,
+                l2_norm_mode=l2_norm_mode,
+                l2_reference=l2_reference(graph_data["next_out_name"]),
             )
       
             # x -> Q -> A -> out
@@ -789,7 +842,13 @@ def compute_op_curvature(
                 graph_data["prev_in"], in_dim, seq_len, head_dim, repeat
             )
             precomputed_prev_dists = _precompute_oproj_prev_distributions(
-                value_map, seq_len, graph_data["prev_in_name"], alpha, l2_norm=l2_norm
+                value_map,
+                seq_len,
+                graph_data["prev_in_name"],
+                alpha,
+                l2_norm=l2_norm,
+                l2_norm_mode=l2_norm_mode,
+                l2_reference=l2_reference(graph_data["prev_in_name"]),
             )
     
     ctx = get_context("fork")
@@ -829,8 +888,6 @@ def compute_op_curvature(
             finite_edges = finite_edges[np.sort(selected_idx)]
     finite_edges = np.asarray(finite_edges, dtype=np.int64).reshape(-1, 2)
     
-    finite_edges = [(379,523),(2220,466),(2811,1359),(2449,2816),(2759,4008),(3880,1552)]
-    
     print(
         f'op = {short_name}, sample = {sample_idx}, seq = {seq_len}, '
         f'total edges = {len(finite_edges)} per seq, cur dist shape = {curr_dist.shape}'
@@ -844,7 +901,8 @@ def compute_op_curvature(
     t1 = time.time()
     
     if l2_norm:
-        print(_SHARED_NEXT_OUT.shape)
+        if _SHARED_NEXT_OUT is not None:
+            print(_SHARED_NEXT_OUT.shape)
         seq_len = 1
         
     _SHARED_SEQ_LEN = seq_len

@@ -16,10 +16,9 @@ from llm_main_utils import (
     run_per_layer_eval,
     run_pp_eval,
 )
+from prune import load_curvature_pkls
 from prune_curvature import prune_curvature
 from prune_wanda import compute_wanda_scores
-
-
 
 def enable_hf_offline_mode():
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -27,6 +26,9 @@ def enable_hf_offline_mode():
 
 
 def safe_hf_login(token):
+    if not token:
+        print("Hugging Face login skipped: HF_TOKEN is not set")
+        return
     try:
         login(token)
         print("Hugging Face login succeeded")
@@ -46,7 +48,7 @@ def _is_network_error(exc):
     )
 
 
-safe_hf_login(token)
+safe_hf_login(os.environ.get("HF_TOKEN"))
 print("# of gpus: ", torch.cuda.device_count())
 
 
@@ -126,6 +128,13 @@ def _build_parser():
         action="store_true",
         help="Reduce node tensors of shape [seq, d] to [1, d] using L2 norm across seq before node normalization.",
     )
+    parser.add_argument(
+        "--l2_norm_mode",
+        type=str,
+        choices=["per_example", "all_examples"],
+        default="per_example",
+        help="L2 reduction mode for curvature: per example, or all calibration examples and seqs.",
+    )
     parser.add_argument("--save_curvature_dir", type=str, default=None, help="Directory to save per-layer curvature pkl files.")
     parser.add_argument("--load_curvature_dir", type=str, default=None, help="Directory to load previously saved per-layer curvature pkl files.")
     parser.add_argument(
@@ -143,6 +152,18 @@ def _build_parser():
         choices=["global", "per_layer", "per_layer_op"],
         default="global",
         help="Curvature pruning scope: global, per layer over all ops, or per layer per op.",
+    )
+    parser.add_argument(
+        "--prunescore_order",
+        "--prunescaore_order",
+        "--prunescore",
+        "--prunescaore",
+        "--prune_score_scope",
+        dest="prunescore_order",
+        type=str,
+        choices=["globally", "locally"],
+        default=None,
+        help="Alias for curvature pruning score scope: globally over full model, or locally per block/layer op.",
     )
     parser.add_argument("--shared_top_k", type=int, default=10, help="Top score-ranked seq positions per edge for curvature; -1 evaluates all seq positions.")
     parser.add_argument(
@@ -174,6 +195,19 @@ def _build_parser():
         help="Run one-layer-at-a-time pruning sweeps and save per-layer PPL results and plots.",
     )
     parser.add_argument(
+        "--per_layer_ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Optional layer indices for per-layer eval. If omitted, all available layers are evaluated.",
+    )
+    parser.add_argument(
+        "--per_layer_compare_dir",
+        type=str,
+        default=None,
+        help="Shared directory for per-layer method comparison CSVs and plots.",
+    )
+    parser.add_argument(
         "--run_pp_eval",
         action="store_true",
         help="Run perplexity evaluation after score/curvature calculation.",
@@ -203,6 +237,10 @@ def _set_seed(seed):
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+    if args.prunescore_order == "globally":
+        args.curvature_prune_scope = "global"
+    elif args.prunescore_order == "locally":
+        args.curvature_prune_scope = "per_layer"
 
     sparsity_ratios = resolve_sparsity_ratios(args)
     prune_score_orders = resolve_prune_score_orders(args)
@@ -260,15 +298,35 @@ def main():
 
     if (
         args.prune_method == "curvature"
-        and (needs_pruning or not args.run_pp_eval)
-        and not (args.run_per_layer_eval and args.load_curvature_dir is not None)
+        and (
+            (args.run_pp_eval and needs_pruning)
+            or (not args.run_pp_eval and not args.run_per_layer_eval)
+            or (args.run_per_layer_eval and args.load_curvature_dir is None)
+        )
     ):
         print(f"loading llm model {args.model} for curvature precomputation")
         model = get_llm(args.model, args.cache_dir, model_device, args.seqlen)
         model.eval()
-        print("loading curvature scores" if args.load_curvature_dir else "precomputing curvature scores")
-        args.curvature_timing_log_path = save_filepath
-        prune_curvature(args, model, tokenizer, compute_device, prune_n, prune_m)
+        if args.load_curvature_dir is not None:
+            print(f"loading curvature scores from {args.load_curvature_dir}")
+            model.curvature_scores = load_curvature_pkls(
+                args.load_curvature_dir,
+                len(model.model.layers),
+                shared_top_k=args.shared_top_k,
+                shared_seq_select=args.shared_seq_select,
+                curvature_lpf_window=args.curvature_lpf_window,
+            )
+            loaded = sum(len(layer_scores) for layer_scores in model.curvature_scores)
+            if loaded > 0:
+                print(f"Loaded {loaded} curvature tensors from {args.load_curvature_dir}")
+            else:
+                print("No curvature tensors loaded; recomputing curvature scores")
+                args.curvature_timing_log_path = save_filepath
+                prune_curvature(args, model, tokenizer, compute_device, prune_n, prune_m)
+        else:
+            print("precomputing curvature scores")
+            args.curvature_timing_log_path = save_filepath
+            prune_curvature(args, model, tokenizer, compute_device, prune_n, prune_m)
         base_curvature_scores = model.curvature_scores
         del model
         if torch.cuda.is_available():
@@ -305,7 +363,8 @@ def main():
             save_filepath,
             base_wanda_scores=base_wanda_scores,
         )
-        return
+        if not args.run_pp_eval:
+            return
 
     if not args.run_pp_eval:
         print("Skipping PP eval.")

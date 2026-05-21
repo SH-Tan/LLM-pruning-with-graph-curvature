@@ -152,6 +152,18 @@ def _clone_pickleable_to_cpu(value):
     return value
 
 
+def align_curvature_to_weight_shape(curv, weight_shape, context="curvature"):
+    curv = curv.detach() if torch.is_tensor(curv) else torch.as_tensor(curv)
+    if tuple(curv.shape) == tuple(weight_shape):
+        return curv
+    if tuple(curv.T.shape) == tuple(weight_shape):
+        return curv.T
+    raise ValueError(
+        f"{context} shape mismatch: got {tuple(curv.shape)}, expected {tuple(weight_shape)} "
+        f"or its transpose"
+    )
+
+
 def save_layer_curvature_pkl(layer_idx, curvature_scores, save_dir, metadata=None):
     if save_dir is None:
         return None
@@ -179,11 +191,24 @@ def load_layer_curvature_pkl(pkl_path):
         payload = pickle.load(f)
 
     layer_idx = int(payload["layer_idx"])
+    metadata = payload.get("metadata", None)
+    legacy_square_layout = not (
+        isinstance(metadata, dict)
+        and metadata.get("curvature_layout") == "weight_out_in"
+    )
     curvature_scores = {
-        op_name: _clone_pickleable_to_cpu(curv)
+        op_name: (
+            _clone_pickleable_to_cpu(curv.T)
+            if (
+                legacy_square_layout
+                and torch.is_tensor(curv)
+                and curv.ndim == 2
+                and curv.shape[0] == curv.shape[1]
+            )
+            else _clone_pickleable_to_cpu(curv)
+        )
         for op_name, curv in payload.get("curvature_scores", {}).items()
     }
-    metadata = payload.get("metadata", None)
     return layer_idx, curvature_scores, metadata
 
 
@@ -264,15 +289,11 @@ def _curvature_candidate_mask(args, model, layer_idx, name, weight):
         print(f"Skipping layer {layer_idx} {name}: no curvature values were loaded")
         return torch.zeros_like(weight, dtype=torch.bool, device=weight.device)
 
-    curv = curv.detach() if torch.is_tensor(curv) else torch.as_tensor(curv)
-    if curv.shape != weight.shape:
-        if curv.T.shape == weight.shape:
-            curv = curv.T
-        else:
-            raise ValueError(
-                f"Curvature shape mismatch for layer {layer_idx} {name}: "
-                f"{tuple(curv.shape)} vs {tuple(weight.shape)}"
-            )
+    curv = align_curvature_to_weight_shape(
+        curv,
+        weight.shape,
+        context=f"layer {layer_idx} {name} loaded curvature",
+    )
 
     return torch.isfinite(curv).to(device=weight.device)
 

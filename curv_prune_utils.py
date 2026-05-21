@@ -1,4 +1,5 @@
 import torch
+from prune import align_curvature_to_weight_shape
 
 
 def _get_prunable_module(model, layer_idx, op_name):
@@ -29,13 +30,11 @@ def prune_global_curvature(args, model):
         for op_name, curv in layer_scores.items():
             module = _get_prunable_module(model, layer_idx, op_name)
             weight = module.weight.data
-            curv_cpu = curv.detach().cpu() if torch.is_tensor(curv) else torch.as_tensor(curv)
-
-            if curv_cpu.shape != weight.shape:
-                raise ValueError(
-                    f"Curvature shape mismatch for layer {layer_idx} {op_name}: "
-                    f"{tuple(curv_cpu.shape)} vs {tuple(weight.shape)}"
-                )
+            curv_cpu = align_curvature_to_weight_shape(
+                curv,
+                weight.shape,
+                context=f"layer {layer_idx} {op_name} global curvature",
+            ).cpu()
 
             finite_mask = torch.isfinite(curv_cpu)
             finite_count = int(finite_mask.sum().item())

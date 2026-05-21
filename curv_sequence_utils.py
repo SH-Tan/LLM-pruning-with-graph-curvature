@@ -109,7 +109,6 @@ def masked_value_map_for_seq(
     return x_masked.view(v_in, seq_len * repeat)
 
 
-
 def masked_oproj_value_map_for_seq(value_map, s, seq_len):
     """
     Same shape [v_out, seq_len].
@@ -121,37 +120,55 @@ def masked_oproj_value_map_for_seq(value_map, s, seq_len):
 
 
 def _safe_inverse_abs(arr):
-    arr = torch.as_tensor(arr, dtype=torch.float32)
+    arr = torch.as_tensor(arr, dtype=torch.float64)
     arr = arr.abs()
     inv = torch.full_like(arr, float("inf"))
     inv = torch.where(arr != 0, 1.0 / arr, inv)
-    return inv.detach().cpu().numpy().astype("float32", copy=False)
-
-
-
-# TODO A with mask
-def _precompute_vproj_next_distributions(value_map, seq_len, repeat, node_name, alpha):
-    out = []
-    for s in range(seq_len):
-        masked = masked_value_map_for_seq(
-            value_map, s, seq_len, repeat
-        ) # [v dim, repeat * seq len]
-        
-        out.append(_build_node_distribution(masked, node_name, alpha))
-    return out
+    return inv.detach().cpu().numpy().astype("float64", copy=False)
 
 # A without mask
-def _precompute_vproj_next_distributions(value_map, node_name, alpha, l2_norm=False):
-    out = _build_node_distribution(value_map, node_name, alpha, l2_norm=l2_norm)
+def _precompute_vproj_next_distributions(
+    value_map,
+    node_name,
+    alpha,
+    l2_norm=False,
+    l2_norm_mode="per_example",
+    l2_reference=None,
+):
+    out = _build_node_distribution(
+        value_map,
+        node_name,
+        alpha,
+        l2_norm=l2_norm,
+        l2_norm_mode=l2_norm_mode,
+        l2_reference=l2_reference,
+    )
     return out
 
 
 
-def _precompute_oproj_prev_distributions(value_map, seq_len, node_name, alpha, l2_norm=False):
+def _precompute_oproj_prev_distributions(
+    value_map,
+    seq_len,
+    node_name,
+    alpha,
+    l2_norm=False,
+    l2_norm_mode="per_example",
+    l2_reference=None,
+):
     out = []
     for s in range(seq_len):
         masked = masked_oproj_value_map_for_seq(value_map, s, seq_len)
-        out.append(_build_node_distribution(masked, node_name, alpha, l2_norm=l2_norm))
+        out.append(
+            _build_node_distribution(
+                masked,
+                node_name,
+                alpha,
+                l2_norm=l2_norm,
+                l2_norm_mode=l2_norm_mode,
+                l2_reference=l2_reference,
+            )
+        )
     return out
 
 

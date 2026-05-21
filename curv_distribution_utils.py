@@ -68,11 +68,27 @@ def _min_reduce_blocks(blocks):
     return np.minimum.reduce([np.asarray(b, dtype=np.float64) for b in blocks])
 
 
-def _build_node_distribution(node_tensor, node_name, alpha, eps=1e-7, l2_norm=False):
+def _build_node_distribution(
+    node_tensor,
+    node_name,
+    alpha,
+    eps=1e-7,
+    l2_norm=False,
+    l2_norm_mode="per_example",
+    l2_reference=None,
+):
     if node_tensor is None or node_tensor.numel() == 0:
         return None
 
-    node_tensor = node_tensor.to(dtype=torch.float64)
+    if l2_norm and l2_norm_mode == "all_examples" and l2_reference is not None:
+        ref_tensor = torch.as_tensor(l2_reference, dtype=torch.float64).reshape(1, -1)
+        if ref_tensor.shape[-1] == node_tensor.shape[-1]:
+            node_tensor = ref_tensor
+        else:
+            node_tensor = node_tensor.to(dtype=torch.float64)
+    else:
+        node_tensor = node_tensor.to(dtype=torch.float64)
+
     if node_tensor.dim() == 3:
         if node_tensor.shape[0] != 1:
             raise ValueError(
@@ -102,11 +118,18 @@ def _build_node_distribution(node_tensor, node_name, alpha, eps=1e-7, l2_norm=Fa
 
     dist = dist * valid_mask
     
-    return dist.detach().cpu().numpy().astype(np.float32, copy=False)
+    return dist.detach().cpu().numpy().astype(np.float64, copy=False)
 
 
 
-def _build_qk_out_node_distribution(l_name, node, alpha, l2_norm=False):
+def _build_qk_out_node_distribution(
+    l_name,
+    node,
+    alpha,
+    l2_norm=False,
+    l2_norm_mode="per_example",
+    l2_reference=None,
+):
     if node is None or node.numel() == 0:
         return None
 
@@ -143,4 +166,6 @@ def _build_qk_out_node_distribution(l_name, node, alpha, l2_norm=False):
         node_name=f"{l_name}_A_out",
         alpha=alpha,
         l2_norm=l2_norm,
+        l2_norm_mode=l2_norm_mode,
+        l2_reference=l2_reference,
     )

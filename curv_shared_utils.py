@@ -47,7 +47,7 @@ def _to_shared_seq_metas(seq_distributions):
     metas = []
     owned_shms = []
     for seq_dist in seq_distributions:
-        shm, meta = _to_shared_numpy(np.asarray(seq_dist, dtype=np.float32))
+        shm, meta = _to_shared_numpy(np.asarray(seq_dist, dtype=np.float64))
         owned_shms.append(shm)
         metas.append(meta)
     return metas, owned_shms
