@@ -23,7 +23,7 @@ from per_layer_eval_utils import (
 )
 from prune import check_sparsity
 from prune_magnitude import prune_magnitude
-from prune_wanda import compute_wanda_scores, prune_wanda
+from prune_wanda import prune_wanda
 
 
 def l2_path_tag(args):
@@ -563,42 +563,6 @@ def run_pp_eval(
             del current_model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-            if args.prune_method == "wanda" and target_ratio != 0:
-                for seq in eval_seq_lens:
-                    print(
-                        f"recomputing WANDA scores with score/eval seqlen = {seq} "
-                        "for an additional perplexity measurement"
-                    )
-                    seq_model = get_llm_fn(args.model, args.cache_dir, model_device, seq)
-                    seq_model.eval()
-                    seq_model.seqlen = seq
-                    seq_model.wanda_scores = compute_wanda_scores(args, seq_model, tokenizer, model_device)
-                    prune_wanda(args, seq_model, tokenizer, model_device, prune_n, prune_m)
-
-                    seq_actual_sparsity_ratio = check_sparsity(seq_model)
-                    print(f"sparsity sanity check {seq_actual_sparsity_ratio:.4f} after recomputing scores")
-
-                    ppl_test = eval_ppl(args, seq_model, tokenizer, model_device)
-                    print(
-                        f"wikitext perplexity {ppl_test} using pp_seqlen = {seq} "
-                        f"with recomputed WANDA score seqlen = {seq}"
-                    )
-                    append_eval_result(
-                        save_filepath,
-                        args,
-                        score_order,
-                        target_ratio,
-                        seq_actual_sparsity_ratio,
-                        "recompute_score_at_pp_len",
-                        seq,
-                        seq,
-                        ppl_test,
-                    )
-
-                    del seq_model
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
 
             with open(save_filepath, "a+", encoding="utf-8") as f:
                 print("", file=f, flush=True)

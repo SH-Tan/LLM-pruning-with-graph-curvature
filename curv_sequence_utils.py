@@ -1,5 +1,6 @@
 import torch
 
+from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 from curv_distribution_utils import _build_node_distribution
 
 
@@ -120,11 +121,11 @@ def masked_oproj_value_map_for_seq(value_map, s, seq_len):
 
 
 def _safe_inverse_abs(arr):
-    arr = torch.as_tensor(arr, dtype=torch.float64)
+    arr = torch.as_tensor(arr, dtype=curvature_torch_dtype())
     arr = arr.abs()
     inv = torch.full_like(arr, float("inf"))
     inv = torch.where(arr != 0, 1.0 / arr, inv)
-    return inv.detach().cpu().numpy().astype("float64", copy=False)
+    return inv.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
 
 # A without mask
 def _precompute_vproj_next_distributions(

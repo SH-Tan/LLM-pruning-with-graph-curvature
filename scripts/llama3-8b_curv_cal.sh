@@ -15,6 +15,8 @@ sample_edge_ratio=0.2
 sample_edge_num=-1
 calib_data="c4_independent"
 curvature_dir="out/llama_8b/unstructured/curvature/Q_0.2/"
+curvature_dtype="${CURVATURE_DTYPE:-float32}"
+save_parameter_metric_logs="${SAVE_PARAMETER_METRIC_LOGS:-0}"
 
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 export CUDA_VISIBLE_DEVICES=$cuda_device
@@ -25,6 +27,10 @@ run_curvature_calculation() {
     l2_flag=""
     if [ "$use_l2_norm" = "1" ]; then
         l2_flag="--L2-norm --l2_norm_mode $l2_mode"
+    fi
+    parameter_log_flag=""
+    if [ "$save_parameter_metric_logs" = "1" ]; then
+        parameter_log_flag="--save_parameter_metric_logs"
     fi
 
     echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select"
@@ -47,6 +53,8 @@ run_curvature_calculation() {
         --shared_top_k $top_k_seq \
         --shared_seq_select $seq_select \
         --curvature_lpf_window $curvature_lpf_window \
+        --curvature_dtype $curvature_dtype \
+        $parameter_log_flag \
         $l2_flag
 }
 

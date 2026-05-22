@@ -4,6 +4,7 @@ import time
 import torch
 
 import curv_analysis_utils as analysis_utils
+from curv_dtype_utils import curvature_torch_dtype, set_curvature_dtype
 from cal_curvature import compute_op_curvature
 from curv_shortest_path_utils import build_shortest_path_cache
 from curv_tensor_utils import build_layer_cache
@@ -57,6 +58,7 @@ def _curvature_save_metadata(args):
         "shared_top_k": getattr(args, "shared_top_k", 10),
         "shared_seq_select": getattr(args, "shared_seq_select", "top"),
         "curvature_lpf_window": getattr(args, "curvature_lpf_window", 0),
+        "curvature_dtype": getattr(args, "curvature_dtype", "float64"),
         "curvature_layout": "weight_out_in",
     }
 
@@ -65,10 +67,17 @@ def _accumulate_l2_stat(stats, name, node):
     if name is None or node is None or not torch.is_tensor(node) or node.numel() == 0:
         return
 
-    node = node.detach().cpu().to(dtype=torch.float64)
+    node = node.detach().cpu().to(dtype=curvature_torch_dtype())
     if node.dim() == 4:
         return
     if node.dim() == 3:
+        if name.endswith("_A_out"):
+            sumsq = (node ** 2).sum(dim=1)
+            if name in stats:
+                stats[name] += sumsq
+            else:
+                stats[name] = sumsq
+            return
         node = node.reshape(-1, node.shape[-1])
     elif node.dim() != 2:
         node = node.reshape(1, -1)
@@ -80,7 +89,7 @@ def _accumulate_l2_stat(stats, name, node):
         stats[name] = sumsq
 
 
-def _attention_l2_node(attention, short_name):
+def _attention_l2_node(attention, short_name, repeat=1):
     if attention is None or not torch.is_tensor(attention) or attention.dim() != 4:
         return None
     if attention.shape[0] != 1:
@@ -89,13 +98,22 @@ def _attention_l2_node(attention, short_name):
     attention = attention.detach().cpu().squeeze(0)
     q_heads, seq_q, seq_k = attention.shape
     if short_name == "q_proj":
-        return attention.permute(1, 0, 2).contiguous().view(seq_q, q_heads * seq_k)
+        return attention.contiguous()
     if short_name == "k_proj":
-        return attention.transpose(-1, -2).permute(1, 0, 2).contiguous().view(seq_k, q_heads * seq_q)
+        repeat = max(int(repeat), 1)
+        if q_heads % repeat != 0:
+            raise ValueError(f"q_heads={q_heads} is not divisible by repeat={repeat}")
+        k_heads = q_heads // repeat
+        return (
+            attention.reshape(k_heads, repeat, seq_q, seq_k)
+            .permute(0, 3, 1, 2)
+            .reshape(k_heads, seq_k, seq_q * repeat)
+            .contiguous()
+        )
     return None
 
 
-def _accumulate_operation_l2_stats(stats, operations, target_ops):
+def _accumulate_operation_l2_stats(stats, operations, target_ops, repeat=1):
     for name, node in operations.items():
         _accumulate_l2_stat(stats, name, node)
 
@@ -103,7 +121,11 @@ def _accumulate_operation_l2_stats(stats, operations, target_ops):
     for short in target_ops:
         if short not in {"q_proj", "k_proj"}:
             continue
-        _accumulate_l2_stat(stats, f"{short}_A_out", _attention_l2_node(attention, short))
+        _accumulate_l2_stat(
+            stats,
+            f"{short}_A_out",
+            _attention_l2_node(attention, short, repeat=repeat),
+        )
 
 
 def _finalize_l2_stats(stats):
@@ -150,6 +172,10 @@ def _parameter_metric_log_root(
 
 
 def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=0):
+    set_curvature_dtype(getattr(args, "curvature_dtype", "float64"))
+    curv_torch_dtype = curvature_torch_dtype()
+    print(f"Using curvature_dtype={getattr(args, 'curvature_dtype', 'float64')}")
+
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
@@ -256,9 +282,6 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
     try:
         for i, layer in enumerate(layers):
             print(f"Processing layer {i}")
-            
-            if i not in [0,1,2,5,10,15,20,25]:
-                continue
 
             layer_cache = {}
             sp_cache = {}
@@ -278,14 +301,14 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 module.min_curvature = torch.full(
                     W.shape,
                     float("inf"),
-                    dtype=torch.float64,
+                    dtype=curv_torch_dtype,
                     device="cpu",
                 )
                 if save_lpf_curvature:
                     module.min_lpf_curvature = torch.full(
                         W.shape,
                         float("inf"),
-                        dtype=torch.float64,
+                        dtype=curv_torch_dtype,
                         device="cpu",
                     )
 
@@ -315,7 +338,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     if i == last_layer_idx:
                         operations.update(_make_lm_head_op(model, x_out))
 
-                    _accumulate_operation_l2_stats(l2_sumsq, operations, target_ops)
+                    _accumulate_operation_l2_stats(l2_sumsq, operations, target_ops, repeat=repeat)
                     del operations, x, x_out
                     if j % 8 == 0 and torch.cuda.is_available():
                         torch.cuda.empty_cache()

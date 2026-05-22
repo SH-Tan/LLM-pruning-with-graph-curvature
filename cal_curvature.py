@@ -3,6 +3,7 @@ import torch
 import ot
 
 import curv_analysis_utils as analysis_utils
+from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 from curv_filter_utils import sliding_median_low_pass
 from curv_distribution_utils import (
     _build_node_distribution,
@@ -81,7 +82,7 @@ def _edge_cost_matrix_base(u_idx, v_idx, prev_active, next_active, sp_uv):
     prev_count = int(len(prev_active))
     next_count = int(len(next_active))
 
-    cost = np.full((prev_count + 1, next_count + 1), np.inf, dtype=np.float64)
+    cost = np.full((prev_count + 1, next_count + 1), np.inf, dtype=curvature_np_dtype())
     sp = _SHARED_SP
 
     prev_to_next_all = sp.get("prev_to_next_all", {})
@@ -147,7 +148,7 @@ def _get_min_QK_A_cost(v_idx, u_idx, s, prev_active):
     shared_end = (s + 1) * repeat
     merged_width = seq_len * repeat
 
-    prev_merged = np.empty((0, merged_width), dtype=np.float64)
+    prev_merged = np.empty((0, merged_width), dtype=curvature_np_dtype())
 
     if len(prev_active) > 0:
         # previous input -> Q-local-out
@@ -202,7 +203,7 @@ def _edge_cost_matrix_seq_aware(u_idx, v_idx, prev_active, next_active, sp_uv, s
 
     prev_count = int(len(prev_active))
     next_count = int(len(next_active))
-    cost = np.full((prev_count + 1, next_count + 1), np.inf, dtype=np.float64)
+    cost = np.full((prev_count + 1, next_count + 1), np.inf, dtype=curvature_np_dtype())
 
     sp = _SHARED_SP
     A = _A
@@ -304,10 +305,24 @@ def _edge_seq_distributions_and_cost(edge_info, seq_info):
     u_idx, v_idx = edge_info
 
     sp_uv = float(_SHARED_CURR_DIST[u_idx, v_idx])
+    next_active_offset = 0
 
     # For seq-aware nodes, pick the row for this sequence.
     if _SHARED_SHORT_NAME == "v_proj":
         next_row = None if _SHARED_NEXT_OUT is None else _SHARED_NEXT_OUT[v_idx]
+    elif _SHARED_SHORT_NAME in {"q_proj", "k_proj"} and _SHARED_NEXT_OUT is not None:
+        head_dim = _SHARED_MODEL_META["head_dim"]
+        repeat = _SHARED_MODEL_META["repeat"]
+        next_width = _SHARED_NEXT_OUT.shape[-1]
+        if _SHARED_SHORT_NAME == "q_proj":
+            q_head = v_idx // head_dim
+            next_row = _SHARED_NEXT_OUT[q_head, seq_info, :]
+            next_active_offset = q_head * next_width
+        else:
+            kv_head = v_idx // head_dim
+            q_start = kv_head * repeat
+            next_row = _SHARED_NEXT_OUT[kv_head, seq_info, :]
+            next_active_offset = q_start * (next_width // repeat)
     else:
         next_row = None if _SHARED_NEXT_OUT is None else _SHARED_NEXT_OUT[seq_info]
 
@@ -318,6 +333,8 @@ def _edge_seq_distributions_and_cost(edge_info, seq_info):
 
     mu, prev_active = _edge_distribution(prev_row, _SHARED_ALPHA)
     nu, next_active = _edge_distribution(next_row, _SHARED_ALPHA)
+    if next_active_offset:
+        next_active = next_active + next_active_offset
 
     cost = _edge_cost_matrix_seq_aware(
         u_idx=u_idx,
@@ -345,12 +362,12 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
     detail = {
         "in_neighbors": [int(idx) for idx in prev_active.tolist()],
         "out_neighbors": [int(idx) for idx in next_active.tolist()],
-        "mu": np.asarray(mu, dtype=np.float64).tolist(),
-        "nu": np.asarray(nu, dtype=np.float64).tolist(),
-        "cost_matrix": np.asarray(cost, dtype=np.float64).tolist(),
-        "prev_neighbors_to_v_cost": np.asarray(cost[:-1, -1], dtype=np.float64).tolist(),
-        "u_to_out_neighbors_cost": np.asarray(cost[-1, :-1], dtype=np.float64).tolist(),
-        "prev_neighbors_to_out_neighbors_cost": np.asarray(cost[:-1, :-1], dtype=np.float64).tolist(),
+        "mu": np.asarray(mu, dtype=curvature_np_dtype()).tolist(),
+        "nu": np.asarray(nu, dtype=curvature_np_dtype()).tolist(),
+        "cost_matrix": np.asarray(cost, dtype=curvature_np_dtype()).tolist(),
+        "prev_neighbors_to_v_cost": np.asarray(cost[:-1, -1], dtype=curvature_np_dtype()).tolist(),
+        "u_to_out_neighbors_cost": np.asarray(cost[-1, :-1], dtype=curvature_np_dtype()).tolist(),
+        "prev_neighbors_to_out_neighbors_cost": np.asarray(cost[:-1, :-1], dtype=curvature_np_dtype()).tolist(),
     }
     if original_weight_magnitude is not None:
         detail["original_weight_magnitude"] = original_weight_magnitude
@@ -359,7 +376,7 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
     if prev_to_curr_in is not None and len(prev_active) > 0:
         detail["prev_neighbors_to_u_cost"] = np.asarray(
             prev_to_curr_in[np.asarray(prev_active, dtype=np.int64), u_idx],
-            dtype=np.float64,
+            dtype=curvature_np_dtype(),
         ).tolist()
     prev_to_curr_in_weight_magnitude = (
         _SHARED_SP.get("prev_to_curr_in_weight_magnitude") if _SHARED_SP is not None else None
@@ -367,7 +384,7 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
     if prev_to_curr_in_weight_magnitude is not None and len(prev_active) > 0:
         detail["prev_neighbors_to_u_weight_magnitude"] = np.asarray(
             prev_to_curr_in_weight_magnitude[np.asarray(prev_active, dtype=np.int64), u_idx],
-            dtype=np.float64,
+            dtype=curvature_np_dtype(),
         ).tolist()
         detail["prev_neighbors_to_u_weight_magnitude_source"] = _SHARED_SP.get(
             "prev_to_curr_in_weight_magnitude_source"
@@ -377,12 +394,12 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
     if curr_out_to_next is not None and len(next_active) > 0:
         v_to_out_neighbors_cost = np.asarray(
             curr_out_to_next[v_idx, np.asarray(next_active, dtype=np.int64)],
-            dtype=np.float64,
+            dtype=curvature_np_dtype(),
         )
         detail["v_to_out_neighbors_cost"] = v_to_out_neighbors_cost.tolist()
         inf_mask = np.isinf(v_to_out_neighbors_cost)
         if np.any(inf_mask):
-            curr_out_row = np.asarray(curr_out_to_next[v_idx], dtype=np.float64)
+            curr_out_row = np.asarray(curr_out_to_next[v_idx], dtype=curvature_np_dtype())
             detail["v_to_out_neighbors_inf_nodes"] = [
                 int(node_idx) for node_idx in np.asarray(next_active, dtype=np.int64)[inf_mask].tolist()
             ]
@@ -395,7 +412,7 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
     if curr_out_to_next_weight_magnitude is not None and len(next_active) > 0:
         detail["v_to_out_neighbors_weight_magnitude"] = np.asarray(
             curr_out_to_next_weight_magnitude[v_idx, np.asarray(next_active, dtype=np.int64)],
-            dtype=np.float64,
+            dtype=curvature_np_dtype(),
         ).tolist()
         detail["v_to_out_neighbors_weight_magnitude_source"] = _SHARED_SP.get(
             "curr_out_to_next_weight_magnitude_source"
@@ -409,8 +426,8 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
         detail["metric_next_score"] = float(metric_next_score[int(seq_idx)])
 
     if len(prev_active) > 0:
-        prev_cost = np.asarray(cost[:-1, -1], dtype=np.float64)
-        prev_probs = np.asarray(mu[:-1], dtype=np.float64)
+        prev_cost = np.asarray(cost[:-1, -1], dtype=curvature_np_dtype())
+        prev_probs = np.asarray(mu[:-1], dtype=curvature_np_dtype())
         detail["top_prev_to_target_sum"] = float(np.sum(prev_probs * np.nan_to_num(prev_cost, nan=0.0, posinf=0.0, neginf=0.0)))
         detail["top_prev_to_target_nodes"] = [
             {
@@ -423,8 +440,8 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
         ]
 
     if len(next_active) > 0:
-        next_cost = np.asarray(cost[-1, :-1], dtype=np.float64)
-        next_probs = np.asarray(nu[:-1], dtype=np.float64)
+        next_cost = np.asarray(cost[-1, :-1], dtype=curvature_np_dtype())
+        next_probs = np.asarray(nu[:-1], dtype=curvature_np_dtype())
         detail["top_next_from_source_sum"] = float(np.sum(next_probs * np.nan_to_num(next_cost, nan=0.0, posinf=0.0, neginf=0.0)))
         detail["top_next_from_source_nodes"] = [
             {
@@ -477,7 +494,7 @@ def _compute_single_edge_seq_global(edge_info, seq_info):
         "seq_idx": seq_info,
         "v_idx": v_idx,
         "u_idx": u_idx,
-        "curv": np.float64(curv),
+        "curv": curvature_np_dtype()(curv),
         "mu_len": int(len(mu)),
         "nu_len": int(len(nu)),
         "w_dist": w_dist,
@@ -587,22 +604,22 @@ def _compute_edge_with_top_seq(edge):
         if edge_res:
             results.append(edge_res)
     if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1 and results:
-        curvs = np.asarray([float(edge_res["curv"]) for edge_res in results], dtype=np.float64)
+        curvs = np.asarray([float(edge_res["curv"]) for edge_res in results], dtype=curvature_np_dtype())
         raw_idx = int(np.argmin(curvs))
         smoothed_curvs = sliding_median_low_pass(curvs, _SHARED_LPF_WINDOW)
         if _SHARED_SAVE_PARAMETER_LOGS:
             detailed_results = []
             for idx, edge_res in enumerate(results):
                 detailed_res = dict(edge_res)
-                detailed_res["curv"] = np.float64(curvs[idx])
-                detailed_res["lpf_curv"] = np.float64(smoothed_curvs[idx])
+                detailed_res["curv"] = curvature_np_dtype()(curvs[idx])
+                detailed_res["lpf_curv"] = curvature_np_dtype()(smoothed_curvs[idx])
                 detailed_results.append(detailed_res)
             return detailed_results
 
         lpf_idx = int(np.argmin(smoothed_curvs))
         best_res = dict(results[raw_idx])
-        best_res["curv"] = np.float64(curvs[raw_idx])
-        best_res["lpf_curv"] = np.float64(smoothed_curvs[lpf_idx])
+        best_res["curv"] = curvature_np_dtype()(curvs[raw_idx])
+        best_res["lpf_curv"] = curvature_np_dtype()(smoothed_curvs[lpf_idx])
         return [best_res]
     return results
 
@@ -763,6 +780,7 @@ def compute_op_curvature(
             l2_norm=l2_norm,
             l2_norm_mode=l2_norm_mode,
             l2_reference=l2_reference(f"{short_name}_A_out"),
+            repeat=repeat,
         )
 
   
@@ -776,10 +794,10 @@ def compute_op_curvature(
     _SHARED_PREV_IN = prev_in_distribution
     _SHARED_NEXT_OUT = next_out_distribution
     
-    curvature = torch.full((out_dim, in_dim), float("inf"), dtype=torch.float64)
+    curvature = torch.full((out_dim, in_dim), float("inf"), dtype=curvature_torch_dtype())
     lpf_curvature = None
 
-    curr_dist_np = np.asarray(curr_dist, dtype=np.float64)
+    curr_dist_np = np.asarray(curr_dist, dtype=curvature_np_dtype())
     curr_dist_finite_edges = int(np.isfinite(curr_dist_np).sum())
     curr_dist_infinite_edges = int(np.isinf(curr_dist_np).sum())
     finite_edges = np.argwhere(np.isfinite(curr_dist_np) & (curr_dist_np > 0))
@@ -861,11 +879,11 @@ def compute_op_curvature(
     base_next_meta = None
 
     if _SHARED_PREV_IN is not None:
-        shm, base_prev_meta = _to_shared_numpy(np.asarray(_SHARED_PREV_IN, dtype=np.float64))
+        shm, base_prev_meta = _to_shared_numpy(np.asarray(_SHARED_PREV_IN, dtype=curvature_np_dtype()))
         base_owned_shms.append(shm)
 
     if _SHARED_NEXT_OUT is not None:
-        shm, base_next_meta = _to_shared_numpy(np.asarray(_SHARED_NEXT_OUT, dtype=np.float64))
+        shm, base_next_meta = _to_shared_numpy(np.asarray(_SHARED_NEXT_OUT, dtype=curvature_np_dtype()))
         base_owned_shms.append(shm)
 
     seq_prev_metas, prev_seq_shms = _to_shared_seq_metas(precomputed_prev_dists)
@@ -911,7 +929,7 @@ def compute_op_curvature(
     _SHARED_LPF_WINDOW = int(curvature_lpf_window)
     _SHARED_SAVE_PARAMETER_LOGS = bool(parameter_log_root)
     if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1:
-        lpf_curvature = torch.full((out_dim, in_dim), float("inf"), dtype=torch.float64)
+        lpf_curvature = torch.full((out_dim, in_dim), float("inf"), dtype=curvature_torch_dtype())
 
     prev_score = None
     next_score = None
@@ -927,10 +945,10 @@ def compute_op_curvature(
     prev_score_meta = None
     next_score_meta = None
     if prev_score is not None and not np.isscalar(prev_score):
-        shm, prev_score_meta = _to_shared_numpy(np.asarray(prev_score, dtype=np.float64))
+        shm, prev_score_meta = _to_shared_numpy(np.asarray(prev_score, dtype=curvature_np_dtype()))
         base_owned_shms.append(shm)
     if next_score is not None and not np.isscalar(next_score):
-        shm, next_score_meta = _to_shared_numpy(np.asarray(next_score, dtype=np.float64))
+        shm, next_score_meta = _to_shared_numpy(np.asarray(next_score, dtype=curvature_np_dtype()))
         base_owned_shms.append(shm)
 
     try:

@@ -1,5 +1,7 @@
 import numpy as np
 
+from curv_dtype_utils import curvature_np_dtype
+
 _SHARED_PREV_SCORE = None
 _SHARED_NEXT_SCORE = None
 _SHARED_SEQ_LEN = 1
@@ -28,9 +30,11 @@ def _as_seq_distribution_matrix(distribution, seq_len):
     if type(distribution) is list:
         return None
 
-    arr = np.asarray(distribution, dtype=np.float64)
+    arr = np.asarray(distribution, dtype=curvature_np_dtype())
     if arr.ndim == 3 and arr.shape[0] == 1:
         arr = arr[0]
+    if arr.ndim == 3:
+        arr = arr.transpose(1, 0, 2).reshape(arr.shape[1], -1)
     if arr.ndim != 2:
         return None
     return arr[:seq_len]
@@ -40,13 +44,13 @@ def _fill_negative_distribution_entries(distribution, alpha):
     if distribution is None:
         return None
 
-    distribution = np.asarray(distribution, dtype=np.float64).copy()
+    distribution = np.asarray(distribution, dtype=curvature_np_dtype()).copy()
     neg_mask = distribution == -1.0
     if not np.any(neg_mask):
         return distribution
 
     non_zero_count = np.count_nonzero(distribution, axis=1)
-    fill_values = np.zeros((distribution.shape[0], 1), dtype=np.float64)
+    fill_values = np.zeros((distribution.shape[0], 1), dtype=curvature_np_dtype())
     valid_rows = non_zero_count > 0
     fill_values[valid_rows, 0] = (1.0 - alpha) / non_zero_count[valid_rows]
     distribution[neg_mask] = np.broadcast_to(fill_values, distribution.shape)[neg_mask]
@@ -60,8 +64,8 @@ def _distribution_cost_score(distribution, cost, top_k=10, transpose_cost=False)
         print("Error: both distribution and cost must be present")
         return None
 
-    distribution = np.asarray(distribution, dtype=np.float64)
-    cost = np.asarray(cost, dtype=np.float64)
+    distribution = np.asarray(distribution, dtype=curvature_np_dtype())
+    cost = np.asarray(cost, dtype=curvature_np_dtype())
 
     if transpose_cost:
         cost = cost.T
@@ -78,7 +82,7 @@ def _distribution_cost_score(distribution, cost, top_k=10, transpose_cost=False)
 
     top_k = min(top_k, node_count)
     if top_k <= 0:
-        return np.zeros((seq_count, out_count), dtype=np.float64)
+        return np.zeros((seq_count, out_count), dtype=curvature_np_dtype())
 
     # Step 1: get top-k indices per row
     top_idx = np.argpartition(-distribution, top_k - 1, axis=1)[:, :top_k]
@@ -103,9 +107,9 @@ def _sanitize_score_values(score, seq_len=None):
             value = 0.0
         if seq_len is None:
             return value
-        return np.full((int(seq_len),), value, dtype=np.float64)
+        return np.full((int(seq_len),), value, dtype=curvature_np_dtype())
 
-    score = np.asarray(score, dtype=np.float64)
+    score = np.asarray(score, dtype=curvature_np_dtype())
     np.nan_to_num(score, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     return score
 
@@ -121,7 +125,7 @@ def build_neighbor_score_matrices(
     prev_dist = _fill_negative_distribution_entries(prev_dist, alpha)
     prev_cost = sp.get("prev_to_curr_in")
     if prev_cost is not None:
-        prev_cost = np.asarray(prev_cost, dtype=np.float64)
+        prev_cost = np.asarray(prev_cost, dtype=curvature_np_dtype())
     prev_score = _distribution_cost_score(prev_dist, prev_cost)
     prev_score = _sanitize_score_values(prev_score)
     del prev_dist, prev_cost
@@ -130,7 +134,7 @@ def build_neighbor_score_matrices(
     next_dist = _fill_negative_distribution_entries(next_dist, alpha)
     next_cost = sp.get("curr_out_to_next")
     if next_cost is not None:
-        next_cost = np.asarray(next_cost, dtype=np.float64)
+        next_cost = np.asarray(next_cost, dtype=curvature_np_dtype())
     next_score = _distribution_cost_score(next_dist, next_cost, transpose_cost=True)
     next_score = _sanitize_score_values(next_score)
     del next_dist, next_cost
@@ -173,7 +177,7 @@ def top_seq_for_edge(edge):
 
 def score_components_for_edge(edge):
     u_idx, v_idx = (int(edge[0]), int(edge[1]))
-    metric = np.zeros((_SHARED_SEQ_LEN,), dtype=np.float64)
+    metric = np.zeros((_SHARED_SEQ_LEN,), dtype=curvature_np_dtype())
 
     prev_col = _score_column(_SHARED_PREV_SCORE, u_idx)
     next_col = _score_column(_SHARED_NEXT_SCORE, v_idx)

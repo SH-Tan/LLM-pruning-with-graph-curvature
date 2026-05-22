@@ -1,5 +1,6 @@
 import torch
 
+from curv_dtype_utils import curvature_torch_dtype
 from graph_relation import _resolve_graph_sets
 from curv_distribution_utils import _min_reduce_blocks
 from curv_tensor_utils import (
@@ -13,7 +14,7 @@ SP_CACHE = {}
 
 
 def _cost_to_magnitude(matrix):
-    matrix = matrix.to(dtype=torch.float64)
+    matrix = matrix.to(dtype=curvature_torch_dtype())
     mag = torch.zeros_like(matrix)
     finite = torch.isfinite(matrix) & (matrix > 0)
     mag[finite] = 1.0 / matrix[finite]
@@ -91,6 +92,7 @@ def build_shortest_path_cache(
             name: _get_qk_next_cost(cost, short_name, model_meta, device=device)
             for name in graph_data["next_cost_names"]
         }
+        
         next_weight_magnitude_source = "activation_or_attention_cost"
     else:
         next_dists = _all_cost_matrices(layer_cache, graph_data["next_cost_names"], device=device)

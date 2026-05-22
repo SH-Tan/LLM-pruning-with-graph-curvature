@@ -25,6 +25,9 @@ top_k_seq=10
 seq_select="median"
 curvature_lpf_window=0
 l2_norm_mode="${L2_NORM_MODE:-per_example}"
+run_curvature="${RUN_CURVATURE:-0}"
+run_wanda="${RUN_WANDA:-1}"
+run_magnitude="${RUN_MAGNITUDE:-1}"
 
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 export CUDA_VISIBLE_DEVICES=$cuda_device
@@ -93,17 +96,23 @@ run_curvature_pair() {
     echo "Finished all-layer curvature $label"
 }
 
-# Curvature: five score variants x two prune-score scopes = 10 curves.
-run_curvature_pair "all_seq_no_L2" -1 "top" 0 0
-run_curvature_pair "all_seq_lpf" -1 "top" 5 0
-run_curvature_pair "top_10_seq" 10 "top" 0 0
-run_curvature_pair "median_10_seq" 10 "median" 0 0
-run_curvature_pair "all_seq_L2" -1 "top" 0 1
+if [ "$run_curvature" = "1" ]; then
+    # Curvature: five score variants x two prune-score scopes = 10 curves.
+    run_curvature_pair "all_seq_no_L2" -1 "top" 0 0
+    run_curvature_pair "all_seq_lpf" -1 "top" 5 0
+    run_curvature_pair "top_10_seq" 10 "top" 0 0
+    run_curvature_pair "median_10_seq" 10 "median" 0 0
+    run_curvature_pair "all_seq_L2" -1 "top" 0 1
+fi
 
-echo "Running all-layer WANDA pruning/eval"
-run_python_command "wanda" "unstructured" "$wanda_dir" "c4_independent" "low_to_high" "$top_k_seq" "$seq_select" "$curvature_lpf_window" 0 "global" "globally"
-echo "Finished all-layer WANDA pruning/eval"
+if [ "$run_wanda" = "1" ]; then
+    echo "Running all-layer WANDA pruning/eval"
+    run_python_command "wanda" "unstructured" "$wanda_dir" "c4_independent" "low_to_high" "$top_k_seq" "$seq_select" "$curvature_lpf_window" 0 "global" "globally"
+    echo "Finished all-layer WANDA pruning/eval"
+fi
 
-echo "Running all-layer magnitude pruning/eval"
-run_python_command "magnitude" "unstructured" "$magnitude_dir" "c4_independent" "low_to_high" "$top_k_seq" "$seq_select" "$curvature_lpf_window" 0 "global" "globally"
-echo "Finished all-layer magnitude pruning/eval"
+if [ "$run_magnitude" = "1" ]; then
+    echo "Running all-layer magnitude pruning/eval"
+    run_python_command "magnitude" "unstructured" "$magnitude_dir" "c4_independent" "low_to_high" "$top_k_seq" "$seq_select" "$curvature_lpf_window" 0 "global" "globally"
+    echo "Finished all-layer magnitude pruning/eval"
+fi

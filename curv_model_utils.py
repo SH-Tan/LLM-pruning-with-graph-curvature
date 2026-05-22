@@ -1,5 +1,7 @@
 import torch
 
+from curv_dtype_utils import curvature_torch_dtype
+
 def _weight_from_model(model, short_name, layer_id, device=None):
     if short_name.startswith("prev_"):
         real_name = short_name.replace("prev_", "")
@@ -33,7 +35,7 @@ def _weight_from_model(model, short_name, layer_id, device=None):
 
 def _operation_distance_matrix_torch(model, operations, short_name, layer_id, device):
     weight = _weight_from_model(model, short_name, layer_id, device=device)
-    abs_w = weight.abs().to(dtype=torch.float64)
+    abs_w = weight.abs().to(dtype=curvature_torch_dtype())
     weight_norm = torch.where(abs_w > 0, 1.0 / abs_w, torch.full_like(abs_w, float("inf")))
     dist = weight_norm.transpose(0, 1).contiguous()
     if dist.shape != (weight.shape[1], weight.shape[0]):

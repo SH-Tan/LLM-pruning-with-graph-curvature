@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import torch
+from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 from layerwrapper_curv import (
     _reshape_for_heads,
     _repeat_kv,
@@ -65,11 +66,14 @@ def _get_matrix_torch(layer_cache, name, device):
     if matrix is None:
         return None
     if torch.is_tensor(matrix):
-        return matrix if matrix.device.type == device.split(":")[0] else matrix.to(device, non_blocking=True)
-    arr = np.asarray(matrix, dtype=np.float64)
+        target_device = torch.device(device)
+        if matrix.device == target_device:
+            return matrix.to(dtype=curvature_torch_dtype())
+        return matrix.to(device=target_device, dtype=curvature_torch_dtype(), non_blocking=True)
+    arr = np.asarray(matrix, dtype=curvature_np_dtype())
     if arr.ndim != 2:
         return None
-    return torch.as_tensor(arr, dtype=torch.float64, device=device)
+    return torch.as_tensor(arr, dtype=curvature_torch_dtype(), device=device)
 
 
 def _all_cost_matrices(layer_cache, names, device):
@@ -117,7 +121,7 @@ def _get_qk_next_cost(cost, name, meta, device = "cpu"):
     num_kv_heads = meta["num_kv_heads"]
     repeat = meta["repeat"]
 
-    cost = cost.to(torch.float64)
+    cost = cost.to(curvature_torch_dtype())
     b, seq, d = cost.shape
     dtype = cost.dtype
 
@@ -201,7 +205,7 @@ def _build_v_to_att_out_template(cost, meta, reduce_batch=True):
     num_kv_heads = meta["num_kv_heads"]
     repeat = meta["repeat"]
     
-    cost = cost.to(torch.float64)
+    cost = cost.to(curvature_torch_dtype())
 
     b, seq, d = cost.shape
     assert d == num_kv_heads * head_dim

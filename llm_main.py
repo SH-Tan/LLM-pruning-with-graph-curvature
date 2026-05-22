@@ -155,15 +155,11 @@ def _build_parser():
     )
     parser.add_argument(
         "--prunescore_order",
-        "--prunescaore_order",
-        "--prunescore",
-        "--prunescaore",
-        "--prune_score_scope",
         dest="prunescore_order",
         type=str,
         choices=["globally", "locally"],
         default=None,
-        help="Alias for curvature pruning score scope: globally over full model, or locally per block/layer op.",
+        help="Alias for curvature pruning score scope: globally over full model, or locally per block/layer.",
     )
     parser.add_argument("--shared_top_k", type=int, default=10, help="Top score-ranked seq positions per edge for curvature; -1 evaluates all seq positions.")
     parser.add_argument(
@@ -178,6 +174,13 @@ def _build_parser():
         type=int,
         default=0,
         help="Sliding median low-pass window for all-seq curvature; active when shared_top_k is -1 and window > 1.",
+    )
+    parser.add_argument(
+        "--curvature_dtype",
+        type=str,
+        choices=["float32", "float64"],
+        default="float64",
+        help="Floating-point precision used for curvature distance/distribution computation.",
     )
     parser.add_argument(
         "--save_parameter_metric_logs",
