@@ -7,6 +7,7 @@ import torch
 
 from prune import align_curvature_to_weight_shape
 from curv_prune_utils import _get_prunable_module
+from prune_log_utils import append_layer_pruned_parameter_log, collect_pruned_parameter_rows
 
 
 def _curvature_score_order(args):
@@ -17,11 +18,11 @@ def _as_cpu_curvature(curv):
     return curv.detach().cpu() if torch.is_tensor(curv) else torch.as_tensor(curv)
 
 
-def _prune_curvature_group(args, group_entries):
+def _prune_curvature_group(args, group_entries, collect_report_rows=False):
     finite_count = sum(int(entry["finite_mask"].sum().item()) for entry in group_entries)
     prune_count = int(finite_count * float(args.sparsity_ratio))
     if prune_count <= 0:
-        return 0
+        return 0, []
 
     prune_count = min(prune_count, finite_count)
     all_scores = torch.cat([
@@ -40,6 +41,7 @@ def _prune_curvature_group(args, group_entries):
 
     offset = 0
     pruned_count = 0
+    report_rows = []
     with torch.no_grad():
         for entry in group_entries:
             finite_mask = entry["finite_mask"]
@@ -50,13 +52,25 @@ def _prune_curvature_group(args, group_entries):
             prune_mask_cpu = torch.zeros_like(finite_mask, dtype=torch.bool)
             prune_mask_cpu[finite_mask] = entry_selection
             pruned_count += int(prune_mask_cpu.sum().item())
+            if collect_report_rows:
+                report_rows.extend(
+                    collect_pruned_parameter_rows(
+                        entry["layer_idx"],
+                        entry["op_name"],
+                        entry["module"],
+                        entry["curv"],
+                        prune_mask_cpu,
+                        largest=_curvature_score_order(args),
+                        limit=25,
+                    )
+                )
 
             prune_mask = prune_mask_cpu.to(device=entry["module"].weight.data.device)
             entry["module"].weight.data[prune_mask] = 0
 
             del prune_mask, prune_mask_cpu
 
-    return pruned_count
+    return pruned_count, report_rows
 
 
 def _iter_curvature_entries(model):
@@ -94,7 +108,21 @@ def prune_layer_curvature(args, model):
     prune_summary = []
     total_pruned = 0
     for layer_idx, group_entries in sorted(layer_groups.items()):
-        layer_pruned = _prune_curvature_group(args, group_entries)
+        layer_pruned, report_rows = _prune_curvature_group(
+            args,
+            group_entries,
+            collect_report_rows=True,
+        )
+        append_layer_pruned_parameter_log(
+            getattr(args, "all_layer_parameter_log_path", None),
+            args,
+            "curvature",
+            layer_idx,
+            getattr(args, "prune_score_order", "high_to_low"),
+            "curvature",
+            report_rows,
+            largest=_curvature_score_order(args),
+        )
         layer_total = sum(entry["finite_count"] for entry in group_entries)
         total_pruned += layer_pruned
         prune_summary.append(
@@ -118,7 +146,7 @@ def prune_layer_op_curvature(args, model):
     total_pruned = 0
 
     for entry in _iter_curvature_entries(model):
-        op_pruned = _prune_curvature_group(args, [entry])
+        op_pruned, _ = _prune_curvature_group(args, [entry])
         total_pruned += op_pruned
         prune_summary.append(
             {

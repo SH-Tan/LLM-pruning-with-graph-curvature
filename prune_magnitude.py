@@ -1,14 +1,22 @@
 import torch
 
 from prune import find_layers, _curvature_candidate_mask, _select_lowest_mask
+from prune_log_utils import (
+    append_all_layer_pruned_parameter_log,
+    append_layer_pruned_parameter_log,
+    collect_pruned_parameter_rows,
+)
 
 
 def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     layers = model.model.layers
+    report_limit = int(getattr(args, "all_layer_report_rank_offset", 0)) + 25
+    report_rows = []
 
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
+        layer_report_rows = []
 
         for name in subset:
             W = subset[name].weight.data
@@ -41,4 +49,48 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                         args.sparsity_ratio,
                     )
 
+            report_rows.extend(
+                collect_pruned_parameter_rows(
+                    i,
+                    name,
+                    subset[name],
+                    W_metric,
+                    W_mask,
+                    largest=False,
+                    limit=report_limit,
+                )
+            )
+            layer_report_rows.extend(
+                collect_pruned_parameter_rows(
+                    i,
+                    name,
+                    subset[name],
+                    W_metric,
+                    W_mask,
+                    largest=False,
+                    limit=25,
+                )
+            )
             W[W_mask] = 0
+
+        append_layer_pruned_parameter_log(
+            getattr(args, "all_layer_parameter_log_path", None),
+            args,
+            "magnitude",
+            i,
+            getattr(args, "prune_score_order", "low_to_high"),
+            "magnitude",
+            layer_report_rows,
+            largest=False,
+        )
+
+    append_all_layer_pruned_parameter_log(
+        getattr(args, "all_layer_parameter_log_path", None),
+        args,
+        "magnitude",
+        getattr(args, "prune_score_order", "low_to_high"),
+        "magnitude",
+        report_rows,
+        largest=False,
+        rank_offset=getattr(args, "all_layer_report_rank_offset", 0),
+    )

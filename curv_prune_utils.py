@@ -1,5 +1,9 @@
 import torch
 from prune import align_curvature_to_weight_shape
+from prune_log_utils import (
+    append_all_layer_pruned_parameter_log,
+    collect_pruned_parameter_rows,
+)
 
 
 def _get_prunable_module(model, layer_idx, op_name):
@@ -78,6 +82,8 @@ def prune_global_curvature(args, model):
     total_pruned = 0
     offset = 0
     prune_summary = []
+    report_limit = int(getattr(args, "all_layer_report_rank_offset", 0)) + 25
+    report_rows = []
     with torch.no_grad():
         for entry in score_refs:
             module = entry["module"]
@@ -90,6 +96,17 @@ def prune_global_curvature(args, model):
             prune_mask_cpu[finite_mask] = flat_selection
             layer_pruned = int(prune_mask_cpu.sum().item())
             total_pruned += layer_pruned
+            report_rows.extend(
+                collect_pruned_parameter_rows(
+                    entry["layer_idx"],
+                    entry["op_name"],
+                    module,
+                    entry["curv"],
+                    prune_mask_cpu,
+                    largest=prune_high_scores,
+                    limit=report_limit,
+                )
+            )
 
             prune_mask = prune_mask_cpu.to(device=module.weight.data.device)
             module.weight.data[prune_mask] = 0
@@ -106,6 +123,17 @@ def prune_global_curvature(args, model):
             )
 
             del prune_mask, prune_mask_cpu
+
+    append_all_layer_pruned_parameter_log(
+        getattr(args, "all_layer_parameter_log_path", None),
+        args,
+        "curvature",
+        getattr(args, "prune_score_order", "high_to_low"),
+        "curvature",
+        report_rows,
+        largest=prune_high_scores,
+        rank_offset=getattr(args, "all_layer_report_rank_offset", 0),
+    )
 
     print(
         f"Global curvature pruning complete: pruned={total_pruned}"

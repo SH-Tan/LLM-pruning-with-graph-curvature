@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import os
 
 from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 
@@ -118,7 +119,37 @@ def _build_node_distribution(
     dist = torch.where(empty_mask & valid_mask, torch.full_like(dist, -1.0), dist)
 
     dist = dist * valid_mask
-    
+
+    dist_rows = dist.reshape(-1, dist.shape[-1])
+    positive_rows = dist_rows > 0
+    row_nonzero_counts = positive_rows.sum(dim=-1)
+    dense_rows = row_nonzero_counts > 250
+    if dense_rows.any():
+        node_rows = node_tensor.reshape(-1, node_tensor.shape[-1])
+        keep_rows = positive_rows.clone()
+        for row_idx in dense_rows.nonzero(as_tuple=False).flatten().tolist():
+            row = dist_rows[row_idx]
+            keep_count = max(1, int(row_nonzero_counts[row_idx].item() * 0.05))
+            top_idx = torch.topk(row, k=keep_count, largest=True, sorted=False).indices
+            keep_rows[row_idx] = False
+            keep_rows[row_idx, top_idx] = True
+
+        node_rows = torch.where(keep_rows, node_rows, torch.zeros_like(node_rows))
+        node_tensor = node_rows.reshape_as(node_tensor)
+        valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
+        weights = torch.exp(-(node_tensor ** 2)) * valid_mask
+
+        sum_weights = weights.sum(dim=-1, keepdim=True)
+        dist = torch.where(
+            sum_weights > eps,
+            ((1.0 - alpha) * weights) / sum_weights,
+            torch.zeros_like(weights),
+        )
+
+        empty_mask = (sum_weights <= eps).expand_as(valid_mask)
+        dist = torch.where(empty_mask & valid_mask, torch.full_like(dist, -1.0), dist)
+        dist = dist * valid_mask
+
     return dist.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
 
 
@@ -160,17 +191,12 @@ def _build_block_row_node_distribution(
     if l2_norm:
         node_tensor = torch.norm(node_tensor, p=2, dim=1, keepdim=True)
 
-    # Important:
-    # node_tensor shape is always [heads, seq_axis, feature_axis].
-    #
-    # For q_proj:
-    #   [q_heads, seq_q, seq_k]
-    #   dim=1 means normalize across seq_q.
-    #
-    # For k_proj:
-    #   [k_heads, seq_k, seq_q * repeat]
-    #   dim=1 means normalize across seq_k.
-    node_tensor = _normalize_node_value_per_sequence(node_tensor, dim=1)
+    # Normalize each row over the feature axis, then distribution-normalize
+    # each row over the same axis.
+    # q_proj: [q_heads, seq_q, seq_k] -> per (head, seq_q) over seq_k.
+    # k_proj: [k_heads, seq_k, seq_q * repeat] -> per (head, seq_k) over features.
+    # L2: [heads, 1, feature_axis] -> per head over feature_axis.
+    node_tensor = _normalize_node_value_per_sequence(node_tensor, dim=-1)
 
     valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
 
@@ -200,6 +226,17 @@ def _build_block_row_node_distribution(
     )
 
 
+def _check_qk_l2_reference_shape(l_name, l2_reference, expected_shape):
+    if l2_reference is None:
+        return
+
+    ref_shape = tuple(torch.as_tensor(l2_reference).shape)
+    if ref_shape != tuple(expected_shape):
+        raise ValueError(
+            f"Invalid {l_name} A L2 reference shape {ref_shape}, "
+            f"expected {tuple(expected_shape)}"
+        )
+
 
 def _build_qk_out_node_distribution(
     l_name,
@@ -218,13 +255,15 @@ def _build_qk_out_node_distribution(
             f"Expected A node shape [B, q_heads, seq, seq], got {tuple(node.shape)}"
         )
 
-    if node.shape[0] != 1:
+    if l2_norm and l2_norm_mode == "all_examples" and l2_reference is not None:
+        A = node[0].contiguous()
+    elif node.shape[0] != 1:
         raise ValueError(
             f"Expected batch size 1 for A node, got shape {tuple(node.shape)}"
         )
-
-    # [1, q_heads, seq_q, seq_k] -> [q_heads, seq_q, seq_k]
-    A = node.squeeze(0).contiguous()
+    else:
+        # [1, q_heads, seq_q, seq_k] -> [q_heads, seq_q, seq_k]
+        A = node.squeeze(0).contiguous()
     q_heads, seq_q, seq_k = A.shape
     repeat = max(int(repeat), 1)
 
@@ -233,9 +272,11 @@ def _build_qk_out_node_distribution(
         # For each q head h and query token i:
         # node = A[h, i, :]
         #
-        # Shape: [q_heads, seq_q, seq_k]
-        # Normalize across seq_q, i.e. dim=1.
+        # Shape: [q_heads, seq_q, seq_k].
+        # Distribution rows are per (q_head, seq_q) over seq_k.
         out_node = A
+        if l2_norm and l2_reference is not None:
+            _check_qk_l2_reference_shape(l_name, l2_reference, (q_heads, seq_k))
 
     elif l_name == "k_proj":
         # K node:
@@ -252,7 +293,7 @@ def _build_qk_out_node_distribution(
         #   [k_heads, seq_k, seq_q * repeat]
         # Feature axis order is [repeat, seq_q], matching _get_qk_next_cost.
         #
-        # Normalize across seq_k, i.e. dim=1.
+        # Distribution rows are per (k_head, seq_k) over seq_q * repeat.
         if q_heads % repeat != 0:
             raise ValueError(
                 f"q_heads={q_heads} is not divisible by repeat={repeat}"
@@ -266,6 +307,8 @@ def _build_qk_out_node_distribution(
              .reshape(k_heads, seq_k, seq_q * repeat)
              .contiguous()
         )
+        if l2_norm and l2_reference is not None:
+            _check_qk_l2_reference_shape(l_name, l2_reference, (k_heads, seq_q * repeat))
 
     else:
         raise ValueError(f"Unsupported l_name={l_name}")
@@ -276,3 +319,78 @@ def _build_qk_out_node_distribution(
         l2_norm=l2_norm,
         l2_reference=l2_reference,
     )
+
+def draw_nonzero_distribution_curve(dist,
+    node_name=None,
+    save_path=None,
+    ignore_negative=True,
+    dpi=300,):
+    """
+    Draw smooth curve distribution of non-zero values in final dist.
+    No histogram bins.
+    """
+    if hasattr(dist, "detach"):
+        values = dist.detach().cpu().numpy()
+    else:
+        values = np.asarray(dist)
+
+    values = values.reshape(-1)
+
+    if ignore_negative:
+        nonzero_values = values[
+            (values != 0) & np.isfinite(values) & (values > 0)
+        ]
+    else:
+        nonzero_values = values[
+            (values != 0) & np.isfinite(values)
+        ]
+
+    nonzero_count = nonzero_values.size
+    print(f"[{node_name}] non-zero value number: {nonzero_count}")
+
+    if nonzero_count == 0:
+        print("No non-zero values to draw.")
+        return nonzero_values
+
+    if nonzero_count == 1:
+        print(f"Only one non-zero value: {nonzero_values[0]}")
+        return nonzero_values
+
+    sorted_values = np.sort(nonzero_values)
+    value_rank = np.arange(nonzero_count)
+
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(value_rank, sorted_values, linewidth=1.0)
+    ax.set_xlabel("Sorted non-zero value index")
+    ax.set_ylabel("Non-zero distribution value")
+    title = f"Sorted non-zero values, n={nonzero_count}"
+    if node_name is not None:
+        title += f" - {node_name}"
+    ax.set_title(title)
+    stats_text = (
+        f"min={sorted_values[0]:.4g}\n"
+        f"p50={np.percentile(sorted_values, 50):.4g}\n"
+        f"p95={np.percentile(sorted_values, 95):.4g}\n"
+        f"max={sorted_values[-1]:.4g}"
+    )
+    ax.text(
+        0.98,
+        0.95,
+        stats_text,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+    )
+    fig.tight_layout()
+
+    if save_path is not None:
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        print(f"Saved figure to: {save_path}")
+    plt.close(fig)
+    return nonzero_values

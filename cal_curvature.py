@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import ot
+import os
 
 import curv_analysis_utils as analysis_utils
 from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
@@ -9,7 +10,7 @@ from curv_distribution_utils import (
     _build_node_distribution,
     _edge_distribution,
     _min_reduce_blocks,
-    _build_qk_out_node_distribution
+    _build_qk_out_node_distribution,
 )
 
 from curv_sequence_utils import (
@@ -162,13 +163,13 @@ def _get_min_QK_A_cost(v_idx, u_idx, s, prev_active):
         # previous input -> K -> V-out, broadcast repeated-head cost across all seq
         k_prev = k_prev_prefix + k_down[None, None, :]                             # [P, seq, repeat]
         prev_merged = k_prev.reshape(len(prev_active), merged_width)
-        
+
         prev_merged[:, shared_start:shared_end] = np.minimum(
             q_prev,
             prev_merged[:, shared_start:shared_end]
         )
 
-        
+
     # current input -> Q-local-out
     q_curr = _Q_to_A["curr_in_to_next_all"][u_idx, shared_out_idx]             # [repeat]
 
@@ -250,7 +251,7 @@ def _edge_cost_matrix_seq_aware(u_idx, v_idx, prev_active, next_active, sp_uv, s
             head_dim=head_dim,
             repeat=repeat,
         )
-        
+
         # if next_active is a subset, select aligned entries first
         if dynamic_next.shape[0] != next_count:
             dynamic_next = dynamic_next[next_active]
@@ -624,6 +625,27 @@ def _compute_edge_with_top_seq(edge):
     return results
 
 
+def _edge_batches(edges, batch_size):
+    batch_size = max(int(batch_size), 1)
+    for start in range(0, len(edges), batch_size):
+        yield edges[start:start + batch_size]
+
+
+def _edge_batch_size(effective_top_k):
+    env_value = os.environ.get("CURV_EDGE_BATCH_SIZE")
+    if env_value:
+        return max(int(env_value), 1)
+    if effective_top_k <= 1:
+        return 256
+    if effective_top_k <= 10:
+        return 32
+    return 512
+
+
+def _compute_edge_batch_with_top_seq(edge_batch):
+    return [_compute_edge_with_top_seq(edge) for edge in edge_batch]
+
+
 def _reset_shared_state():
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
@@ -783,7 +805,6 @@ def compute_op_curvature(
             repeat=repeat,
         )
 
-  
     _SHARED_CURR_DIST = curr_dist
     _SHARED_SP = sp
     _SHARED_ALPHA = alpha
@@ -919,8 +940,6 @@ def compute_op_curvature(
     t1 = time.time()
     
     if l2_norm:
-        if _SHARED_NEXT_OUT is not None:
-            print(_SHARED_NEXT_OUT.shape)
         seq_len = 1
         
     _SHARED_SEQ_LEN = seq_len
@@ -954,10 +973,12 @@ def compute_op_curvature(
     try:
         effective_top_k = _SHARED_SEQ_LEN if _SHARED_TOP_K == -1 else min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
         total_edge_seq_tasks = len(finite_edges) * max(effective_top_k, 0)
+        edge_batch_size = _edge_batch_size(effective_top_k)
         print(
             f"Will evaluate {effective_top_k} seq positions with {_SHARED_SEQ_SELECT} selection "
             f"for about {total_edge_seq_tasks} edge/seq tasks from {len(finite_edges)} edges."
         )
+        print(f"Using edge batch size {edge_batch_size} per worker task.")
         if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1:
             print(f"Using sliding median low-pass filter with window={_SHARED_LPF_WINDOW}.")
         print(f'Start creating Pool....')
@@ -972,45 +993,50 @@ def compute_op_curvature(
                 prev_score_meta,
                 next_score_meta,
             ),) as pool:
-            for edge_results in pool.imap_unordered(_compute_edge_with_top_seq, finite_edges, chunksize=1):
-                if not edge_results:
-                    continue
-                parameter_log_path = None
-                for edge_res in edge_results:
-                    if not edge_res:
+            for edge_batch_results in pool.imap_unordered(
+                _compute_edge_batch_with_top_seq,
+                _edge_batches(finite_edges, edge_batch_size),
+                chunksize=1,
+            ):
+                for edge_results in edge_batch_results:
+                    if not edge_results:
                         continue
-                    edge_res["sample_idx"] = sample_idx
-                    if parameter_log_root is not None:
-                        parameter_log_path = analysis_utils.prepare_parameter_detail_log(
-                            parameter_log_root,
-                            layer_id,
-                            short_name,
-                            sample_idx,
-                            edge_res["v_idx"],
-                            edge_res["u_idx"],
-                        )
-                        analysis_utils.append_parameter_detail_log(
-                            parameter_log_root,
-                            layer_id,
-                            short_name,
-                            edge_res,
-                        )
-                    v_idx = edge_res["v_idx"]
-                    u_idx = edge_res["u_idx"]
-                    curv = float(edge_res["curv"])
-                    if curv < float(curvature[v_idx, u_idx]):
-                        curvature[v_idx, u_idx] = curv
-                    if lpf_curvature is not None and "lpf_curv" in edge_res:
-                        lpf_curv = float(edge_res["lpf_curv"])
-                        if lpf_curv < float(lpf_curvature[v_idx, u_idx]):
-                            lpf_curvature[v_idx, u_idx] = lpf_curv
-                    mu_len_total += float(edge_res["mu_len"])
-                    nu_len_total += float(edge_res["nu_len"])
-                    mu_nu_count += 1
-                    cost_has_inf = cost_has_inf or bool(edge_res["cost_has_inf"])
-                    cost_inf_count += int(edge_res["cost_inf_count"])
-                if parameter_log_path is not None:
-                    analysis_utils.finalize_parameter_detail_log(parameter_log_path)
+                    parameter_log_path = None
+                    for edge_res in edge_results:
+                        if not edge_res:
+                            continue
+                        edge_res["sample_idx"] = sample_idx
+                        if parameter_log_root is not None:
+                            parameter_log_path = analysis_utils.prepare_parameter_detail_log(
+                                parameter_log_root,
+                                layer_id,
+                                short_name,
+                                sample_idx,
+                                edge_res["v_idx"],
+                                edge_res["u_idx"],
+                            )
+                            analysis_utils.append_parameter_detail_log(
+                                parameter_log_root,
+                                layer_id,
+                                short_name,
+                                edge_res,
+                            )
+                        v_idx = edge_res["v_idx"]
+                        u_idx = edge_res["u_idx"]
+                        curv = float(edge_res["curv"])
+                        if curv < float(curvature[v_idx, u_idx]):
+                            curvature[v_idx, u_idx] = curv
+                        if lpf_curvature is not None and "lpf_curv" in edge_res:
+                            lpf_curv = float(edge_res["lpf_curv"])
+                            if lpf_curv < float(lpf_curvature[v_idx, u_idx]):
+                                lpf_curvature[v_idx, u_idx] = lpf_curv
+                        mu_len_total += float(edge_res["mu_len"])
+                        nu_len_total += float(edge_res["nu_len"])
+                        mu_nu_count += 1
+                        cost_has_inf = cost_has_inf or bool(edge_res["cost_has_inf"])
+                        cost_inf_count += int(edge_res["cost_inf_count"])
+                    if parameter_log_path is not None:
+                        analysis_utils.finalize_parameter_detail_log(parameter_log_path)
 
     finally:
         for shm in seq_owned_shms:
@@ -1042,7 +1068,6 @@ def compute_op_curvature(
         runtime_sec=runtime_sec,
     )
 
-    # curvature = _merge_gqa_curvature(curvature, model, layer_id, short_name)
     if lpf_curvature is not None:
         return {
             "curvature": curvature,

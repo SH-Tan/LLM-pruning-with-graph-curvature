@@ -29,8 +29,9 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
         value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
 
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    
-    attn_weight += attn_bias
+
+    attn_weight = attn_weight + attn_bias
+
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
 
@@ -103,12 +104,15 @@ def _resolve_attention_dims(layer, model):
     return num_heads, num_kv_heads, num_kv_groups, head_dim
 
 
-def _store_operation(op_bank, name, node):
-    op_bank[name] = node.detach().cpu() # _normalize_node_value_per_sequence(node, name)
+def _store_operation(op_bank, name, node, dtype=None):
+    node = node.detach().cpu()
+    if dtype is not None and torch.is_floating_point(node):
+        node = node.to(dtype=dtype)
+    op_bank[name] = node # _normalize_node_value_per_sequence(node, name)
 
 
 
-def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer=None):
+def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer=None, operation_dtype=None):
     operations = {}
 
     with torch.no_grad():
@@ -138,9 +142,9 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
             del cos, sin
         
         # Keep GQA-expanded K/V aligned with the expanded curvature weight layout.
-        _store_operation(operations, "q_proj", _merge_heads(q))
-        _store_operation(operations, "k_proj", _merge_heads(k))
-        _store_operation(operations, "v_proj", v_linear)
+        _store_operation(operations, "q_proj", _merge_heads(q), operation_dtype)
+        _store_operation(operations, "k_proj", _merge_heads(k), operation_dtype)
+        _store_operation(operations, "v_proj", v_linear, operation_dtype)
         
         k = _repeat_kv(k, num_kv_groups) # [1, 32, 8192, 128]
         v = _repeat_kv(v, num_kv_groups) # [1, 32, 8192, 128]
@@ -157,8 +161,9 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         attn_context = _merge_heads(attn_output) # [1, 8192, 4096]
         
         # ---- store Attention weight and out ----
-        _store_operation(operations, "A", A)
-        _store_operation(operations, "Att_out", attn_context)
+        A = torch.where(torch.isinf(A), torch.zeros_like(A), A)
+        _store_operation(operations, "A", A, operation_dtype)
+        _store_operation(operations, "Att_out", attn_context, operation_dtype)
 
         # ===== O PROJ =====
         o = layer.self_attn.o_proj(attn_context)
@@ -166,7 +171,7 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         x_norm2 = layer.post_attention_layernorm(x_res1)
         
         # ---- attention output ----
-        _store_operation(operations, "o_proj", x_norm2)
+        _store_operation(operations, "o_proj", x_norm2, operation_dtype)
 
         # ===== MLP =====
         gate = layer.mlp.gate_proj(x_norm2)
@@ -176,18 +181,18 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         down = layer.mlp.down_proj(mlp_hidden)
         x_out = x_res1 + down
         
-        _store_operation(operations, "gate_proj", act)
-        _store_operation(operations, "up_proj", up)
-        _store_operation(operations, "gate_up_out", mlp_hidden)
+        _store_operation(operations, "gate_proj", act, operation_dtype)
+        _store_operation(operations, "up_proj", up, operation_dtype)
+        _store_operation(operations, "gate_up_out", mlp_hidden, operation_dtype)
 
         if next_layer is not None and hasattr(next_layer, "input_layernorm"):
             next_ln = next_layer.input_layernorm
             next_ln_device = next_ln.weight.device
             next_input = x_out.to(next_ln_device)
             next_input_norm = next_ln(next_input)
-            _store_operation(operations, "down_proj", next_input_norm)
+            _store_operation(operations, "down_proj", next_input_norm, operation_dtype)
         else:
-            _store_operation(operations, "down_proj", x_out)
+            _store_operation(operations, "down_proj", x_out, operation_dtype)
             
         # ---- cleanup (GPU memory critical) ----
         del q, k, v, A, attn_output

@@ -238,7 +238,9 @@ def per_layer_result_tag(args):
 def pp_result_tag(args):
     if args.prune_method != "curvature":
         return args.prune_method
-    return f"{per_layer_result_tag(args)}_{getattr(args, 'curvature_prune_scope', 'global')}"
+    scope = getattr(args, "curvature_prune_scope", "global")
+    scope_tag = "local" if scope == "per_layer" else scope
+    return f"{per_layer_result_tag(args)}_{scope_tag}"
 
 
 def reference_layer_indices(args, get_llm_fn, model_device, base_wanda_scores):
@@ -300,9 +302,11 @@ def run_per_layer_eval(
     layer_ids = reference_layer_indices(args, get_llm_fn, model_device, base_wanda_scores)
     result_dir = os.path.dirname(save_filepath)
     result_tag = per_layer_result_tag(args)
-    plot_dir = os.path.join(result_dir, f"per_layer_plots_{result_tag}")
     compare_dir = args.per_layer_compare_dir or result_dir
+    plot_dir = os.path.join(compare_dir, "per_layer_plots", result_tag)
     compare_plot_dir = os.path.join(compare_dir, "method_compare_plots")
+    per_layer_log_dir = os.path.join(compare_dir, "per_layer_logs", result_tag)
+    os.makedirs(per_layer_log_dir, exist_ok=True)
     all_records = []
     if args.prune_method == "curvature":
         prune_score_orders = ["high_to_low"]
@@ -310,6 +314,9 @@ def run_per_layer_eval(
     for score_order in prune_score_orders:
         args.prune_score_order = score_order
         for layer_idx in layer_ids:
+            layer_log_prefix = os.path.join(per_layer_log_dir, f"layer_{layer_idx:03d}")
+            edge_log_path = f"{layer_log_prefix}_pruned_parameters.txt"
+            pp_log_path = f"{layer_log_prefix}_pp_eval.txt"
             layer_records = []
             layer_curvature_scores = None
             if args.load_curvature_dir is not None:
@@ -355,7 +362,7 @@ def run_per_layer_eval(
                             current_model,
                             layer_idx,
                             layer_curvature_scores,
-                            edge_log_path=save_filepath,
+                            edge_log_path=edge_log_path,
                             report_rank_offset=report_rank_offset,
                         )
                     elif args.prune_method == "wanda":
@@ -367,7 +374,7 @@ def run_per_layer_eval(
                             layer_curvature_scores=layer_curvature_scores,
                             prune_n=prune_n,
                             prune_m=prune_m,
-                            edge_log_path=save_filepath,
+                            edge_log_path=edge_log_path,
                             report_rank_offset=report_rank_offset,
                         )
                     elif args.prune_method == "magnitude":
@@ -378,7 +385,7 @@ def run_per_layer_eval(
                             layer_curvature_scores=layer_curvature_scores,
                             prune_n=prune_n,
                             prune_m=prune_m,
-                            edge_log_path=save_filepath,
+                            edge_log_path=edge_log_path,
                             report_rank_offset=report_rank_offset,
                         )
 
@@ -389,7 +396,7 @@ def run_per_layer_eval(
                     current_model.seqlen = seq
                     ppl_test = eval_ppl(args, current_model, tokenizer, model_device)
                     append_per_layer_eval_result(
-                        save_filepath,
+                        pp_log_path,
                         args,
                         layer_idx,
                         score_order,
@@ -420,7 +427,7 @@ def run_per_layer_eval(
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                with open(save_filepath, "a+", encoding="utf-8") as f:
+                with open(pp_log_path, "a+", encoding="utf-8") as f:
                     print("", file=f, flush=True)
 
                 del current_model
@@ -435,7 +442,7 @@ def run_per_layer_eval(
             if plot_paths:
                 print(f"Saved layer {layer_idx} plot to {plot_paths[-1]}")
 
-            with open(save_filepath, "a+", encoding="utf-8") as f:
+            with open(pp_log_path, "a+", encoding="utf-8") as f:
                 print("", file=f, flush=True)
 
     if all_records:
@@ -470,7 +477,14 @@ def run_pp_eval(
     base_curvature_scores=None,
     base_wanda_scores=None,
 ):
-    with open(save_filepath, "a+") as f:
+    result_dir = os.path.dirname(save_filepath)
+    compare_dir = args.per_layer_compare_dir or result_dir
+    compare_tag = pp_result_tag(args)
+    pp_log_path = os.path.join(compare_dir, f"all_layer_pp_eval_{compare_tag}.txt")
+    parameter_log_path = os.path.join(compare_dir, f"all_layer_pruned_parameters_{compare_tag}.txt")
+    os.makedirs(compare_dir, exist_ok=True)
+
+    with open(pp_log_path, "a+") as f:
         print(
             f"{'method':<15}{'score_order':<15}{'l2_norm':<10}{'target_sparsity':<18}"
             f"{'actual_sparsity':<18}{'calib_data':<20}{'eval_mode':<28}"
@@ -482,12 +496,13 @@ def run_pp_eval(
     eval_records = []
     for score_order in prune_score_orders:
         args.prune_score_order = score_order
+        nonzero_sparsity_idx = 0
         for run_idx, target_ratio in enumerate(sparsity_ratios):
             print(
                 f"starting sweep run {run_idx + 1}/{len(sparsity_ratios)} "
                 f"with sparsity={target_ratio:.4f}, score_order={score_order}"
             )
-            append_eval_run_header(save_filepath, args, target_ratio, score_order)
+            append_eval_run_header(pp_log_path, args, target_ratio, score_order)
             current_model = get_llm_fn(args.model, args.cache_dir, model_device, args.seqlen)
             current_model.eval()
             current_model.seqlen = args.seqlen
@@ -495,6 +510,9 @@ def run_pp_eval(
 
             if target_ratio != 0:
                 print("pruning starts")
+                args.all_layer_parameter_log_path = parameter_log_path
+                args.all_layer_report_rank_offset = nonzero_sparsity_idx * 25
+                nonzero_sparsity_idx += 1
                 if args.prune_method == "curvature":
                     current_model.curvature_scores = base_curvature_scores
                     if args.curvature_prune_scope == "global":
@@ -502,7 +520,7 @@ def run_pp_eval(
                     else:
                         prune_summary = prune_scoped_curvature(args, current_model)
                     append_curvature_prune_summary(
-                        save_filepath,
+                        pp_log_path,
                         prune_summary,
                         target_ratio=target_ratio,
                         score_order=score_order,
@@ -524,7 +542,7 @@ def run_pp_eval(
                 eval_mode = "fixed_score_seq_len" if args.prune_method == "wanda" else "standard_eval"
                 print(f"wikitext perplexity {ppl_test} using pp_seqlen = {seq}")
                 append_eval_result(
-                    save_filepath,
+                    pp_log_path,
                     args,
                     score_order,
                     target_ratio,
@@ -564,11 +582,10 @@ def run_pp_eval(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            with open(save_filepath, "a+", encoding="utf-8") as f:
+            with open(pp_log_path, "a+", encoding="utf-8") as f:
                 print("", file=f, flush=True)
 
     if eval_records:
-        result_dir = os.path.dirname(save_filepath)
         result_tag = pp_result_tag(args)
         csv_path = os.path.join(result_dir, f"ppl_vs_sparsity_{result_tag}.csv")
         plot_path = os.path.join(result_dir, f"ppl_vs_sparsity_{result_tag}.png")
@@ -577,9 +594,7 @@ def run_pp_eval(
         if drawn_path is not None:
             print(f"Saved PPL vs sparsity plot: {drawn_path}")
 
-        compare_dir = args.per_layer_compare_dir or result_dir
         compare_plot_dir = os.path.join(compare_dir, "all_layer_method_compare_plots")
-        compare_tag = pp_result_tag(args)
         compare_csv = os.path.join(compare_dir, f"pp_records_{compare_tag}.csv")
         saved_compare_csv = save_eval_records_csv(eval_records, compare_csv)
         if saved_compare_csv is not None:

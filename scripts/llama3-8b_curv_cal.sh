@@ -5,7 +5,7 @@ set -e
 model="meta-llama/Meta-Llama-3-8B"
 python_bin="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
 sparsity_ratios="0"
-nsamples=5
+nsamples=1
 seed=13
 alpha=0.9
 model_device="cuda:0"
@@ -14,7 +14,7 @@ seq_len=512
 sample_edge_ratio=0.2
 sample_edge_num=-1
 calib_data="c4_independent"
-curvature_dir="out/llama_8b/unstructured/curvature/Q_0.2/"
+curvature_dir="out/llama_8b/unstructured/curvature/Q_0.2_reduce_neighbor_A/1_example/"
 curvature_dtype="${CURVATURE_DTYPE:-float32}"
 save_parameter_metric_logs="${SAVE_PARAMETER_METRIC_LOGS:-0}"
 
@@ -61,22 +61,24 @@ run_curvature_calculation() {
 # Run list. Keep each setting explicit so it is easy to comment out or add variants.
 
 # 1. L2 norm type 1: current behavior, L2 per example over all sequence positions.
-top_k_seq=-1
-seq_select="top"
-curvature_lpf_window=0
-run_curvature_calculation 1 "per_example"
+# top_k_seq=-1
+# seq_select="top"
+# curvature_lpf_window=0
+# run_curvature_calculation 1 "per_example"
 
-# 2. L2 norm type 2: Wanda-style, L2 over all examples and all sequence positions.
-top_k_seq=-1
-seq_select="top"
-curvature_lpf_window=0
-run_curvature_calculation 1 "all_examples"
-
-# 3. No L2: select top 10 sequence positions.
+# 2. No L2: select top 10 sequence positions.
 top_k_seq=10
 seq_select="top"
 curvature_lpf_window=0
 run_curvature_calculation 0 "per_example"
+
+# 3. L2 norm type 2: Wanda-style, L2 over all examples and all sequence positions.
+# top_k_seq=-1
+# seq_select="top"
+# curvature_lpf_window=0
+# run_curvature_calculation 1 "all_examples"
+
+
 
 # Future examples:
 # top_k_seq=10

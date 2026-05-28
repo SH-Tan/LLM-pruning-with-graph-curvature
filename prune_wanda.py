@@ -8,6 +8,11 @@ from prune import (
     _curvature_candidate_mask,
     _select_lowest_mask,
 )
+from prune_log_utils import (
+    append_all_layer_pruned_parameter_log,
+    append_layer_pruned_parameter_log,
+    collect_pruned_parameter_rows,
+)
 
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
@@ -112,10 +117,13 @@ def compute_wanda_scores(args, model, tokenizer, device=torch.device("cuda:0")):
 
 def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
     layers = model.model.layers
+    report_limit = int(getattr(args, "all_layer_report_rank_offset", 0)) + 25
+    report_rows = []
 
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
+        layer_report_rows = []
 
         layer_scores = wanda_scores[i] if i < len(wanda_scores) else {}
 
@@ -156,6 +164,30 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
             else:
                 if candidate_mask is not None and not args.use_variant:
                     W_mask = _select_lowest_mask(W_metric, candidate_mask, args.sparsity_ratio)
+                    report_rows.extend(
+                        collect_pruned_parameter_rows(
+                            i,
+                            name,
+                            subset[name],
+                            W_metric,
+                            W_mask,
+                            largest=False,
+                            limit=report_limit,
+                            include_input_scale=True,
+                        )
+                    )
+                    layer_report_rows.extend(
+                        collect_pruned_parameter_rows(
+                            i,
+                            name,
+                            subset[name],
+                            W_metric,
+                            W_mask,
+                            largest=False,
+                            limit=25,
+                            include_input_scale=True,
+                        )
+                    )
                     W[W_mask.to(device=W.device)] = 0
                     del W_metric, W_mask
                     continue
@@ -188,8 +220,54 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
                     if candidate_mask is not None:
                         W_mask &= candidate_mask
 
+            report_rows.extend(
+                collect_pruned_parameter_rows(
+                    i,
+                    name,
+                    subset[name],
+                    W_metric,
+                    W_mask,
+                    largest=False,
+                    limit=report_limit,
+                    include_input_scale=True,
+                )
+            )
+            layer_report_rows.extend(
+                collect_pruned_parameter_rows(
+                    i,
+                    name,
+                    subset[name],
+                    W_metric,
+                    W_mask,
+                    largest=False,
+                    limit=25,
+                    include_input_scale=True,
+                )
+            )
             W[W_mask.to(device=W.device)] = 0
             del W_metric, W_mask
+
+        append_layer_pruned_parameter_log(
+            getattr(args, "all_layer_parameter_log_path", None),
+            args,
+            "wanda",
+            i,
+            getattr(args, "prune_score_order", "low_to_high"),
+            "wanda",
+            layer_report_rows,
+            largest=False,
+        )
+
+    append_all_layer_pruned_parameter_log(
+        getattr(args, "all_layer_parameter_log_path", None),
+        args,
+        "wanda",
+        getattr(args, "prune_score_order", "low_to_high"),
+        "wanda",
+        report_rows,
+        largest=False,
+        rank_offset=getattr(args, "all_layer_report_rank_offset", 0),
+    )
 
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):

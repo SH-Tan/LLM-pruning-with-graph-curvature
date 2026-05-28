@@ -13,7 +13,6 @@ from layerwrapper_curv import collect_layer_data, _make_lm_head_op
 from prune import (
     align_curvature_to_weight_shape,
     find_layers,
-    load_curvature_pkls,
     prepare_calibration_input,
     save_layer_curvature_pkl,
 )
@@ -58,7 +57,7 @@ def _curvature_save_metadata(args):
         "shared_top_k": getattr(args, "shared_top_k", 10),
         "shared_seq_select": getattr(args, "shared_seq_select", "top"),
         "curvature_lpf_window": getattr(args, "curvature_lpf_window", 0),
-        "curvature_dtype": getattr(args, "curvature_dtype", "float64"),
+        "curvature_dtype": getattr(args, "curvature_dtype", "float32"),
         "curvature_layout": "weight_out_in",
     }
 
@@ -73,20 +72,14 @@ def _accumulate_l2_stat(stats, name, node):
     if node.dim() == 3:
         if name.endswith("_A_out"):
             sumsq = (node ** 2).sum(dim=1)
-            if name in stats:
-                stats[name] += sumsq
-            else:
-                stats[name] = sumsq
+            stats[name] = stats[name] + sumsq if name in stats else sumsq
             return
         node = node.reshape(-1, node.shape[-1])
     elif node.dim() != 2:
         node = node.reshape(1, -1)
 
     sumsq = (node ** 2).sum(dim=0)
-    if name in stats:
-        stats[name] += sumsq
-    else:
-        stats[name] = sumsq
+    stats[name] = stats[name] + sumsq if name in stats else sumsq
 
 
 def _attention_l2_node(attention, short_name, repeat=1):
@@ -128,8 +121,9 @@ def _accumulate_operation_l2_stats(stats, operations, target_ops, repeat=1):
         )
 
 
-def _finalize_l2_stats(stats):
-    return {name: torch.sqrt(value) for name, value in stats.items()}
+def _finalize_l2_stats(stats, nsamples):
+    nsamples = max(int(nsamples), 1)
+    return {name: torch.sqrt(value / nsamples) for name, value in stats.items()}
 
 
 def _curvature_pkl_dir(base_dir, shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
@@ -172,9 +166,9 @@ def _parameter_metric_log_root(
 
 
 def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=0):
-    set_curvature_dtype(getattr(args, "curvature_dtype", "float64"))
+    set_curvature_dtype(getattr(args, "curvature_dtype", "float32"))
     curv_torch_dtype = curvature_torch_dtype()
-    print(f"Using curvature_dtype={getattr(args, 'curvature_dtype', 'float64')}")
+    print(f"Using curvature_dtype={getattr(args, 'curvature_dtype', 'float32')}")
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -219,7 +213,6 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
     if save_lpf_curvature:
         model.lpf_curvature_scores = [{} for _ in range(len(layers))]
     curvature_save_dir = getattr(args, "save_curvature_dir", None)
-    curvature_load_dir = getattr(args, "load_curvature_dir", None)
     save_curvature_pkls = not (
         bool(getattr(args, "save_parameter_metric_logs", False))
         or bool(getattr(args, "draw_parameter_metric_plots", False))
@@ -254,30 +247,10 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
             curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
         )
 
-    if curvature_load_dir is not None:
-        model.curvature_scores = load_curvature_pkls(
-            curvature_load_dir,
-            len(layers),
-            shared_top_k=getattr(args, "shared_top_k", 10),
-            shared_seq_select=getattr(args, "shared_seq_select", "top"),
-            curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
-        )
-        loaded = sum(len(layer_scores) for layer_scores in model.curvature_scores)
-        if loaded > 0:
-            print(f"Loaded {loaded} curvature pkls from {curvature_load_dir}")
-            model.config.use_cache = use_cache
-            return
-        print(
-            "No curvature pkls found for the requested seq-selection setting at "
-            f"{curvature_load_dir}; recomputing curvature."
-        )
-
     _append_curvature_timing_header(curvature_timing_log_path)
 
     uses_prev_layer_context = any(short in {"q_proj", "k_proj", "v_proj", "down_proj"} for short in target_ops)
     prev_layer_outputs = [None] * args.nsamples if uses_prev_layer_context else None
-    layer_cache = {}
-    sp_cache = {}
 
     try:
         for i, layer in enumerate(layers):
@@ -312,70 +285,117 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         device="cpu",
                     )
 
-            new_inps = torch.empty_like(inps, device="cpu")
             l2_norm_stats = None
-            if getattr(args, "l2_norm", False) and getattr(args, "l2_norm_mode", "per_example") == "all_examples":
+            all_examples_l2 = (
+                getattr(args, "l2_norm", False)
+                and getattr(args, "l2_norm_mode", "per_example") == "all_examples"
+            )
+            if all_examples_l2:
                 print(f"Collecting all-example L2 stats for layer {i}")
                 l2_sumsq = {}
+                next_inps = torch.empty_like(inps, device="cpu")
+                next_prev_layer_outputs = [None] * args.nsamples if prev_layer_outputs is not None else None
+                representative = None
                 for j in range(args.nsamples):
                     x = inps[j:j + 1].to(model_device, non_blocking=True)
                     next_layer = layers[i + 1] if i < last_layer_idx else None
+                    prev_outputs = prev_layer_outputs[j] if prev_layer_outputs is not None else None
+
                     with torch.no_grad():
-                        x_out, operations, _, _, _, _ = collect_layer_data(
+                        x_out, operations, _, _, repeat, _ = collect_layer_data(
                             layer,
                             x,
                             attention_mask,
                             position_ids,
                             model,
                             next_layer=next_layer,
+                            operation_dtype=curv_torch_dtype,
                         )
 
                     x_out = x_out.detach().cpu()
-                    if prev_layer_outputs is not None and prev_layer_outputs[j] is not None:
+                    if prev_outputs is not None:
                         for name in ["o_proj", "gate_up_out", "down_proj"]:
-                            if name in prev_layer_outputs[j]:
-                                operations[f"prev_{name}"] = prev_layer_outputs[j][name]
+                            if name in prev_outputs:
+                                operations[f"prev_{name}"] = prev_outputs[name]
                     if i == last_layer_idx:
                         operations.update(_make_lm_head_op(model, x_out))
 
                     _accumulate_operation_l2_stats(l2_sumsq, operations, target_ops, repeat=repeat)
-                    del operations, x, x_out
+                    if next_prev_layer_outputs is not None:
+                        next_prev_layer_outputs[j] = {
+                            name: operations[name]
+                            for name in ["o_proj", "gate_up_out", "down_proj"]
+                            if name in operations
+                        }
+                    next_inps[j].copy_(x_out.squeeze(0))
+                    if representative is None:
+                        representative = (
+                            operations,
+                            repeat,
+                        )
+                        operations = None
+                    del operations, x, x_out, prev_outputs
                     if j % 8 == 0 and torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                l2_norm_stats = _finalize_l2_stats(l2_sumsq)
+                l2_norm_stats = _finalize_l2_stats(l2_sumsq, args.nsamples)
                 del l2_sumsq
+                inps = next_inps
+                prev_layer_outputs = next_prev_layer_outputs
+                representative_operations, _ = representative
 
-            for j in range(args.nsamples):
+            sample_indices = range(1) if all_examples_l2 else range(args.nsamples)
+            for j in sample_indices:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize(model_device)
                     torch.cuda.synchronize(compute_device)
                 sample_start_time = time.perf_counter()
-                
-                x = inps[j:j + 1].to(model_device, non_blocking=True)
-                next_layer = layers[i + 1] if i < last_layer_idx else None
 
-                with torch.no_grad():
-                    x_out, operations, num_q_heads, num_kv_heads, repeat, head_dim = collect_layer_data(
-                        layer,
-                        x,
-                        attention_mask,
-                        position_ids,
-                        model,
-                        next_layer=next_layer,
-                    )
+                if all_examples_l2:
+                    x = None
+                    prev_outputs = None
+                    operations = representative_operations
+                    num_q_heads, num_kv_heads, repeat, head_dim = layer._cached_dims
+                else:
+                    x = inps[j:j + 1].to(model_device, non_blocking=True)
+                    prev_outputs = prev_layer_outputs[j] if prev_layer_outputs is not None else None
+                    next_layer = layers[i + 1] if i < last_layer_idx else None
 
-                x_out = x_out.detach().cpu()
+                    with torch.no_grad():
+                        x_out, operations, num_q_heads, num_kv_heads, repeat, head_dim = collect_layer_data(
+                            layer,
+                            x,
+                            attention_mask,
+                            position_ids,
+                            model,
+                            next_layer=next_layer,
+                            operation_dtype=curv_torch_dtype,
+                        )
+
+                    x_out = x_out.detach().cpu()
 
                 print("Finish getting layer data!!!")
 
                 # prev_* tensors come from layer i-1 and are used as context for layer i curvature.
-                if prev_layer_outputs is not None and prev_layer_outputs[j] is not None:
+                if prev_outputs is not None:
                     for name in ["o_proj", "gate_up_out", "down_proj"]:
-                        if name in prev_layer_outputs[j]:
-                            operations[f"prev_{name}"] = prev_layer_outputs[j][name]
+                        if name in prev_outputs:
+                            operations[f"prev_{name}"] = prev_outputs[name]
 
                 if i == last_layer_idx:
-                    operations.update(_make_lm_head_op(model, x_out))
+                    if not all_examples_l2:
+                        operations.update(_make_lm_head_op(model, x_out))
+
+                if prev_layer_outputs is not None and not all_examples_l2:
+                    prev_layer_outputs[j] = {
+                        name: operations[name]
+                        for name in ["o_proj", "gate_up_out", "down_proj"]
+                        if name in operations
+                    }
+
+                if not all_examples_l2:
+                    inps[j].copy_(x_out.squeeze(0))
+                    del x_out
+                del prev_outputs
 
                 if j == 0:
                     layer_cache = build_layer_cache(model, operations, i, layer_cache, device=compute_device)
@@ -392,7 +412,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                             device=compute_device,
                         )
 
-                    if prev_layer_outputs is not None and prev_layer_outputs[j] is not None and has_down_proj_target:
+                    if "prev_down_proj" in operations and has_down_proj_target:
                         build_shortest_path_cache(
                             operations=operations,
                             layer_cache=layer_cache,
@@ -465,7 +485,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         )
                         torch.minimum(module.min_lpf_curvature, param_lpf_curv, out=module.min_lpf_curvature)
 
-                if prev_layer_outputs is not None and prev_layer_outputs[j] is not None and has_down_proj_target:
+                if "prev_down_proj" in operations and has_down_proj_target:
                     prev_i = i - 1
                     curv_result = compute_op_curvature(
                         operations=operations,
@@ -612,16 +632,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         )
                         model.lpf_curvature_scores[i]["lm_head"] = lm_lpf_curv
 
-                if prev_layer_outputs is not None:
-                    prev_layer_outputs[j] = {
-                        name: operations[name]
-                        for name in ["o_proj", "gate_up_out", "down_proj"]
-                        if name in operations
-                    }
-
-                new_inps[j] = x_out.squeeze(0)
-
-                del operations, x, x_out
+                del operations, x
 
                 if torch.cuda.is_available():
                     torch.cuda.synchronize(model_device)
@@ -643,8 +654,6 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
                 if j % 8 == 0:
                     torch.cuda.empty_cache()
-
-            inps = new_inps
 
             for short, module in modules_items:
                 model.curvature_scores[i][short] = module.min_curvature
