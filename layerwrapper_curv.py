@@ -120,7 +120,7 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         x_norm = layer.input_layernorm(x_in)
         
         # ---- store shared layer input ----
-        # _store_operation(operations, "layer_input", x_norm)
+        _store_operation(operations, "layer_input", x_norm, operation_dtype)
 
         if not hasattr(layer, "_cached_dims"):
             layer._cached_dims = _resolve_attention_dims(layer, model)

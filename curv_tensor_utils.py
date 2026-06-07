@@ -21,7 +21,9 @@ def _append_debug_log(lines, log_name):
         f.write("\n" + "=" * 80 + "\n")
 
 
-def adaptive_chunksize(max_chunk=512):
+def adaptive_chunksize(max_chunk=512, device=None):
+    if device is not None and not str(device).startswith("cuda"):
+        return max_chunk, max_chunk
     if not torch.cuda.is_available():
         return max_chunk, max_chunk
 
@@ -89,15 +91,19 @@ def _all_cost_matrices(layer_cache, names, device):
 
 
 
-def build_layer_cache(model, operations, layer_id, cache=None, device="cuda"):
+def build_layer_cache(model, operations, layer_id, cache=None, device="cuda", required_names=None):
     """
     Build or update the layer cache with distance matrices.
     Keep this once per layer/model state, then reuse across samples.
     """
     if cache is None:
         cache = {}
+    if required_names is not None:
+        required_names = set(required_names)
 
     for name in operations.keys():
+        if required_names is not None and name not in required_names:
+            continue
         if name in {"layer_input", "A", "Att_out", "gate_up_out"}:
             continue
         
@@ -267,7 +273,7 @@ def _build_x_to_out_cost(v, sp_q, meta, device):
         else:
             a = a.to(device)
             
-        chunk_k, chunk_p = adaptive_chunksize()
+        chunk_k, chunk_p = adaptive_chunksize(device=device)
         res = _min_plus_torch(a, out, chunk_k=chunk_k, chunk_p=chunk_p)
         
         cost["prev_to_next_all"] = res.cpu().contiguous().numpy()
@@ -280,7 +286,7 @@ def _build_x_to_out_cost(v, sp_q, meta, device):
     else:
         a = a.to(device)
         
-    chunk_k, chunk_p = adaptive_chunksize()
+    chunk_k, chunk_p = adaptive_chunksize(device=device)
     res = _min_plus_torch(a, out, chunk_k=chunk_k, chunk_p=chunk_p)
     
     cost["curr_in_to_next_all"] = res.cpu().contiguous().numpy()

@@ -6,7 +6,14 @@ import numpy as np
 import torch
 
 from curv_prune_utils import _get_prunable_module
-from prune import align_curvature_to_weight_shape, find_layers, load_layer_curvature_pkl
+from prune import (
+    align_curvature_to_weight_shape,
+    find_layers,
+    load_layer_curvature_pkl,
+    prune_scope_from_args,
+    score_order_largest,
+    select_prune_masks_by_score,
+)
 
 
 def _curvature_seq_tag(shared_top_k=None, shared_seq_select="top", curvature_lpf_window=0):
@@ -132,24 +139,6 @@ def _candidate_mask_from_curvature(layer_scores, name, weight):
         context=f"{name} layer curvature candidate mask",
     )
     return torch.isfinite(curv).to(device=weight.device)
-
-
-def _select_lowest_mask(metric, candidate_mask, ratio):
-    prune_mask = torch.zeros_like(metric, dtype=torch.bool)
-    eligible_count = int(candidate_mask.sum().item())
-    prune_count = int(eligible_count * ratio)
-    if prune_count <= 0:
-        return prune_mask, None
-
-    candidate_scores = metric[candidate_mask].float()
-    prune_count = min(prune_count, candidate_scores.numel())
-    selected = torch.topk(candidate_scores, k=prune_count, largest=False, sorted=False).indices
-    selected_scores = candidate_scores[selected]
-    cutoff = float(selected_scores.max().item()) if selected_scores.numel() > 0 else None
-
-    flat_positions = candidate_mask.reshape(-1).nonzero(as_tuple=False).flatten()
-    prune_mask.reshape(-1)[flat_positions[selected]] = True
-    return prune_mask, cutoff
 
 
 def _selected_score_cutoff(selected_scores, prune_high_scores):
@@ -351,6 +340,72 @@ def prune_curvature_layer(
     if prune_count <= 0 or total_finite == 0:
         return {"layer_idx": layer_idx, "pruned_params": 0, "total_params": total_finite}, None
 
+    if prune_scope_from_args(args) == "per_layer_op":
+        edge_rows = []
+        total_pruned = 0
+        cutoffs = []
+        prune_high_scores = _score_order_is_descending(args)
+        report_start = int(report_rank_offset)
+        report_end = report_start + 25
+        for entry in group_entries:
+            op_scores = entry["curv"][entry["finite_mask"]].reshape(-1)
+            op_prune_count = int(op_scores.numel() * float(args.sparsity_ratio))
+            if op_prune_count <= 0:
+                continue
+            op_prune_count = min(op_prune_count, op_scores.numel())
+            selected = torch.topk(
+                op_scores,
+                k=op_prune_count,
+                largest=prune_high_scores,
+                sorted=True,
+            ).indices
+            cutoffs.append(_selected_score_cutoff(op_scores[selected], prune_high_scores))
+            selection_mask = torch.zeros(op_scores.numel(), dtype=torch.bool)
+            selection_mask[selected] = True
+
+            prune_mask_cpu = torch.zeros_like(entry["finite_mask"], dtype=torch.bool)
+            prune_mask_cpu[entry["finite_mask"]] = selection_mask
+            total_pruned += int(prune_mask_cpu.sum().item())
+
+            flat_positions = entry["finite_mask"].reshape(-1).nonzero(as_tuple=False).flatten()
+            for selected_idx in selected[:report_end].tolist():
+                flat_idx = int(flat_positions[selected_idx].item())
+                col_count = entry["finite_mask"].shape[1]
+                row_idx = int(flat_idx // col_count)
+                col_idx = int(flat_idx % col_count)
+                edge_rows.append(
+                    {
+                        "op_name": entry["op_name"],
+                        "i": col_idx,
+                        "j": row_idx,
+                        "weight_magnitude": _weight_magnitude_at(entry["module"], row_idx, col_idx),
+                        "score": float(op_scores[selected_idx].item()),
+                    }
+                )
+
+            prune_mask = prune_mask_cpu.to(device=entry["module"].weight.data.device)
+            entry["module"].weight.data[prune_mask] = 0
+
+        edge_rows = sorted(edge_rows, key=lambda row: row["score"], reverse=prune_high_scores)[report_start:report_end]
+        _append_first_pruned_edges(
+            edge_log_path,
+            args,
+            "curvature",
+            layer_idx,
+            getattr(args, "prune_score_order", "high_to_low"),
+            "curvature",
+            edge_rows,
+            rank_offset=report_start,
+        )
+        cutoff = None
+        if cutoffs:
+            cutoff = min(cutoffs) if prune_high_scores else max(cutoffs)
+        return {
+            "layer_idx": layer_idx,
+            "pruned_params": total_pruned,
+            "total_params": total_finite,
+        }, cutoff
+
     all_scores = torch.cat(
         [entry["curv"][entry["finite_mask"]].reshape(-1) for entry in group_entries]
     )
@@ -445,6 +500,64 @@ def prune_magnitude_layer(
     zero_score_count = 0
     eligible_score_count = 0
 
+    scope = prune_scope_from_args(args)
+    largest = score_order_largest(args, default=False)
+    if prune_n == 0 and scope == "per_layer":
+        entries = []
+        for name, module in subset.items():
+            weight = module.weight.data
+            metric = torch.abs(weight)
+            candidate_mask = _candidate_mask_from_curvature(layer_curvature_scores, name, weight)
+            op_zero_count, op_eligible_count, op_score_rows = _nonzero_score_rows(
+                name,
+                module,
+                metric,
+                candidate_mask=candidate_mask,
+                limit=int(report_rank_offset) + 25,
+            )
+            zero_score_count += op_zero_count
+            eligible_score_count += op_eligible_count
+            score_rows.extend(op_score_rows)
+            entries.append(
+                {
+                    "name": name,
+                    "module": module,
+                    "metric": metric,
+                    "candidate_mask": candidate_mask,
+                }
+            )
+
+        prune_masks, cutoff = select_prune_masks_by_score(
+            entries,
+            args.sparsity_ratio,
+            largest=largest,
+        )
+        for entry, prune_mask in zip(entries, prune_masks):
+            entry["module"].weight.data[prune_mask.to(device=entry["module"].weight.data.device)] = 0
+            layer_pruned += int(prune_mask.sum().item())
+            candidate_mask = entry["candidate_mask"]
+            layer_total += (
+                int(candidate_mask.sum().item())
+                if candidate_mask is not None
+                else entry["module"].weight.data.numel()
+            )
+
+        report_start = int(report_rank_offset)
+        report_end = report_start + 25
+        score_rows = sorted(score_rows, key=lambda row: row["score"], reverse=largest)[report_start:report_end]
+        _append_score_zero_summary(
+            edge_log_path,
+            args,
+            "magnitude",
+            layer_idx,
+            "magnitude",
+            zero_score_count,
+            eligible_score_count,
+            score_rows,
+            rank_offset=report_start,
+        )
+        return {"layer_idx": layer_idx, "pruned_params": layer_pruned, "total_params": layer_total}, cutoff
+
     for name, module in subset.items():
         weight = module.weight.data
         metric = torch.abs(weight)
@@ -488,7 +601,12 @@ def prune_magnitude_layer(
         else:
             if candidate_mask is None:
                 candidate_mask = torch.ones_like(metric, dtype=torch.bool, device=metric.device)
-            prune_mask, cutoff = _select_lowest_mask(metric, candidate_mask, args.sparsity_ratio)
+            prune_mask, cutoff = select_prune_masks_by_score(
+                [{"metric": metric, "candidate_mask": candidate_mask}],
+                args.sparsity_ratio,
+                largest=largest,
+            )
+            prune_mask = prune_mask[0]
             if cutoff is not None:
                 cutoffs.append(cutoff)
 
@@ -498,7 +616,7 @@ def prune_magnitude_layer(
 
     report_start = int(report_rank_offset)
     report_end = report_start + 25
-    score_rows = sorted(score_rows, key=lambda row: row["score"])[report_start:report_end]
+    score_rows = sorted(score_rows, key=lambda row: row["score"], reverse=largest)[report_start:report_end]
     _append_score_zero_summary(
         edge_log_path,
         args,
@@ -511,7 +629,7 @@ def prune_magnitude_layer(
         rank_offset=report_start,
     )
 
-    cutoff = max(cutoffs) if cutoffs else None
+    cutoff = (min(cutoffs) if largest else max(cutoffs)) if cutoffs else None
     return {"layer_idx": layer_idx, "pruned_params": layer_pruned, "total_params": layer_total}, cutoff
 
 
@@ -533,6 +651,75 @@ def prune_wanda_layer(
     score_rows = []
     zero_score_count = 0
     eligible_score_count = 0
+
+    scope = prune_scope_from_args(args)
+    largest = score_order_largest(args, default=False)
+    if prune_n == 0 and scope == "per_layer":
+        entries = []
+        for name, module in subset.items():
+            if name not in layer_wanda_scores:
+                raise KeyError(f"Missing precomputed WANDA scores for layer {layer_idx} name {name}")
+
+            weight = module.weight.data
+            metric = layer_wanda_scores[name].detach().cpu()
+            if metric.shape != weight.shape:
+                raise ValueError(
+                    f"WANDA score shape mismatch for layer {layer_idx} {name}: "
+                    f"{tuple(metric.shape)} vs {tuple(weight.shape)}"
+                )
+
+            candidate_mask = _candidate_mask_from_curvature(layer_curvature_scores, name, weight)
+            if candidate_mask is not None:
+                candidate_mask = candidate_mask.cpu()
+            op_zero_count, op_eligible_count, op_score_rows = _nonzero_score_rows(
+                name,
+                module,
+                metric,
+                candidate_mask=candidate_mask,
+                limit=int(report_rank_offset) + 25,
+            )
+            zero_score_count += op_zero_count
+            eligible_score_count += op_eligible_count
+            score_rows.extend(op_score_rows)
+            entries.append(
+                {
+                    "name": name,
+                    "module": module,
+                    "metric": metric,
+                    "candidate_mask": candidate_mask,
+                }
+            )
+
+        prune_masks, cutoff = select_prune_masks_by_score(
+            entries,
+            args.sparsity_ratio,
+            largest=largest,
+        )
+        for entry, prune_mask in zip(entries, prune_masks):
+            entry["module"].weight.data[prune_mask.to(device=entry["module"].weight.data.device)] = 0
+            layer_pruned += int(prune_mask.sum().item())
+            candidate_mask = entry["candidate_mask"]
+            layer_total += (
+                int(candidate_mask.sum().item())
+                if candidate_mask is not None
+                else entry["module"].weight.data.numel()
+            )
+
+        report_start = int(report_rank_offset)
+        report_end = report_start + 25
+        score_rows = sorted(score_rows, key=lambda row: row["score"], reverse=largest)[report_start:report_end]
+        _append_score_zero_summary(
+            edge_log_path,
+            args,
+            "wanda",
+            layer_idx,
+            "wanda_score",
+            zero_score_count,
+            eligible_score_count,
+            score_rows,
+            rank_offset=report_start,
+        )
+        return {"layer_idx": layer_idx, "pruned_params": layer_pruned, "total_params": layer_total}, cutoff
 
     for name, module in subset.items():
         if name not in layer_wanda_scores:
@@ -587,44 +774,44 @@ def prune_wanda_layer(
             if selected_scores:
                 cutoffs.append(float(torch.cat(selected_scores).max().item()))
         else:
-            if candidate_mask is not None and not args.use_variant:
-                prune_mask, cutoff = _select_lowest_mask(metric, candidate_mask, args.sparsity_ratio)
-                if cutoff is not None:
-                    cutoffs.append(cutoff)
-            else:
-                if candidate_mask is not None and args.use_variant:
-                    metric = metric.masked_fill(~candidate_mask, float("inf"))
+            if candidate_mask is not None and args.use_variant:
+                metric = metric.masked_fill(~candidate_mask, float("inf"))
 
-                if args.use_variant:
-                    sort_res = torch.sort(metric, dim=-1, stable=True)
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = metric.sum(dim=1)
+            if args.use_variant:
+                sort_res = torch.sort(metric, dim=-1, stable=True)
+                tmp_metric = torch.cumsum(sort_res[0], dim=1)
+                sum_before = metric.sum(dim=1)
 
-                    alpha = 0.4
-                    alpha_hist = [0.0, 0.8]
-                    prune_mask, cur_sparsity = _return_given_alpha(alpha, sort_res, metric, tmp_metric, sum_before)
-                    while (
-                        torch.abs(cur_sparsity - args.sparsity_ratio) > 0.001
-                        and (alpha_hist[1] - alpha_hist[0] >= 0.001)
-                    ):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-                        alpha = alpha_new
-                        prune_mask, cur_sparsity = _return_given_alpha(
-                            alpha, sort_res, metric, tmp_metric, sum_before
-                        )
-                else:
-                    prune_mask = _row_lowest_mask(metric, args.sparsity_ratio)
-                    if candidate_mask is not None:
-                        prune_mask &= candidate_mask
+                alpha = 0.4
+                alpha_hist = [0.0, 0.8]
+                prune_mask, cur_sparsity = _return_given_alpha(alpha, sort_res, metric, tmp_metric, sum_before)
+                while (
+                    torch.abs(cur_sparsity - args.sparsity_ratio) > 0.001
+                    and (alpha_hist[1] - alpha_hist[0] >= 0.001)
+                ):
+                    if cur_sparsity > args.sparsity_ratio:
+                        alpha_new = (alpha + alpha_hist[0]) / 2.0
+                        alpha_hist[1] = alpha
+                    else:
+                        alpha_new = (alpha + alpha_hist[1]) / 2.0
+                        alpha_hist[0] = alpha
+                    alpha = alpha_new
+                    prune_mask, cur_sparsity = _return_given_alpha(
+                        alpha, sort_res, metric, tmp_metric, sum_before
+                    )
 
                 selected_scores = metric[prune_mask]
                 if selected_scores.numel() > 0:
                     cutoffs.append(float(selected_scores.max().item()))
+            else:
+                prune_masks, cutoff = select_prune_masks_by_score(
+                    [{"metric": metric, "candidate_mask": candidate_mask}],
+                    args.sparsity_ratio,
+                    largest=largest,
+                )
+                prune_mask = prune_masks[0]
+                if cutoff is not None:
+                    cutoffs.append(cutoff)
 
         weight[prune_mask.to(device=weight.device)] = 0
         layer_pruned += int(prune_mask.sum().item())
@@ -632,7 +819,7 @@ def prune_wanda_layer(
 
     report_start = int(report_rank_offset)
     report_end = report_start + 25
-    score_rows = sorted(score_rows, key=lambda row: row["score"])[report_start:report_end]
+    score_rows = sorted(score_rows, key=lambda row: row["score"], reverse=largest)[report_start:report_end]
     _append_score_zero_summary(
         edge_log_path,
         args,
@@ -645,19 +832,8 @@ def prune_wanda_layer(
         rank_offset=report_start,
     )
 
-    cutoff = max(cutoffs) if cutoffs else None
+    cutoff = (min(cutoffs) if largest else max(cutoffs)) if cutoffs else None
     return {"layer_idx": layer_idx, "pruned_params": layer_pruned, "total_params": layer_total}, cutoff
-
-
-def _row_lowest_mask(metric, ratio):
-    prune_mask = torch.zeros_like(metric, dtype=torch.bool)
-    prune_count = int(metric.shape[1] * ratio)
-    if prune_count <= 0:
-        return prune_mask
-    if prune_count >= metric.shape[1]:
-        return torch.ones_like(metric, dtype=torch.bool)
-    threshold = torch.kthvalue(metric, k=prune_count, dim=1).values.reshape(-1, 1)
-    return metric <= threshold
 
 
 def _return_given_alpha(alpha, sort_res, metric, tmp_metric, sum_before):
@@ -696,81 +872,77 @@ def draw_per_layer_ppl_vs_sparsity(records, plot_dir, annotate_cutoff=False):
 
     saved_paths = []
     for layer_idx, layer_records in sorted(layer_groups.items()):
-        fig, ax = plt.subplots(figsize=(5.6, 3.4))
+        pp_lens = sorted({int(record["pp_seq_len"]) for record in layer_records})
+        fig, axes = plt.subplots(
+            1,
+            len(pp_lens),
+            figsize=(5.6 * len(pp_lens), 3.4),
+            squeeze=False,
+        )
         grouped = {}
         score_orders = sorted({record["score_order"] for record in layer_records})
         for record in layer_records:
             key = (record["score_order"], int(record["pp_seq_len"]))
             grouped.setdefault(key, []).append(record)
 
-        for (score_order, pp_seq_len), group_records in sorted(grouped.items()):
-            group_records = sorted(group_records, key=lambda item: item["target_sparsity"])
-            xs = np.asarray([item["target_sparsity"] for item in group_records], dtype=np.float64)
-            ys = np.asarray([item["ppl_test"] for item in group_records], dtype=np.float64)
-            finite = np.isfinite(xs) & np.isfinite(ys)
-            if not finite.any():
-                continue
-            ax.plot(
-                xs[finite],
-                ys[finite],
-                marker="o",
-                linewidth=1.0,
-                markersize=2.6,
-                label=(
-                    f"pp={pp_seq_len}"
-                    if len(score_orders) == 1
-                    else f"{score_order}, pp={pp_seq_len}"
-                ),
-            )
-
-        if annotate_cutoff:
+        for ax, pp_seq_len in zip(axes[0], pp_lens):
             for score_order in score_orders:
-                pp_lens = sorted(
-                    int(record["pp_seq_len"])
-                    for record in layer_records
-                    if record["score_order"] == score_order
-                )
-                if not pp_lens:
+                group_records = grouped.get((score_order, pp_seq_len), [])
+                group_records = sorted(group_records, key=lambda item: item["target_sparsity"])
+                xs = np.asarray([item["target_sparsity"] for item in group_records], dtype=np.float64)
+                ys = np.asarray([item["ppl_test"] for item in group_records], dtype=np.float64)
+                finite = np.isfinite(xs) & np.isfinite(ys)
+                if not finite.any():
                     continue
-                anchor_records = sorted(
-                    grouped[(score_order, pp_lens[0])],
-                    key=lambda item: item["target_sparsity"],
+                ax.plot(
+                    xs[finite],
+                    ys[finite],
+                    marker="o",
+                    linewidth=1.0,
+                    markersize=2.6,
+                    label=score_order,
                 )
-                for record in anchor_records:
-                    cutoff = record.get("score_cutoff")
-                    if cutoff is None or not np.isfinite(cutoff):
-                        continue
-                    ax.annotate(
-                        f"{cutoff:.3g}",
-                        (record["target_sparsity"], record["ppl_test"]),
-                        textcoords="offset points",
-                        xytext=(0, 5),
-                        ha="center",
-                        fontsize=6,
-                    )
 
-                nonpositive = sorted(
-                    float(record["target_sparsity"])
-                    for record in anchor_records
-                    if bool(record.get("cutoff_nonpositive", False))
-                )
-                if nonpositive:
-                    ax.axvline(
-                        nonpositive[0],
-                        color="tab:red",
-                        linestyle="--",
-                        linewidth=0.9,
-                        label=f"{score_order} non-positive cutoff",
-                    )
+                if annotate_cutoff:
+                    for record in group_records:
+                        cutoff = record.get("score_cutoff")
+                        if cutoff is None or not np.isfinite(cutoff):
+                            continue
+                        ax.annotate(
+                            f"{cutoff:.3g}",
+                            (record["target_sparsity"], record["ppl_test"]),
+                            textcoords="offset points",
+                            xytext=(0, 5),
+                            ha="center",
+                            fontsize=6,
+                        )
 
-        ax.set_title(f"Layer {layer_idx}")
-        ax.set_xlabel("target sparsity")
-        ax.set_ylabel("perplexity")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=7, loc="best")
+                    nonpositive = sorted(
+                        float(record["target_sparsity"])
+                        for record in group_records
+                        if bool(record.get("cutoff_nonpositive", False))
+                    )
+                    if nonpositive:
+                        ax.axvline(
+                            nonpositive[0],
+                            color="tab:red",
+                            linestyle="--",
+                            linewidth=0.9,
+                            label=f"{score_order} non-positive cutoff",
+                        )
+
+            ax.set_title(f"pp_seqlen={pp_seq_len}")
+            ax.set_xlabel("target sparsity")
+            ax.grid(True, alpha=0.3)
+
+        axes[0][0].set_ylabel("perplexity")
+        handles, labels = _collect_legend_handles_labels(axes[0])
+        if handles:
+            fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 5), fontsize=7)
+        fig.suptitle(f"Layer {layer_idx}", y=1.02)
         fig.tight_layout()
         plot_path = os.path.join(plot_dir, f"layer_{layer_idx:03d}.png")
-        fig.savefig(plot_path, dpi=140)
+        fig.savefig(plot_path, dpi=140, bbox_inches="tight")
         plt.close(fig)
         saved_paths.append(plot_path)
 
@@ -849,6 +1021,15 @@ def _read_per_layer_records(csv_paths):
         )
         records_by_key[key] = record
     return list(records_by_key.values())
+
+
+def _collect_legend_handles_labels(axes):
+    handles_by_label = {}
+    for ax in axes:
+        handles, labels = ax.get_legend_handles_labels()
+        for handle, label in zip(handles, labels):
+            handles_by_label.setdefault(label, handle)
+    return list(handles_by_label.values()), list(handles_by_label.keys())
 
 
 def draw_per_layer_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
@@ -935,7 +1116,7 @@ def draw_per_layer_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
             ax.grid(True, alpha=0.3)
 
         axes[0][0].set_ylabel("perplexity")
-        handles, labels = axes[0][-1].get_legend_handles_labels()
+        handles, labels = _collect_legend_handles_labels(axes[0])
         if handles:
             fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 5), fontsize=7)
         fig.suptitle(f"Layer {layer_idx} method comparison", y=1.02)

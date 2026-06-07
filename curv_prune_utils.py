@@ -1,5 +1,5 @@
 import torch
-from prune import align_curvature_to_weight_shape
+from prune import align_curvature_to_weight_shape, skip_prune_layer
 from prune_log_utils import (
     append_all_layer_pruned_parameter_log,
     collect_pruned_parameter_rows,
@@ -21,6 +21,13 @@ def _get_prunable_module(model, layer_idx, op_name):
     raise KeyError(f"Unsupported op_name for curvature pruning: {op_name}")
 
 
+def _is_magnitude_fallback(model, layer_idx, op_name):
+    fallbacks = getattr(model, "curvature_magnitude_fallbacks", None)
+    if fallbacks is None or layer_idx >= len(fallbacks):
+        return False
+    return bool(fallbacks[layer_idx].get(op_name, False))
+
+
 def prune_global_curvature(args, model):
     if not hasattr(model, "curvature_scores"):
         raise AttributeError("Model does not have curvature_scores. Run prune_curvature first.")
@@ -31,6 +38,9 @@ def prune_global_curvature(args, model):
     total_finite_params = 0
 
     for layer_idx, layer_scores in enumerate(getattr(model, "curvature_scores", [])):
+        if skip_prune_layer(args, layer_idx):
+            print(f"Skipping layer {layer_idx}: requested by skip_prune_layer_ids")
+            continue
         for op_name, curv in layer_scores.items():
             module = _get_prunable_module(model, layer_idx, op_name)
             weight = module.weight.data
@@ -39,6 +49,9 @@ def prune_global_curvature(args, model):
                 weight.shape,
                 context=f"layer {layer_idx} {op_name} global curvature",
             ).cpu()
+            magnitude_fallback = _is_magnitude_fallback(model, layer_idx, op_name)
+            if magnitude_fallback:
+                curv_cpu = torch.abs(weight.detach()).cpu()
 
             finite_mask = torch.isfinite(curv_cpu)
             finite_count = int(finite_mask.sum().item())
@@ -53,6 +66,7 @@ def prune_global_curvature(args, model):
                     "module": module,
                     "curv": curv_cpu,
                     "finite_mask": finite_mask,
+                    "magnitude_fallback": magnitude_fallback,
                 }
             )
             total_finite_params += finite_count
@@ -67,30 +81,53 @@ def prune_global_curvature(args, model):
         print("Global curvature pruning skipped because prune_count is 0")
         return []
 
-    all_scores = torch.cat([entry["curv"][entry["finite_mask"]].reshape(-1) for entry in score_refs])
-    prune_count = min(prune_count, all_scores.numel())
+    prune_count = min(prune_count, total_finite_params)
     prune_high_scores = getattr(args, "prune_score_order", "high_to_low") == "high_to_low"
-    topk_indices = torch.topk(
-        all_scores,
-        k=prune_count,
-        largest=prune_high_scores,
-        sorted=False,
-    ).indices
-    global_prune_mask = torch.zeros(all_scores.numel(), dtype=torch.bool)
-    global_prune_mask[topk_indices] = True
+    entry_selections = [
+        torch.zeros(int(entry["finite_mask"].sum().item()), dtype=torch.bool)
+        for entry in score_refs
+    ]
+
+    for fallback, largest in ((False, prune_high_scores), (True, False)):
+        remaining = prune_count - sum(int(mask.sum().item()) for mask in entry_selections)
+        if remaining <= 0:
+            break
+        group_indices = [
+            idx for idx, entry in enumerate(score_refs)
+            if bool(entry["magnitude_fallback"]) == fallback
+        ]
+        if not group_indices:
+            continue
+        group_scores = torch.cat([
+            score_refs[idx]["curv"][score_refs[idx]["finite_mask"]].reshape(-1)
+            for idx in group_indices
+        ])
+        if group_scores.numel() == 0:
+            continue
+        group_prune_count = min(remaining, group_scores.numel())
+        topk_indices = torch.topk(
+            group_scores,
+            k=group_prune_count,
+            largest=largest,
+            sorted=False,
+        ).indices
+        group_mask = torch.zeros(group_scores.numel(), dtype=torch.bool)
+        group_mask[topk_indices] = True
+        group_offset = 0
+        for idx in group_indices:
+            count = int(score_refs[idx]["finite_mask"].sum().item())
+            entry_selections[idx] = group_mask[group_offset:group_offset + count]
+            group_offset += count
 
     total_pruned = 0
-    offset = 0
     prune_summary = []
     report_limit = int(getattr(args, "all_layer_report_rank_offset", 0)) + 25
     report_rows = []
     with torch.no_grad():
-        for entry in score_refs:
+        for entry, flat_selection in zip(score_refs, entry_selections):
             module = entry["module"]
             finite_mask = entry["finite_mask"]
             flat_finite_count = int(finite_mask.sum().item())
-            flat_selection = global_prune_mask[offset:offset + flat_finite_count]
-            offset += flat_finite_count
 
             prune_mask_cpu = torch.zeros_like(finite_mask, dtype=torch.bool)
             prune_mask_cpu[finite_mask] = flat_selection

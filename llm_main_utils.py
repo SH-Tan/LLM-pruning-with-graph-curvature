@@ -156,7 +156,8 @@ def append_eval_result(
 ):
     with open(log_file, "a+") as f:
         print(
-            f"{args.prune_method:<15}{score_order:<15}{str(args.l2_norm):<10}{target_ratio:<18.4f}"
+            f"{args.prune_method:<15}{getattr(args, 'curvature_prune_scope', 'global'):<15}"
+            f"{score_order:<15}{str(args.l2_norm):<10}{target_ratio:<18.4f}"
             f"{actual_sparsity_ratio:<18.4f}{args.calib_data:<20}{eval_mode:<28}"
             f"{score_seq_len:<16d}{pp_seq_len:<12d}{ppl_test:<12.4f}",
             file=f,
@@ -224,23 +225,21 @@ def resolve_prune_score_orders(args):
 
 
 def per_layer_result_tag(args):
+    scope = getattr(args, "curvature_prune_scope", "global")
+    scope_tag = "local" if scope == "per_layer" else "per_op" if scope == "per_layer_op" else scope
     if args.prune_method != "curvature":
-        return args.prune_method
+        return f"{args.prune_method}_{scope_tag}"
 
     setting_tag = curvature_seq_tag(
         args.shared_top_k,
         args.shared_seq_select,
         args.curvature_lpf_window,
     ).removesuffix("_pkl")
-    return f"{args.prune_method}_{l2_path_tag(args)}_{setting_tag}"
+    return f"{args.prune_method}_{l2_path_tag(args)}_{setting_tag}_{scope_tag}"
 
 
 def pp_result_tag(args):
-    if args.prune_method != "curvature":
-        return args.prune_method
-    scope = getattr(args, "curvature_prune_scope", "global")
-    scope_tag = "local" if scope == "per_layer" else scope
-    return f"{per_layer_result_tag(args)}_{scope_tag}"
+    return per_layer_result_tag(args)
 
 
 def reference_layer_indices(args, get_llm_fn, model_device, base_wanda_scores):
@@ -299,6 +298,12 @@ def run_per_layer_eval(
     save_filepath,
     base_wanda_scores=None,
 ):
+    if getattr(args, "curvature_prune_scope", "global") == "global":
+        raise ValueError(
+            "run_per_layer_eval supports only local/per-layer or per-op pruning scopes; "
+            "global scope is only valid for all-layer pruning."
+        )
+
     layer_ids = reference_layer_indices(args, get_llm_fn, model_device, base_wanda_scores)
     result_dir = os.path.dirname(save_filepath)
     result_tag = per_layer_result_tag(args)
@@ -486,7 +491,7 @@ def run_pp_eval(
 
     with open(pp_log_path, "a+") as f:
         print(
-            f"{'method':<15}{'score_order':<15}{'l2_norm':<10}{'target_sparsity':<18}"
+            f"{'method':<15}{'prune_scope':<15}{'score_order':<15}{'l2_norm':<10}{'target_sparsity':<18}"
             f"{'actual_sparsity':<18}{'calib_data':<20}{'eval_mode':<28}"
             f"{'score_seq_len':<16}{'pp_seq_len':<12}{'ppl_test':<12}",
             file=f,
@@ -556,11 +561,7 @@ def run_pp_eval(
                     {
                         "method": args.prune_method,
                         "method_tag": per_layer_result_tag(args),
-                        "prune_scope": (
-                            args.curvature_prune_scope
-                            if args.prune_method == "curvature"
-                            else "global"
-                        ),
+                        "prune_scope": args.curvature_prune_scope,
                         "score_order": score_order,
                         "target_sparsity": float(target_ratio),
                         "actual_sparsity": float(actual_sparsity_ratio),

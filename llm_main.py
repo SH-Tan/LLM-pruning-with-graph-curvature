@@ -151,23 +151,22 @@ def _build_parser():
         type=str,
         choices=["global", "per_layer", "per_layer_op"],
         default="global",
-        help="Curvature pruning scope: global, per layer over all ops, or per layer per op.",
+        help="Pruning score scope: global, per layer over all ops, or per layer per op.",
     )
     parser.add_argument(
         "--prunescore_order",
         dest="prunescore_order",
         type=str,
-        choices=["globally", "locally"],
+        choices=["globally", "locally", "per_op"],
         default=None,
-        help="Alias for curvature pruning score scope: globally over full model, or locally per block/layer.",
+        help="Alias for pruning score scope: globally over full model, locally per layer, or per op.",
     )
     parser.add_argument("--shared_top_k", type=int, default=10, help="Top score-ranked seq positions per edge for curvature; -1 evaluates all seq positions.")
     parser.add_argument(
         "--shared_seq_select",
         type=str,
-        choices=["top", "median"],
         default="top",
-        help="Seq selection mode when shared_top_k > 0: top score-ranked seqs or seqs closest to the median score.",
+        help="Seq selection mode: top, median, or strideN such as stride10.",
     )
     parser.add_argument(
         "--curvature_lpf_window",
@@ -211,6 +210,13 @@ def _build_parser():
         help="Shared directory for per-layer method comparison CSVs and plots.",
     )
     parser.add_argument(
+        "--skip_prune_layer_ids",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Layer indices to skip during all-layer pruning.",
+    )
+    parser.add_argument(
         "--run_pp_eval",
         action="store_true",
         help="Run perplexity evaluation after score/curvature calculation.",
@@ -244,6 +250,8 @@ def main():
         args.curvature_prune_scope = "global"
     elif args.prunescore_order == "locally":
         args.curvature_prune_scope = "per_layer"
+    elif args.prunescore_order == "per_op":
+        args.curvature_prune_scope = "per_layer_op"
 
     sparsity_ratios = resolve_sparsity_ratios(args)
     prune_score_orders = resolve_prune_score_orders(args)

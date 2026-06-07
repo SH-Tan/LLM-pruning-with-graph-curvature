@@ -6,7 +6,10 @@ from prune import (
     find_layers,
     prepare_calibration_input,
     _curvature_candidate_mask,
-    _select_lowest_mask,
+    prune_scope_from_args,
+    score_order_largest,
+    select_prune_masks_by_score,
+    skip_prune_layer,
 )
 from prune_log_utils import (
     append_all_layer_pruned_parameter_log,
@@ -22,18 +25,6 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     W_mask = (W_metric <= thres)
     cur_sparsity = (W_mask == True).sum() / W_mask.numel()
     return W_mask, cur_sparsity
-
-
-def _row_lowest_mask(metric, ratio):
-    W_mask = torch.zeros_like(metric, dtype=torch.bool)
-    prune_count = int(metric.shape[1] * ratio)
-    if prune_count <= 0:
-        return W_mask
-    if prune_count >= metric.shape[1]:
-        return torch.ones_like(metric, dtype=torch.bool)
-
-    threshold = torch.kthvalue(metric, k=prune_count, dim=1).values.reshape(-1, 1)
-    return metric <= threshold
 
 
 def compute_wanda_scores(args, model, tokenizer, device=torch.device("cuda:0")):
@@ -119,13 +110,182 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
     layers = model.model.layers
     report_limit = int(getattr(args, "all_layer_report_rank_offset", 0)) + 25
     report_rows = []
+    scope = prune_scope_from_args(args)
+
+    if prune_n == 0 and not args.use_variant and scope == "global":
+        entries = []
+        for i, layer in enumerate(layers):
+            if skip_prune_layer(args, i):
+                print(f"Skipping layer {i}: requested by skip_prune_layer_ids")
+                continue
+            subset = find_layers(layer)
+            layer_scores = wanda_scores[i] if i < len(wanda_scores) else {}
+            for name, module in subset.items():
+                print(f"pruning layer {i} name {name}")
+                if name not in layer_scores:
+                    raise KeyError(f"Missing precomputed WANDA scores for layer {i} name {name}")
+
+                W = module.weight.data
+                W_metric = layer_scores[name].detach().cpu()
+                if W_metric.shape != W.shape:
+                    raise ValueError(
+                        f"WANDA score shape mismatch for layer {i} {name}: "
+                        f"{tuple(W_metric.shape)} vs {tuple(W.shape)}"
+                    )
+
+                candidate_mask = _curvature_candidate_mask(args, model, i, name, W)
+                if candidate_mask is not None:
+                    candidate_mask = candidate_mask.cpu()
+                entries.append(
+                    {
+                        "layer_idx": i,
+                        "name": name,
+                        "module": module,
+                        "metric": W_metric,
+                        "candidate_mask": candidate_mask,
+                    }
+                )
+
+        largest = score_order_largest(args, default=False)
+        prune_masks, _ = select_prune_masks_by_score(entries, args.sparsity_ratio, largest=largest)
+        layer_report_rows_by_idx = {}
+        for entry, W_mask in zip(entries, prune_masks):
+            layer_idx = entry["layer_idx"]
+            name = entry["name"]
+            module = entry["module"]
+            report_rows.extend(
+                collect_pruned_parameter_rows(
+                    layer_idx,
+                    name,
+                    module,
+                    entry["metric"],
+                    W_mask,
+                    largest=largest,
+                    limit=report_limit,
+                    include_input_scale=True,
+                )
+            )
+            layer_report_rows_by_idx.setdefault(layer_idx, []).extend(
+                collect_pruned_parameter_rows(
+                    layer_idx,
+                    name,
+                    module,
+                    entry["metric"],
+                    W_mask,
+                    largest=largest,
+                    limit=25,
+                    include_input_scale=True,
+                )
+            )
+            module.weight.data[W_mask.to(device=module.weight.data.device)] = 0
+
+        for layer_idx, layer_report_rows in sorted(layer_report_rows_by_idx.items()):
+            append_layer_pruned_parameter_log(
+                getattr(args, "all_layer_parameter_log_path", None),
+                args,
+                "wanda",
+                layer_idx,
+                getattr(args, "prune_score_order", "low_to_high"),
+                "wanda",
+                layer_report_rows,
+                largest=largest,
+            )
+
+        append_all_layer_pruned_parameter_log(
+            getattr(args, "all_layer_parameter_log_path", None),
+            args,
+            "wanda",
+            getattr(args, "prune_score_order", "low_to_high"),
+            "wanda",
+            report_rows,
+            largest=largest,
+            rank_offset=getattr(args, "all_layer_report_rank_offset", 0),
+        )
+        return
 
     for i in range(len(layers)):
+        if skip_prune_layer(args, i):
+            print(f"Skipping layer {i}: requested by skip_prune_layer_ids")
+            continue
         layer = layers[i]
         subset = find_layers(layer)
         layer_report_rows = []
 
         layer_scores = wanda_scores[i] if i < len(wanda_scores) else {}
+
+        if prune_n == 0 and not args.use_variant and scope == "per_layer":
+            layer_entries = []
+            for name, module in subset.items():
+                print(f"pruning layer {i} name {name}")
+                if name not in layer_scores:
+                    raise KeyError(f"Missing precomputed WANDA scores for layer {i} name {name}")
+
+                W = module.weight.data
+                W_metric = layer_scores[name].detach().cpu()
+                if W_metric.shape != W.shape:
+                    raise ValueError(
+                        f"WANDA score shape mismatch for layer {i} {name}: "
+                        f"{tuple(W_metric.shape)} vs {tuple(W.shape)}"
+                    )
+
+                candidate_mask = _curvature_candidate_mask(args, model, i, name, W)
+                if candidate_mask is not None:
+                    candidate_mask = candidate_mask.cpu()
+                layer_entries.append(
+                    {
+                        "name": name,
+                        "module": module,
+                        "metric": W_metric,
+                        "candidate_mask": candidate_mask,
+                    }
+                )
+
+            largest = score_order_largest(args, default=False)
+            prune_masks, _ = select_prune_masks_by_score(
+                layer_entries,
+                args.sparsity_ratio,
+                largest=largest,
+            )
+            for entry, W_mask in zip(layer_entries, prune_masks):
+                name = entry["name"]
+                module = entry["module"]
+                report_rows.extend(
+                    collect_pruned_parameter_rows(
+                        i,
+                        name,
+                        module,
+                        entry["metric"],
+                        W_mask,
+                        largest=largest,
+                        limit=report_limit,
+                        include_input_scale=True,
+                    )
+                )
+                layer_report_rows.extend(
+                    collect_pruned_parameter_rows(
+                        i,
+                        name,
+                        module,
+                        entry["metric"],
+                        W_mask,
+                        largest=largest,
+                        limit=25,
+                        include_input_scale=True,
+                    )
+                )
+                module.weight.data[W_mask.to(device=module.weight.data.device)] = 0
+
+            append_layer_pruned_parameter_log(
+                getattr(args, "all_layer_parameter_log_path", None),
+                args,
+                "wanda",
+                i,
+                getattr(args, "prune_score_order", "low_to_high"),
+                "wanda",
+                layer_report_rows,
+                largest=largest,
+            )
+            continue
 
         for name in subset:
             print(f"pruning layer {i} name {name}")
@@ -162,36 +322,6 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
                 if candidate_mask is not None:
                     W_mask &= candidate_mask
             else:
-                if candidate_mask is not None and not args.use_variant:
-                    W_mask = _select_lowest_mask(W_metric, candidate_mask, args.sparsity_ratio)
-                    report_rows.extend(
-                        collect_pruned_parameter_rows(
-                            i,
-                            name,
-                            subset[name],
-                            W_metric,
-                            W_mask,
-                            largest=False,
-                            limit=report_limit,
-                            include_input_scale=True,
-                        )
-                    )
-                    layer_report_rows.extend(
-                        collect_pruned_parameter_rows(
-                            i,
-                            name,
-                            subset[name],
-                            W_metric,
-                            W_mask,
-                            largest=False,
-                            limit=25,
-                            include_input_scale=True,
-                        )
-                    )
-                    W[W_mask.to(device=W.device)] = 0
-                    del W_metric, W_mask
-                    continue
-
                 if candidate_mask is not None and args.use_variant:
                     print("WANDA variant with loaded curvature uses finite-curvature candidates only")
                     W_metric = W_metric.masked_fill(~candidate_mask, float("inf"))
@@ -216,9 +346,16 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
                         W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
                     print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
                 else:
-                    W_mask = _row_lowest_mask(W_metric, args.sparsity_ratio)
-                    if candidate_mask is not None:
-                        W_mask &= candidate_mask
+                    W_mask = select_prune_masks_by_score(
+                        [
+                            {
+                                "metric": W_metric,
+                                "candidate_mask": candidate_mask,
+                            }
+                        ],
+                        args.sparsity_ratio,
+                        largest=score_order_largest(args, default=False),
+                    )[0][0]
 
             report_rows.extend(
                 collect_pruned_parameter_rows(
@@ -227,7 +364,7 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
                     subset[name],
                     W_metric,
                     W_mask,
-                    largest=False,
+                    largest=score_order_largest(args, default=False),
                     limit=report_limit,
                     include_input_scale=True,
                 )
@@ -239,7 +376,7 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
                     subset[name],
                     W_metric,
                     W_mask,
-                    largest=False,
+                    largest=score_order_largest(args, default=False),
                     limit=25,
                     include_input_scale=True,
                 )
@@ -255,7 +392,7 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
             getattr(args, "prune_score_order", "low_to_high"),
             "wanda",
             layer_report_rows,
-            largest=False,
+            largest=score_order_largest(args, default=False),
         )
 
     append_all_layer_pruned_parameter_log(
@@ -265,7 +402,7 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
         getattr(args, "prune_score_order", "low_to_high"),
         "wanda",
         report_rows,
-        largest=False,
+        largest=score_order_largest(args, default=False),
         rank_offset=getattr(args, "all_layer_report_rank_offset", 0),
     )
 

@@ -62,6 +62,7 @@ def build_shortest_path_cache(
     device="cuda",
     graph_data=None,
     model_meta=None,
+    include_qk_next=True,
 ):
     """
     Cache is flat: sp_cache[short_name] = ...
@@ -83,7 +84,7 @@ def build_shortest_path_cache(
 
     prev_dists = _all_cost_matrices(layer_cache, graph_data["prev_cost_names"], device=device)
 
-    if short_name in {"q_proj", "k_proj"}:
+    if short_name in {"q_proj", "k_proj"} and include_qk_next:
         cost_n = graph_data["next_cost_names"][0]
         cost = operations.get(cost_n)
         if model_meta is None:
@@ -95,10 +96,11 @@ def build_shortest_path_cache(
         
         next_weight_magnitude_source = "activation_or_attention_cost"
     else:
-        next_dists = _all_cost_matrices(layer_cache, graph_data["next_cost_names"], device=device)
+        next_names = [] if short_name in {"q_proj", "k_proj"} else graph_data["next_cost_names"]
+        next_dists = _all_cost_matrices(layer_cache, next_names, device=device)
         next_weight_magnitude_source = "nn_weight"
 
-    chunk_k, chunk_p = adaptive_chunksize()
+    chunk_k, chunk_p = adaptive_chunksize(device=device)
 
     prev_to_curr_out_all = {}
     curr_in_to_next_all = {}

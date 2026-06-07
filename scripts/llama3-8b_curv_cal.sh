@@ -1,22 +1,23 @@
 #!/bin/sh
 set -e
 
-# Curvature calculation only for Llama-3-8B. No pruning/eval is run.
+# Curvature calculation for Llama-3-8B, with optional per-layer eval after it finishes.
 model="meta-llama/Meta-Llama-3-8B"
 python_bin="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
 sparsity_ratios="0"
-nsamples=1
+nsamples=5
 seed=13
 alpha=0.9
 model_device="cuda:0"
-compute_device="cuda:1"
+compute_device="${COMPUTE_DEVICE:-cuda:1}"
 seq_len=512
 sample_edge_ratio=0.2
 sample_edge_num=-1
 calib_data="c4_independent"
-curvature_dir="out/llama_8b/unstructured/curvature/Q_0.2_reduce_neighbor_A/1_example/"
+curvature_dir="out/llama_8b/unstructured/curvature/Q_0.2_reduce_neighbor_A/beta/"
 curvature_dtype="${CURVATURE_DTYPE:-float32}"
 save_parameter_metric_logs="${SAVE_PARAMETER_METRIC_LOGS:-0}"
+run_eval_after_curv="${RUN_EVAL_AFTER_CURV:-1}"
 
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 export CUDA_VISIBLE_DEVICES=$cuda_device
@@ -33,7 +34,7 @@ run_curvature_calculation() {
         parameter_log_flag="--save_parameter_metric_logs"
     fi
 
-    echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select"
+    echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select, lpf_window=$curvature_lpf_window"
     "$python_bin" llm_main.py \
         --model $model \
         --prune_method curvature \
@@ -66,11 +67,12 @@ run_curvature_calculation() {
 # curvature_lpf_window=0
 # run_curvature_calculation 1 "per_example"
 
-# 2. No L2: select top 10 sequence positions.
-top_k_seq=10
-seq_select="top"
-curvature_lpf_window=0
-run_curvature_calculation 0 "per_example"
+# 2. No L2: evaluate seq positions 0, 10, 20, ... and save LPF curvature.
+#    Set curvature_lpf_window=0 to disable LPF, or change seq_select back to "top".
+# top_k_seq=-1
+# seq_select="stride10"
+# curvature_lpf_window="${CURVATURE_LPF_WINDOW:-5}"
+# run_curvature_calculation 0 "per_example"
 
 # 3. L2 norm type 2: Wanda-style, L2 over all examples and all sequence positions.
 # top_k_seq=-1
@@ -80,8 +82,12 @@ run_curvature_calculation 0 "per_example"
 
 
 
-# Future examples:
-# top_k_seq=10
-# seq_select="median"
-# curvature_lpf_window=0
-# run_curvature_calculation 0 "per_example"
+top_k_seq=10
+seq_select="top"
+curvature_lpf_window=0
+run_curvature_calculation 0 "per_example"
+
+if [ "$run_eval_after_curv" = "1" ]; then
+    echo "Curvature calculation finished; running eval script."
+    PYTHON_BIN="$python_bin" sh scripts/llama3-8b_eval.sh
+fi

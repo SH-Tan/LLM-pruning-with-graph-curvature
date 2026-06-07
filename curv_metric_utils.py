@@ -156,16 +156,27 @@ def _score_column(score, idx):
     return None
 
 
-def top_seq_for_edge(edge):
-    metric, _, _ = score_components_for_edge(edge)
+def _stride_seq_indices():
+    stride = int(str(_SHARED_SEQ_SELECT).replace("stride", "") or 1)
+    return [int(seq_idx) for seq_idx in range(0, _SHARED_SEQ_LEN, stride)]
 
-    np.nan_to_num(metric, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+def top_seq_for_edge(edge):
     total_count = _SHARED_SEQ_LEN if _SHARED_TOP_K == -1 else min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
     if total_count <= 0:
         return []
 
+    if str(_SHARED_SEQ_SELECT).startswith("stride"):
+        seqs = _stride_seq_indices()
+        if _SHARED_TOP_K != -1:
+            seqs = seqs[:total_count]
+        return seqs
+
     if _SHARED_TOP_K == -1:
         return [int(seq_idx) for seq_idx in range(_SHARED_SEQ_LEN)]
+
+    metric, _, _ = score_components_for_edge(edge)
+    np.nan_to_num(metric, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     if _SHARED_SEQ_SELECT == "median":
         median_value = float(np.median(metric))
@@ -173,6 +184,16 @@ def top_seq_for_edge(edge):
     else:
         ordered = np.argsort(-metric, kind="stable")
     return [int(seq_idx) for seq_idx in ordered[:total_count]]
+
+
+def selected_seq_count():
+    if str(_SHARED_SEQ_SELECT).startswith("stride"):
+        total_count = len(_stride_seq_indices())
+    else:
+        total_count = _SHARED_SEQ_LEN if _SHARED_TOP_K == -1 else min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
+    if _SHARED_TOP_K != -1:
+        total_count = min(total_count, _SHARED_TOP_K)
+    return max(int(total_count), 0)
 
 
 def score_components_for_edge(edge):

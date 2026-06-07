@@ -298,16 +298,64 @@ def _curvature_candidate_mask(args, model, layer_idx, name, weight):
     return torch.isfinite(curv).to(device=weight.device)
 
 
-def _select_lowest_mask(metric, candidate_mask, ratio):
-    W_mask = torch.zeros_like(metric, dtype=torch.bool)
-    eligible_count = int(candidate_mask.sum().item())
-    prune_count = int(eligible_count * ratio)
-    if prune_count <= 0:
-        return W_mask
+def skip_prune_layer(args, layer_idx):
+    return int(layer_idx) in getattr(args, "skip_prune_layer_ids", [])
 
-    candidate_scores = metric[candidate_mask].float()
-    prune_count = min(prune_count, candidate_scores.numel())
-    selected = torch.topk(candidate_scores, k=prune_count, largest=False, sorted=False).indices
-    flat_candidate_positions = candidate_mask.reshape(-1).nonzero(as_tuple=False).flatten()
-    W_mask.reshape(-1)[flat_candidate_positions[selected]] = True
-    return W_mask
+
+def prune_scope_from_args(args):
+    return getattr(args, "curvature_prune_scope", "global")
+
+
+def score_order_largest(args, default=False):
+    return getattr(args, "prune_score_order", "high_to_low" if default else "low_to_high") == "high_to_low"
+
+
+def select_prune_masks_by_score(entries, ratio, largest=False):
+    eligible_counts = []
+    score_chunks = []
+    for entry in entries:
+        metric = entry["metric"]
+        candidate_mask = entry.get("candidate_mask")
+        if candidate_mask is None:
+            candidate_mask = torch.ones_like(metric, dtype=torch.bool, device=metric.device)
+        else:
+            candidate_mask = candidate_mask.to(device=metric.device, dtype=torch.bool)
+        eligible_mask = candidate_mask & torch.isfinite(metric)
+        eligible_count = int(eligible_mask.sum().item())
+        eligible_counts.append(eligible_count)
+        if eligible_count == 0:
+            continue
+        score_chunks.append(metric[eligible_mask].detach().float().cpu())
+
+    total_eligible = sum(eligible_counts)
+    prune_count = int(total_eligible * float(ratio))
+    if prune_count <= 0 or total_eligible == 0:
+        return [torch.zeros_like(entry["metric"], dtype=torch.bool) for entry in entries], None
+
+    all_scores = torch.cat(score_chunks)
+    prune_count = min(prune_count, all_scores.numel())
+    selected = torch.topk(all_scores, k=prune_count, largest=largest, sorted=False).indices
+    selected_mask = torch.zeros(all_scores.numel(), dtype=torch.bool)
+    selected_mask[selected] = True
+    cutoff = float(all_scores[selected].min().item() if largest else all_scores[selected].max().item())
+
+    masks = []
+    offset = 0
+    for entry, eligible_count in zip(entries, eligible_counts):
+        metric = entry["metric"]
+        prune_mask = torch.zeros_like(metric, dtype=torch.bool)
+        if eligible_count > 0:
+            candidate_mask = entry.get("candidate_mask")
+            if candidate_mask is None:
+                candidate_mask = torch.ones_like(metric, dtype=torch.bool, device=metric.device)
+            else:
+                candidate_mask = candidate_mask.to(device=metric.device, dtype=torch.bool)
+            eligible_mask = candidate_mask & torch.isfinite(metric)
+            entry_selection = selected_mask[offset:offset + eligible_count].to(device=metric.device)
+            flat_candidate_positions = eligible_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+            prune_mask.reshape(-1)[flat_candidate_positions[entry_selection]] = True
+            offset += eligible_count
+        else:
+            offset += eligible_count
+        masks.append(prune_mask)
+    return masks, cutoff

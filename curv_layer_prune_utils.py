@@ -5,8 +5,8 @@ import os
 import numpy as np
 import torch
 
-from prune import align_curvature_to_weight_shape
-from curv_prune_utils import _get_prunable_module
+from prune import align_curvature_to_weight_shape, skip_prune_layer
+from curv_prune_utils import _get_prunable_module, _is_magnitude_fallback
 from prune_log_utils import append_layer_pruned_parameter_log, collect_pruned_parameter_rows
 
 
@@ -25,29 +25,45 @@ def _prune_curvature_group(args, group_entries, collect_report_rows=False):
         return 0, []
 
     prune_count = min(prune_count, finite_count)
-    all_scores = torch.cat([
-        entry["curv"][entry["finite_mask"]].reshape(-1)
+    entry_selections = [
+        torch.zeros(int(entry["finite_mask"].sum().item()), dtype=torch.bool)
         for entry in group_entries
-    ])
-    selected = torch.topk(
-        all_scores,
-        k=prune_count,
-        largest=_curvature_score_order(args),
-        sorted=False,
-    ).indices
+    ]
+    for fallback, largest in ((False, _curvature_score_order(args)), (True, False)):
+        remaining = prune_count - sum(int(mask.sum().item()) for mask in entry_selections)
+        if remaining <= 0:
+            break
+        group_indices = [
+            idx for idx, entry in enumerate(group_entries)
+            if bool(entry["magnitude_fallback"]) == fallback
+        ]
+        if not group_indices:
+            continue
+        all_scores = torch.cat([
+            group_entries[idx]["curv"][group_entries[idx]["finite_mask"]].reshape(-1)
+            for idx in group_indices
+        ])
+        selected = torch.topk(
+            all_scores,
+            k=min(remaining, all_scores.numel()),
+            largest=largest,
+            sorted=False,
+        ).indices
 
-    group_mask = torch.zeros(all_scores.numel(), dtype=torch.bool)
-    group_mask[selected] = True
+        group_mask = torch.zeros(all_scores.numel(), dtype=torch.bool)
+        group_mask[selected] = True
+        group_offset = 0
+        for idx in group_indices:
+            entry_count = int(group_entries[idx]["finite_mask"].sum().item())
+            entry_selections[idx] = group_mask[group_offset:group_offset + entry_count]
+            group_offset += entry_count
 
-    offset = 0
     pruned_count = 0
     report_rows = []
     with torch.no_grad():
-        for entry in group_entries:
+        for entry, entry_selection in zip(group_entries, entry_selections):
             finite_mask = entry["finite_mask"]
             entry_count = int(finite_mask.sum().item())
-            entry_selection = group_mask[offset:offset + entry_count]
-            offset += entry_count
 
             prune_mask_cpu = torch.zeros_like(finite_mask, dtype=torch.bool)
             prune_mask_cpu[finite_mask] = entry_selection
@@ -73,8 +89,11 @@ def _prune_curvature_group(args, group_entries, collect_report_rows=False):
     return pruned_count, report_rows
 
 
-def _iter_curvature_entries(model):
+def _iter_curvature_entries(args, model):
     for layer_idx, layer_scores in enumerate(getattr(model, "curvature_scores", [])):
+        if skip_prune_layer(args, layer_idx):
+            print(f"Skipping layer {layer_idx}: requested by skip_prune_layer_ids")
+            continue
         for op_name, curv in layer_scores.items():
             module = _get_prunable_module(model, layer_idx, op_name)
             curv_cpu = align_curvature_to_weight_shape(
@@ -82,6 +101,9 @@ def _iter_curvature_entries(model):
                 module.weight.data.shape,
                 context=f"layer {layer_idx} {op_name} scoped curvature",
             ).cpu()
+            magnitude_fallback = _is_magnitude_fallback(model, layer_idx, op_name)
+            if magnitude_fallback:
+                curv_cpu = torch.abs(module.weight.data.detach()).cpu()
 
             finite_mask = torch.isfinite(curv_cpu)
             finite_count = int(finite_mask.sum().item())
@@ -96,13 +118,14 @@ def _iter_curvature_entries(model):
                 "curv": curv_cpu,
                 "finite_mask": finite_mask,
                 "finite_count": finite_count,
+                "magnitude_fallback": magnitude_fallback,
             }
 
 
 def prune_layer_curvature(args, model):
     model.eval()
     layer_groups = {}
-    for entry in _iter_curvature_entries(model):
+    for entry in _iter_curvature_entries(args, model):
         layer_groups.setdefault(entry["layer_idx"], []).append(entry)
 
     prune_summary = []
@@ -145,7 +168,7 @@ def prune_layer_op_curvature(args, model):
     prune_summary = []
     total_pruned = 0
 
-    for entry in _iter_curvature_entries(model):
+    for entry in _iter_curvature_entries(args, model):
         op_pruned, _ = _prune_curvature_group(args, [entry])
         total_pruned += op_pruned
         prune_summary.append(
@@ -226,6 +249,15 @@ def _read_eval_records(csv_paths):
     return list(records_by_key.values())
 
 
+def _collect_legend_handles_labels(axes):
+    handles_by_label = {}
+    for ax in axes:
+        handles, labels = ax.get_legend_handles_labels()
+        for handle, label in zip(handles, labels):
+            handles_by_label.setdefault(label, handle)
+    return list(handles_by_label.values()), list(handles_by_label.keys())
+
+
 def draw_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
     csv_paths = sorted(glob.glob(os.path.join(compare_dir, "pp_records_*.csv")))
     records = _read_eval_records(csv_paths)
@@ -259,7 +291,7 @@ def draw_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
     def draw_scope_plot(scope_label, curvature_scope):
         scope_records = [
             record for record in records
-            if record["method"] != "curvature" or record["prune_scope"] == curvature_scope
+            if record["prune_scope"] == curvature_scope
         ]
         if not scope_records:
             return None
@@ -319,7 +351,7 @@ def draw_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
             ax.grid(True, alpha=0.3)
 
         axes[0][0].set_ylabel("perplexity")
-        handles, labels = axes[0][-1].get_legend_handles_labels()
+        handles, labels = _collect_legend_handles_labels(axes[0])
         if handles:
             fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 5), fontsize=7)
         fig.suptitle(f"All-layer method comparison ({scope_label})", y=1.02)
@@ -333,6 +365,7 @@ def draw_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
         path for path in [
             draw_scope_plot("global", "global"),
             draw_scope_plot("local", "per_layer"),
+            draw_scope_plot("per_op", "per_layer_op"),
         ]
         if path is not None
     ]

@@ -115,6 +115,38 @@ def start_curvature_analysis(
     return analysis_path
 
 
+def append_qproj_cost_statistics(analysis_path, sample_idx, parameter_cost_stats, old_cost_stats, new_cost_stats):
+    if analysis_path is None or (
+        parameter_cost_stats is None and old_cost_stats is None and new_cost_stats is None
+    ):
+        return
+
+    def fmt(name, stats):
+        if not stats or int(stats.get("count", 0)) <= 0:
+            return f"{name}: unavailable\n"
+        count = int(stats["count"])
+        mean = float(stats["sum"]) / count
+        variance = max(float(stats["sum_sq"]) / count - mean * mean, 0.0)
+        return (
+            f"{name}: "
+            f"count={count}, "
+            f"mean={mean:.8f}, "
+            f"max={float(stats['max']):.8f}, "
+            f"min={float(stats['min']):.8f}, "
+            f"variance={variance:.8f}\n"
+        )
+
+    with open(analysis_path, "a", encoding="utf-8") as f:
+        f.write(
+            "q_proj_cost_statistics:\n"
+            f"sample_idx: {int(sample_idx)}\n"
+            + fmt("parameter_cost_1_over_abs_para", parameter_cost_stats)
+            + fmt("old_curr_to_next_cost_before_target_scale", old_cost_stats)
+            + fmt("new_curr_to_next_cost_after_target_scale", new_cost_stats)
+            + "\n"
+        )
+
+
 def _parameter_log_path(log_root, layer_id, short_name, sample_idx, v_idx, u_idx):
     param_name = "down_proj" if short_name == "prev_down_proj" else short_name
     layer_dir = os.path.join(log_root, f"layer_{int(layer_id):03d}", param_name)
@@ -186,6 +218,7 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
             "neighbor_note: mu: in neighbor, nu: out neighbor\n"
             f"W_dist: {edge_res['w_dist']}\n"
             f"sp_uv: {edge_res['sp_uv']}\n"
+            f"duv_beta: {edge_res.get('duv_beta', 1.0)}\n"
             f"curv: {curv}\n"
         )
         _write_array_block(f, "in_neighbors", edge_res.get("in_neighbors"))
@@ -978,6 +1011,7 @@ def append_final_min_curvature_summary(
     cost_has_inf,
     cost_inf_count,
     runtime_sec=None,
+    beta_stats=None,
 ):
     if torch.is_tensor(curvature):
         curvature = curvature.detach().cpu().numpy()
@@ -986,6 +1020,18 @@ def append_final_min_curvature_summary(
 
     summary = _summarize_curvatures(curvature)
     runtime_sec = float(runtime_sec) if runtime_sec is not None else float("nan")
+    beta_stats = beta_stats or {}
+    beta_count = int(beta_stats.get("count", 0))
+    if beta_count > 0:
+        beta_mean = float(beta_stats["sum"]) / beta_count
+        beta_variance = max(float(beta_stats["sum_sq"]) / beta_count - beta_mean * beta_mean, 0.0)
+        beta_min = float(beta_stats["min"])
+        beta_max = float(beta_stats["max"])
+    else:
+        beta_mean = float("nan")
+        beta_variance = float("nan")
+        beta_min = float("nan")
+        beta_max = float("nan")
 
     with open(analysis_path, "r", encoding="utf-8") as f:
         content = _strip_aggregate_footer(f.read())
@@ -1006,6 +1052,11 @@ def append_final_min_curvature_summary(
             f"avg_len(nu)={float(avg_nu_len):.8f}, "
             f"cost_has_inf={bool(cost_has_inf)}, "
             f"cost_inf_count={int(cost_inf_count)}, "
+            f"beta_count={beta_count}, "
+            f"beta_mean={beta_mean:.8f}, "
+            f"beta_min={beta_min:.8f}, "
+            f"beta_max={beta_max:.8f}, "
+            f"beta_variance={beta_variance:.8f}, "
             f"runtime_sec={float(runtime_sec):.6f}, "
             f"min_curv={summary['min_curv']:.8f}, "
             f"max_curv={summary['max_curv']:.8f}\n"

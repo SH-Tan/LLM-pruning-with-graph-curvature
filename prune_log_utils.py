@@ -81,6 +81,7 @@ def append_all_layer_pruned_parameter_log(
         print(
             f"all_layer_pruned_parameters method={method}, "
             f"target_sparsity={float(args.sparsity_ratio):.4f}, "
+            f"prune_scope={getattr(args, 'curvature_prune_scope', 'global')}, "
             f"score_order={score_order}",
             file=f,
             flush=True,
@@ -129,6 +130,7 @@ def append_layer_pruned_parameter_log(
         print(
             f"per_layer_top_pruned_parameters method={method}, layer={int(layer_idx)}, "
             f"target_sparsity={float(args.sparsity_ratio):.4f}, "
+            f"prune_scope={getattr(args, 'curvature_prune_scope', 'global')}, "
             f"score_order={score_order}",
             file=f,
             flush=True,
