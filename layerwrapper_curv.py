@@ -170,6 +170,9 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         x_res1 = x_in + o
         x_norm2 = layer.post_attention_layernorm(x_res1)
         
+        # ---- residual value for qkv output ----
+        _store_operation(operations, "qkv_residual", x_res1, operation_dtype)
+        
         # ---- attention output ----
         _store_operation(operations, "o_proj", x_norm2, operation_dtype)
 

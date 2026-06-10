@@ -38,9 +38,11 @@ def _operation_distance_matrix_torch(model, operations, short_name, layer_id, de
     abs_w = weight.abs().to(dtype=curvature_torch_dtype())
     weight_norm = torch.where(abs_w > 0, 1.0 / abs_w, torch.full_like(abs_w, float("inf")))
     dist = weight_norm.transpose(0, 1).contiguous()
-    if dist.shape != (weight.shape[1], weight.shape[0]):
+    expected_shape = (weight.shape[1], weight.shape[0])
+    del weight, abs_w, weight_norm
+    if dist.shape != expected_shape:
         raise ValueError(
             f"Unexpected cost matrix shape for {short_name}: "
-            f"got {tuple(dist.shape)}, expected {(weight.shape[1], weight.shape[0])}"
+            f"got {tuple(dist.shape)}, expected {expected_shape}"
         )
     return dist

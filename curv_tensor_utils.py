@@ -13,6 +13,22 @@ from curv_model_utils import _operation_distance_matrix_torch
 _DEBUG_LOG_DIR = os.path.join(os.path.dirname(__file__), "cost_inf_debug")
 
 
+def _residual_distance_matrix_torch(operations, name, device):
+    residual = operations.get(name)
+    if residual is None:
+        return None
+    width = int(residual.shape[-1])
+    dist = torch.full(
+        (width, width),
+        float("inf"),
+        dtype=curvature_torch_dtype(),
+        device=device,
+    )
+    idx = torch.arange(width, device=device)
+    dist[idx, idx] = 1.0
+    return dist
+
+
 def _append_debug_log(lines, log_name):
     os.makedirs(_DEBUG_LOG_DIR, exist_ok=True)
     log_path = os.path.join(_DEBUG_LOG_DIR, log_name)
@@ -112,8 +128,16 @@ def build_layer_cache(model, operations, layer_id, cache=None, device="cuda", re
             if real_name in {"layer_input", "A", "Att_out", "gate_up_out"}:
                 continue
    
-        dist_matrix = _operation_distance_matrix_torch(model, operations, name, layer_id, device)
-        cache[f"{name}__dist"] = dist_matrix # 1/|w.T| device tensor
+        if name == "prev_qkv_residual":
+            dist_matrix = _residual_distance_matrix_torch(operations, name, device)
+            if dist_matrix is None:
+                continue
+        else:
+            dist_matrix = _operation_distance_matrix_torch(model, operations, name, layer_id, device)
+        cache[f"{name}__dist"] = dist_matrix.cpu().contiguous()
+        del dist_matrix
+        if str(device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return cache
 
@@ -207,7 +231,6 @@ def _get_qk_next_cost(cost, name, meta, device = "cpu"):
     
 def _build_v_to_att_out_template(cost, meta, reduce_batch=True):
     head_dim = meta["head_dim"]
-    num_q_heads = meta["num_q_heads"]
     num_kv_heads = meta["num_kv_heads"]
     repeat = meta["repeat"]
     
@@ -277,6 +300,7 @@ def _build_x_to_out_cost(v, sp_q, meta, device):
         res = _min_plus_torch(a, out, chunk_k=chunk_k, chunk_p=chunk_p)
         
         cost["prev_to_next_all"] = res.cpu().contiguous().numpy()
+        del a, res
     
         
     a = sp_q["curr_in_to_next_all"]["k_proj"]
@@ -290,6 +314,9 @@ def _build_x_to_out_cost(v, sp_q, meta, device):
     res = _min_plus_torch(a, out, chunk_k=chunk_k, chunk_p=chunk_p)
     
     cost["curr_in_to_next_all"] = res.cpu().contiguous().numpy()
+    del a, out, res, v
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return cost
     

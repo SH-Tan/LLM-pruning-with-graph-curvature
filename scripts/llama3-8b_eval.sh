@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-# All-layer pruning/eval for Llama-3-8B.
+# Per-layer pruning/eval for Llama-3-8B.
 model="meta-llama/Meta-Llama-3-8B"
 python_bin="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
 sparsity_ratios="0 0.3 0.5 0.7 0.9 1"
@@ -16,10 +16,10 @@ sample_edge_num=-1
 pp_seqlen="$seq_len 1024"
 calib_data="c4_independent"
 
-curvature_dir="out/llama_8b/unstructured/curvature/Q_0.2_reduce_neighbor_A/beta/"
+curvature_dir="out/llama_8b/unstructured/curvature/residual/"
 wanda_dir="out/llama_8b/unstructured/wanda/all_seq_compare/"
 magnitude_dir="out/llama_8b/unstructured/magnitude/all_seq_compare/"
-compare_dir="out/llama_8b/unstructured/all_layer_compare/Q_0.2_reduce_neighbor_A/beta/top10/"
+compare_dir="out/llama_8b/unstructured/per_layer_compare/residual/"
 
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 export CUDA_VISIBLE_DEVICES=$cuda_device
@@ -59,29 +59,29 @@ run_python_command() {
         --shared_seq_select $seq_select \
         --curvature_lpf_window $lpf_window \
         --per_layer_compare_dir $compare_dir \
-        --run_pp_eval
+        --run_per_layer_eval
 }
 
-echo "Running all-layer curvature global"
-run_python_command "curvature" "$curvature_dir" 10 "top" 0 "globally" "high_to_low" "$compare_dir"
-echo "Finished all-layer curvature global"
-
-echo "Running all-layer curvature local"
+echo "Running per-layer curvature local"
 run_python_command "curvature" "$curvature_dir" 10 "top" 0 "locally" "high_to_low" "$compare_dir"
-echo "Finished all-layer curvature local"
+echo "Finished per-layer curvature local"
 
-echo "Running all-layer WANDA global"
-run_python_command "wanda" "$wanda_dir" 10 "top" 0 "globally" "low_to_high" "$compare_dir"
-echo "Finished all-layer WANDA global"
+# echo "Running per-layer curvature global"
+# run_python_command "curvature" "$curvature_dir" 10 "top" 0 "globally" "high_to_low" "$compare_dir"
+# echo "Finished per-layer curvature global"
 
-echo "Running all-layer WANDA local"
+echo "Running per-layer WANDA local"
 run_python_command "wanda" "$wanda_dir" 10 "top" 0 "locally" "low_to_high" "$compare_dir"
-echo "Finished all-layer WANDA local"
+echo "Finished per-layer WANDA local"
 
-echo "Running all-layer magnitude global"
-run_python_command "magnitude" "$magnitude_dir" 10 "top" 0 "globally" "low_to_high" "$compare_dir"
-echo "Finished all-layer magnitude global"
+# echo "Running per-layer WANDA global"
+# run_python_command "wanda" "$wanda_dir" 10 "top" 0 "globally" "low_to_high" "$compare_dir"
+# echo "Finished per-layer WANDA global"
 
-echo "Running all-layer magnitude local"
+echo "Running per-layer magnitude local"
 run_python_command "magnitude" "$magnitude_dir" 10 "top" 0 "locally" "low_to_high" "$compare_dir"
-echo "Finished all-layer magnitude local"
+echo "Finished per-layer magnitude local"
+
+# echo "Running per-layer magnitude global"
+# run_python_command "magnitude" "$magnitude_dir" 10 "top" 0 "globally" "low_to_high" "$compare_dir"
+# echo "Finished per-layer magnitude global"

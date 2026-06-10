@@ -8,6 +8,8 @@ from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 from curv_filter_utils import sliding_median_low_pass
 from curv_distribution_utils import (
     _build_node_distribution,
+    _build_node_distribution_row_from_values,
+    _build_qk_out_node_distribution,
     _edge_distribution,
     _min_reduce_blocks,
 )
@@ -47,6 +49,12 @@ _V_COST = None
 _SPK = None
 _SHARED_SOURCE_NODE_VALUES = None
 _SHARED_TARGET_NODE_VALUES = None
+_SHARED_PREV_NODE_VALUES = None
+_SHARED_NEXT_NODE_VALUES = None
+_SHARED_RESIDUAL_NODE_VALUES = None
+_SHARED_RESIDUAL_NODE_META = None
+_SHARED_OT_PREV_SCORE = None
+_SHARED_OT_NEXT_SCORE = None
 
 _SHARED_SHORT_NAME = None
 _SHARED_SAMPLE_IDX = None
@@ -61,6 +69,8 @@ _WORKER_PREV_IN_SHM = None
 _WORKER_NEXT_OUT_SHM = None
 _WORKER_SOURCE_NODE_SHM = None
 _WORKER_TARGET_NODE_SHM = None
+_WORKER_PREV_NODE_SHM = None
+_WORKER_NEXT_NODE_SHM = None
 _WORKER_SCORE_SHMS = []
 _WORKER_PREV_SEQ_METAS = None
 _WORKER_NEXT_SEQ_METAS = None
@@ -137,13 +147,233 @@ def _target_node_value(seq_idx, v_idx):
     return _seq_node_value(_SHARED_TARGET_NODE_VALUES, seq_idx, v_idx)
 
 
+def _out_neighbor_node_values(seq_idx, next_active, nu, cost):
+    if _SHARED_NEXT_NODE_VALUES is None or len(next_active) == 0:
+        return None
+    next_probs = np.asarray(nu[:-1], dtype=curvature_np_dtype()).reshape(-1)
+    next_cost = np.asarray(cost[-1, :-1], dtype=curvature_np_dtype()).reshape(-1)
+    values = []
+    for pos, node_idx in enumerate(np.asarray(next_active, dtype=np.int64).reshape(-1)):
+        node_idx = int(node_idx)
+        values.append({
+            "node_idx": node_idx,
+            "raw_value": _seq_node_value(_SHARED_NEXT_NODE_VALUES, seq_idx, node_idx),
+            "normalized_probability": float(next_probs[pos]),
+            "cost_from_source": float(next_cost[pos]),
+        })
+    return values
+
+
+def _weight_magnitude_from_cost(cost_value):
+    if cost_value is None or not np.isfinite(cost_value) or cost_value <= 0.0:
+        return 0.0
+    return float(1.0 / cost_value)
+
+
+def _mu_node_values(seq_idx, u_idx, prev_active, mu):
+    if _SHARED_PREV_NODE_VALUES is None or len(prev_active) == 0:
+        return None
+
+    prev_probs = np.asarray(mu[:-1], dtype=curvature_np_dtype()).reshape(-1)
+    prev_to_curr_in = _SHARED_SP.get("prev_to_curr_in") if _SHARED_SP is not None else None
+    values = []
+    for pos, node_idx in enumerate(np.asarray(prev_active, dtype=np.int64).reshape(-1)):
+        node_idx = int(node_idx)
+        raw_value = _seq_node_value(_SHARED_PREV_NODE_VALUES, seq_idx, node_idx)
+        cost_to_u = None
+        if prev_to_curr_in is not None:
+            cost_to_u = float(prev_to_curr_in[node_idx, int(u_idx)])
+        weight_magnitude = _weight_magnitude_from_cost(cost_to_u)
+        node_times_weight = None if raw_value is None else float(raw_value * weight_magnitude)
+        probability = float(prev_probs[pos])
+        item = {
+            "node_idx": node_idx,
+            "raw_value": raw_value,
+            "normalized_probability": probability,
+            "cost_to_u": cost_to_u,
+            "original_weight_magnitude_to_u": weight_magnitude,
+            "node_times_weight_magnitude": node_times_weight,
+        }
+        if _SHARED_RESIDUAL_NODE_META:
+            for meta in _SHARED_RESIDUAL_NODE_META:
+                start = int(meta["start"])
+                end = int(meta["end"])
+                if start <= node_idx < end:
+                    item["residual_name"] = meta["name"]
+                    item["residual_local_idx"] = node_idx - start
+                    break
+        if node_times_weight is not None:
+            item["probability_times_node_weight"] = float(probability * node_times_weight)
+        values.append(item)
+    return values
+
+
+def _with_importance(values):
+    values = [dict(item) for item in values if item is not None]
+    total = sum(
+        abs(float(item.get("node_times_weight_magnitude", 0.0)))
+        for item in values
+        if item.get("node_times_weight_magnitude") is not None
+    )
+    for item in values:
+        contribution = item.get("node_times_weight_magnitude")
+        item["importance"] = 0.0 if contribution is None or total == 0.0 else abs(float(contribution)) / total
+    return values
+
+
+def _residual_node_detail(meta, seq_idx, node_idx, probability=None, u_idx=None):
+    raw_value = _seq_node_value(_SHARED_RESIDUAL_NODE_VALUES, seq_idx, node_idx)
+    item = {
+        "name": meta["name"],
+        "node_idx": int(node_idx),
+        "local_idx": int(node_idx) - int(meta["start"]),
+        "raw_value": raw_value,
+    }
+    if probability is not None:
+        item["normalized_probability"] = float(probability)
+    if u_idx is not None and _SHARED_SP is not None:
+        prev_to_curr_in = _SHARED_SP.get("prev_to_curr_in")
+        if prev_to_curr_in is not None:
+            cost_to_u = float(prev_to_curr_in[int(node_idx), int(u_idx)])
+            weight_magnitude = _weight_magnitude_from_cost(cost_to_u)
+            item["cost_to_u"] = cost_to_u
+            item["original_weight_magnitude_to_u"] = weight_magnitude
+            if raw_value is not None:
+                node_times_weight = float(raw_value * weight_magnitude)
+                item["node_times_weight_magnitude"] = node_times_weight
+                if probability is not None:
+                    item["probability_times_node_weight"] = float(float(probability) * node_times_weight)
+    return item
+
+
+def _residual_source_node_values(seq_idx, u_idx, mu=None, prev_active=None):
+    if _SHARED_RESIDUAL_NODE_VALUES is None or not _SHARED_RESIDUAL_NODE_META:
+        return None
+    prev_probs = None if mu is None else np.asarray(mu[:-1], dtype=curvature_np_dtype()).reshape(-1)
+    prev_active = None if prev_active is None else np.asarray(prev_active, dtype=np.int64).reshape(-1)
+    values = []
+    for meta in _SHARED_RESIDUAL_NODE_META:
+        start = int(meta["start"])
+        width = int(meta["end"]) - start
+        if int(u_idx) < width:
+            node_idx = int(start + u_idx)
+            probability = 0.0
+            if prev_probs is not None and prev_active is not None:
+                match = np.nonzero(prev_active == node_idx)[0]
+                if match.size > 0:
+                    probability = float(prev_probs[int(match[0])])
+            values.append(_residual_node_detail(meta, seq_idx, node_idx, probability, u_idx))
+    return values or None
+
+
+def _edge_prev_distribution_with_residual(seq_idx, u_idx):
+    if _SHARED_PREV_NODE_VALUES is None or not _SHARED_RESIDUAL_NODE_META:
+        return None
+    base_width = int(_SHARED_RESIDUAL_NODE_META[0]["start"])
+    if base_width <= 0 or int(u_idx) >= base_width:
+        return None
+    base_values = np.asarray(_SHARED_PREV_NODE_VALUES[int(seq_idx), :base_width], dtype=curvature_np_dtype())
+    residual_node_idx = None
+    residual_value = None
+    for meta in _SHARED_RESIDUAL_NODE_META:
+        start = int(meta["start"])
+        width = int(meta["end"]) - start
+        if int(u_idx) < width:
+            residual_node_idx = start + int(u_idx)
+            residual_value = _seq_node_value(_SHARED_RESIDUAL_NODE_VALUES, seq_idx, residual_node_idx)
+            break
+    if residual_node_idx is None or residual_value is None:
+        return None
+
+    row = _build_node_distribution_row_from_values(
+        np.concatenate((base_values, np.array([residual_value], dtype=curvature_np_dtype()))),
+        _SHARED_ALPHA,
+    )
+    mu, active = _edge_distribution(row, _SHARED_ALPHA)
+    active = np.asarray(active, dtype=np.int64)
+    if active.size > 0:
+        active = active.copy()
+        active[active == base_width] = int(residual_node_idx)
+    return mu, active
+
+
+def _filter_residual_prev_distribution(u_idx, mu, prev_active):
+    if _SHARED_RESIDUAL_NODE_VALUES is None or not _SHARED_RESIDUAL_NODE_META or len(prev_active) == 0:
+        return mu, prev_active
+
+    prev_active = np.asarray(prev_active, dtype=np.int64).reshape(-1)
+    prev_probs = np.asarray(mu[:-1], dtype=curvature_np_dtype()).reshape(-1)
+    keep = np.ones(prev_active.shape, dtype=bool)
+
+    for pos, node_idx in enumerate(prev_active):
+        node_idx = int(node_idx)
+        for meta in _SHARED_RESIDUAL_NODE_META:
+            start = int(meta["start"])
+            end = int(meta["end"])
+            if start <= node_idx < end:
+                keep[pos] = (node_idx - start) == int(u_idx)
+                break
+
+    if keep.all():
+        return mu, prev_active
+
+    kept_active = prev_active[keep]
+    kept_probs = prev_probs[keep]
+    prob_sum = float(kept_probs.sum())
+    if prob_sum > 0.0:
+        kept_probs = kept_probs * (float(1.0 - _SHARED_ALPHA) / prob_sum)
+        kept_mu = np.hstack((kept_probs, np.array([_SHARED_ALPHA], dtype=curvature_np_dtype())))
+    else:
+        kept_mu = np.array([1.0], dtype=curvature_np_dtype())
+        kept_active = np.empty((0,), dtype=np.int64)
+    return kept_mu.astype(curvature_np_dtype(), copy=False), kept_active
+
+
+def _append_residual_prev_nodes(operations, prev_node_tensor, residual_names):
+    residual_tensors = [operations[name] for name in residual_names if name in operations]
+    if not residual_tensors:
+        return prev_node_tensor
+    tensors = []
+    if prev_node_tensor is not None:
+        tensors.append(prev_node_tensor)
+    tensors.extend(residual_tensors)
+    return torch.cat(tensors, dim=-1) if len(tensors) > 1 else tensors[0]
+
+
+def _build_residual_node_values(operations, residual_names, seq_len, prev_width):
+    if not residual_names:
+        return None, None
+
+    metas = []
+    values = []
+    offset = int(prev_width or 0)
+    if offset > 0:
+        values.append(np.zeros((int(seq_len), offset), dtype=curvature_np_dtype()))
+    for name in residual_names:
+        residual_values = _build_seq_node_values(operations.get(name), seq_len)
+        if residual_values is None:
+            continue
+        width = int(residual_values.shape[-1])
+        metas.append({"name": name, "start": offset, "end": offset + width})
+        values.append(residual_values)
+        offset += width
+
+    if not metas:
+        return None, None
+    return np.concatenate(values, axis=1), metas
+
+
 def _node_value_is_zero(value):
     return value is not None and np.isfinite(value) and value == 0.0
 
 
-def _edge_duv_beta(source_value, target_value):
-    beta = np.abs(source_value) / np.abs(target_value)
-    return curvature_np_dtype()(beta)
+def _edge_duv_beta(source_value, target_value, weight_magnitude=1.0):
+    if source_value is None or target_value is None:
+        return 1.0
+    if source_value == 0.0 or target_value == 0.0:
+        return 0.0
+    beta = abs(source_value) * abs(weight_magnitude) / abs(target_value) if target_value != 0.0 else 1.0
+    return float(beta) if np.isfinite(beta) and beta > 0.0 else 1.0
 
 
 def _finite_array_stats(values):
@@ -173,6 +403,25 @@ def _merge_cost_stats(total, update):
     total["min"] = min(float(total["min"]), float(update["min"]))
     total["max"] = max(float(total["max"]), float(update["max"]))
     return total
+
+
+def _score_value(score, idx, seq_idx, other_idx=None):
+    if score is None:
+        return None
+    if metric_utils.is_compact_score(score):
+        if other_idx is None:
+            return None
+        score = score.get_for_edge(idx, other_idx)
+    if isinstance(score, dict):
+        if other_idx is not None:
+            score = score.get((int(idx), int(other_idx)), score.get(int(idx)))
+        else:
+            score = score.get(int(idx))
+    if score is None:
+        return None
+    if np.isscalar(score):
+        return float(score)
+    return float(np.asarray(score, dtype=curvature_np_dtype())[int(seq_idx)])
 
 
 def _get_min_QK_A_cost(v_idx, u_idx, s, prev_active):
@@ -394,7 +643,12 @@ def _edge_seq_distributions(edge_info, seq_info):
     else:
         prev_row = None if _SHARED_PREV_IN is None else _SHARED_PREV_IN[seq_info]
 
-    mu, prev_active = _edge_distribution(prev_row, _SHARED_ALPHA)
+    residual_prev = _edge_prev_distribution_with_residual(seq_info, u_idx)
+    if residual_prev is None:
+        mu, prev_active = _edge_distribution(prev_row, _SHARED_ALPHA)
+        mu, prev_active = _filter_residual_prev_distribution(u_idx, mu, prev_active)
+    else:
+        mu, prev_active = residual_prev
     nu, next_active = _edge_distribution(next_row, _SHARED_ALPHA)
     if next_active_offset:
         next_active = next_active + next_active_offset
@@ -418,39 +672,50 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
         "out_neighbors": [int(idx) for idx in next_active.tolist()],
         "mu": np.asarray(mu, dtype=curvature_np_dtype()).tolist(),
         "nu": np.asarray(nu, dtype=curvature_np_dtype()).tolist(),
-        "cost_matrix": np.asarray(cost, dtype=curvature_np_dtype()).tolist(),
-        "prev_neighbors_to_v_cost": np.asarray(cost[:-1, -1], dtype=curvature_np_dtype()).tolist(),
-        "u_to_out_neighbors_cost": np.asarray(cost[-1, :-1], dtype=curvature_np_dtype()).tolist(),
-        "prev_neighbors_to_out_neighbors_cost": np.asarray(cost[:-1, :-1], dtype=curvature_np_dtype()).tolist(),
     }
     if original_weight_magnitude is not None:
         detail["original_weight_magnitude"] = original_weight_magnitude
         detail["weight_magnitude"] = original_weight_magnitude
-    prev_to_curr_in = _SHARED_SP.get("prev_to_curr_in") if _SHARED_SP is not None else None
-    if prev_to_curr_in is not None and len(prev_active) > 0:
-        detail["prev_neighbors_to_u_cost"] = np.asarray(
-            prev_to_curr_in[np.asarray(prev_active, dtype=np.int64), u_idx],
-            dtype=curvature_np_dtype(),
-        ).tolist()
-    prev_to_curr_in_weight_magnitude = (
-        _SHARED_SP.get("prev_to_curr_in_weight_magnitude") if _SHARED_SP is not None else None
-    )
-    if prev_to_curr_in_weight_magnitude is not None and len(prev_active) > 0:
-        detail["prev_neighbors_to_u_weight_magnitude"] = np.asarray(
-            prev_to_curr_in_weight_magnitude[np.asarray(prev_active, dtype=np.int64), u_idx],
-            dtype=curvature_np_dtype(),
-        ).tolist()
-        detail["prev_neighbors_to_u_weight_magnitude_source"] = _SHARED_SP.get(
-            "prev_to_curr_in_weight_magnitude_source"
+    residual_source_values = _residual_source_node_values(seq_idx, u_idx, mu, prev_active)
+    if residual_source_values is not None:
+        detail["residual_source_node_values"] = residual_source_values
+    mu_node_values = _mu_node_values(seq_idx, u_idx, prev_active, mu)
+    source_node_value = _source_node_value(seq_idx, u_idx)
+    importance_values = []
+    if mu_node_values is not None:
+        importance_values.extend(mu_node_values)
+    if residual_source_values is not None:
+        logged_nodes = {int(item["node_idx"]) for item in importance_values}
+        importance_values.extend(
+            item for item in residual_source_values
+            if int(item["node_idx"]) not in logged_nodes
         )
-
+    if source_node_value is not None:
+        detail["source_node_raw_value"] = source_node_value
+        if original_weight_magnitude is not None:
+            source_node_weighted_value = float(source_node_value * original_weight_magnitude)
+            source_node_probability = float(np.asarray(mu, dtype=curvature_np_dtype())[-1])
+            detail["source_node_mu_probability"] = source_node_probability
+            detail["source_node_times_weight_magnitude"] = source_node_weighted_value
+            detail["source_probability_times_node_weight"] = float(
+                source_node_probability * source_node_weighted_value
+            )
+    if importance_values:
+        detail["mu_importance_values"] = _with_importance(importance_values)
+        detail["mu_node_weighted_sum_to_u"] = float(sum(
+            abs(float(item.get("node_times_weight_magnitude", 0.0)))
+            for item in importance_values
+            if item.get("node_times_weight_magnitude") is not None
+        ))
+    out_neighbor_values = _out_neighbor_node_values(seq_idx, next_active, nu, cost)
+    if out_neighbor_values is not None:
+        detail["out_neighbor_node_values"] = out_neighbor_values
     curr_out_to_next = _SHARED_SP.get("curr_out_to_next") if _SHARED_SP is not None else None
     if curr_out_to_next is not None and len(next_active) > 0:
         v_to_out_neighbors_cost = np.asarray(
             curr_out_to_next[v_idx, np.asarray(next_active, dtype=np.int64)],
             dtype=curvature_np_dtype(),
         )
-        detail["v_to_out_neighbors_cost"] = v_to_out_neighbors_cost.tolist()
         inf_mask = np.isinf(v_to_out_neighbors_cost)
         if np.any(inf_mask):
             curr_out_row = np.asarray(curr_out_to_next[v_idx], dtype=curvature_np_dtype())
@@ -460,18 +725,6 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
             detail["v_to_out_neighbors_finite_count"] = int(np.isfinite(v_to_out_neighbors_cost).sum())
             detail["v_to_all_out_finite_count"] = int(np.isfinite(curr_out_row).sum())
             detail["v_to_all_out_count"] = int(curr_out_row.size)
-    curr_out_to_next_weight_magnitude = (
-        _SHARED_SP.get("curr_out_to_next_weight_magnitude") if _SHARED_SP is not None else None
-    )
-    if curr_out_to_next_weight_magnitude is not None and len(next_active) > 0:
-        detail["v_to_out_neighbors_weight_magnitude"] = np.asarray(
-            curr_out_to_next_weight_magnitude[v_idx, np.asarray(next_active, dtype=np.int64)],
-            dtype=curvature_np_dtype(),
-        ).tolist()
-        detail["v_to_out_neighbors_weight_magnitude_source"] = _SHARED_SP.get(
-            "curr_out_to_next_weight_magnitude_source"
-        )
-
     if metric_score is not None:
         detail["metric_score"] = float(metric_score[int(seq_idx)])
     if metric_prev_score is not None:
@@ -479,39 +732,14 @@ def _parameter_log_detail(edge, seq_idx, sp_uv, mu, prev_active, nu, next_active
     if metric_next_score is not None:
         detail["metric_next_score"] = float(metric_next_score[int(seq_idx)])
 
-    if len(prev_active) > 0:
-        prev_cost = np.asarray(cost[:-1, -1], dtype=curvature_np_dtype())
-        prev_probs = np.asarray(mu[:-1], dtype=curvature_np_dtype())
-        detail["top_prev_to_target_sum"] = float(np.sum(prev_probs * np.nan_to_num(prev_cost, nan=0.0, posinf=0.0, neginf=0.0)))
-        detail["top_prev_to_target_nodes"] = [
-            {
-                "node_idx": int(node_idx),
-                "probability": float(probability),
-                "cost_to_target": float(cost_to_target),
-                "weighted_cost": float(probability * (cost_to_target if np.isfinite(cost_to_target) else 0.0)),
-            }
-            for node_idx, probability, cost_to_target in zip(prev_active, prev_probs, prev_cost)
-        ]
-
-    if len(next_active) > 0:
-        next_cost = np.asarray(cost[-1, :-1], dtype=curvature_np_dtype())
-        next_probs = np.asarray(nu[:-1], dtype=curvature_np_dtype())
-        detail["top_next_from_source_sum"] = float(np.sum(next_probs * np.nan_to_num(next_cost, nan=0.0, posinf=0.0, neginf=0.0)))
-        detail["top_next_from_source_nodes"] = [
-            {
-                "node_idx": int(node_idx),
-                "probability": float(probability),
-                "cost_from_source": float(cost_from_source),
-                "weighted_cost": float(probability * (cost_from_source if np.isfinite(cost_from_source) else 0.0)),
-            }
-            for node_idx, probability, cost_from_source in zip(next_active, next_probs, next_cost)
-        ]
-
-    if "top_prev_to_target_sum" in detail or "top_next_from_source_sum" in detail:
-        detail["top_neighbor_cost_sum"] = (
-            float(detail.get("top_prev_to_target_sum", 0.0))
-            + float(detail.get("top_next_from_source_sum", 0.0))
-        )
+    ot_prev_score = _score_value(_SHARED_OT_PREV_SCORE, v_idx, seq_idx, other_idx=u_idx)
+    ot_next_score = _score_value(_SHARED_OT_NEXT_SCORE, u_idx, seq_idx, other_idx=v_idx)
+    if ot_prev_score is not None:
+        detail["ot_prev_score"] = ot_prev_score
+    if ot_next_score is not None:
+        detail["ot_next_score"] = ot_next_score
+    if ot_prev_score is not None or ot_next_score is not None:
+        detail["ot_neighbor_score"] = float(ot_prev_score or 0.0) + float(ot_next_score or 0.0)
 
     return detail
 
@@ -525,6 +753,10 @@ def _compute_single_edge_seq_global(edge_info, seq_info):
     target_value = _target_node_value(seq_info, v_idx)
     source_node_zero = _node_value_is_zero(source_value)
     target_node_zero = _node_value_is_zero(target_value)
+    curr_weight_magnitude = _SHARED_SP.get("curr_weight_magnitude") if _SHARED_SP is not None else None
+    weight_magnitude = 1.0 if curr_weight_magnitude is None else float(curr_weight_magnitude[u_idx, v_idx])
+    duv_beta = _edge_duv_beta(source_value, target_value, weight_magnitude)
+
     if source_node_zero or target_node_zero:
         curv = 1.0 if len(prev_active) == 0 or len(next_active) == 0 else 2.0
         return {
@@ -536,6 +768,7 @@ def _compute_single_edge_seq_global(edge_info, seq_info):
             "nu_len": int(len(nu)),
             "w_dist": 0.0,
             "sp_uv": sp_uv,
+            "duv_beta": duv_beta,
             "cost_has_inf": False,
             "cost_inf_count": 0,
             "source_node_zero": bool(source_node_zero),
@@ -553,29 +786,28 @@ def _compute_single_edge_seq_global(edge_info, seq_info):
     )
     cost_inf_count = int(np.isinf(cost).sum())
 
+    emd_error = None
     try:
         w_dist = float(ot.emd2(mu, nu, cost))
-    except Exception:
-        detail = _parameter_log_detail(edge_info, seq_info, sp_uv, mu, prev_active, nu, next_active, cost)
-        return {
-            "seq_idx": seq_info,
-            "v_idx": v_idx,
-            "u_idx": u_idx,
-            "curv": float("inf"),
-            "mu_len": int(len(mu)),
-            "nu_len": int(len(nu)),
-            "w_dist": float("inf"),
-            "sp_uv": sp_uv,
-            "cost_has_inf": bool(cost_inf_count > 0),
-            "cost_inf_count": cost_inf_count,
-            **(q_cost_stats or {}),
-            **detail,
-        }
+    except Exception as exc:
+        emd_error = str(exc)
+        print(f"OT emd2 failed for seq={seq_info}, u={u_idx}, v={v_idx}: {emd_error}")
+        w_dist = float("inf")
 
-    duv_beta = _edge_duv_beta(source_value, target_value)
-    d = sp_uv / duv_beta
-    curv = 1.0 - (w_dist / d)
-    curv = curv / (1-_SHARED_ALPHA)
+    if w_dist == 0:
+        print(
+            f"zero_w_dist sp_uv={sp_uv}, "
+            f"mu_sum={mu.sum()}, nu_sum={nu.sum()}, "
+            f"mu_len={len(mu)}, nu_len={len(nu)}, "
+            f"cost_min={np.nanmin(cost)}, "
+            f"cost_zero_count={(cost == 0).sum()}, "
+            f"prev_active_len={len(prev_active)}, next_active_len={len(next_active)}"
+        )
+
+    d = sp_uv
+    curv = float("inf") if (not np.isfinite(w_dist) or d == 0.0) else 1.0 - (w_dist / d)
+    if np.isfinite(curv):
+        curv = curv / (1-_SHARED_ALPHA)
     detail = _parameter_log_detail(edge_info, seq_info, sp_uv, mu, prev_active, nu, next_active, cost)
 
     return {
@@ -588,6 +820,7 @@ def _compute_single_edge_seq_global(edge_info, seq_info):
         "w_dist": w_dist,
         "sp_uv": sp_uv,
         "duv_beta": duv_beta,
+        "emd_error": emd_error,
         "cost_has_inf": bool(cost_inf_count > 0),
         "cost_inf_count": cost_inf_count,
         **(q_cost_stats or {}),
@@ -604,15 +837,22 @@ def _init_worker(
     next_meta,
     source_node_meta=None,
     target_node_meta=None,
+    prev_node_meta=None,
+    next_node_meta=None,
     prev_seq_metas=None,
     next_seq_metas=None,
     prev_score_meta=None,
     next_score_meta=None,
+    prev_score_value=None,
+    next_score_value=None,
+    ot_prev_score_value=None,
+    ot_next_score_value=None,
 ):
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
-    global _SHARED_SOURCE_NODE_VALUES, _SHARED_TARGET_NODE_VALUES
+    global _SHARED_SOURCE_NODE_VALUES, _SHARED_TARGET_NODE_VALUES, _SHARED_PREV_NODE_VALUES, _SHARED_NEXT_NODE_VALUES
+    global _SHARED_OT_PREV_SCORE, _SHARED_OT_NEXT_SCORE
     global _WORKER_CURR_DIST_SHM, _WORKER_PREV_IN_SHM, _WORKER_NEXT_OUT_SHM
-    global _WORKER_SOURCE_NODE_SHM, _WORKER_TARGET_NODE_SHM
+    global _WORKER_SOURCE_NODE_SHM, _WORKER_TARGET_NODE_SHM, _WORKER_PREV_NODE_SHM, _WORKER_NEXT_NODE_SHM
     global _WORKER_SCORE_SHMS
     global _WORKER_PREV_SEQ_METAS, _WORKER_NEXT_SEQ_METAS
     global _WORKER_PREV_SEQ_SHMS, _WORKER_NEXT_SEQ_SHMS
@@ -640,13 +880,23 @@ def _init_worker(
     if target_node_meta is not None:
         _WORKER_TARGET_NODE_SHM, _SHARED_TARGET_NODE_VALUES = _from_shared_numpy(target_node_meta)
 
+    _WORKER_PREV_NODE_SHM = None
+    _SHARED_PREV_NODE_VALUES = None
+    if prev_node_meta is not None:
+        _WORKER_PREV_NODE_SHM, _SHARED_PREV_NODE_VALUES = _from_shared_numpy(prev_node_meta)
+
+    _WORKER_NEXT_NODE_SHM = None
+    _SHARED_NEXT_NODE_VALUES = None
+    if next_node_meta is not None:
+        _WORKER_NEXT_NODE_SHM, _SHARED_NEXT_NODE_VALUES = _from_shared_numpy(next_node_meta)
+
     _WORKER_SCORE_SHMS = []
-    prev_score = None
+    prev_score = prev_score_value
     if prev_score_meta is not None:
         shm, prev_score = _from_shared_numpy(prev_score_meta)
         _WORKER_SCORE_SHMS.append(shm)
 
-    next_score = None
+    next_score = next_score_value
     if next_score_meta is not None:
         shm, next_score = _from_shared_numpy(next_score_meta)
         _WORKER_SCORE_SHMS.append(shm)
@@ -657,6 +907,8 @@ def _init_worker(
         top_k=_SHARED_TOP_K,
         seq_select=_SHARED_SEQ_SELECT,
     )
+    _SHARED_OT_PREV_SCORE = ot_prev_score_value
+    _SHARED_OT_NEXT_SCORE = ot_next_score_value
 
     _WORKER_PREV_SEQ_METAS = prev_seq_metas
     _WORKER_NEXT_SEQ_METAS = next_seq_metas
@@ -708,22 +960,35 @@ def _compute_edge_with_top_seq(edge):
         if edge_res:
             results.append(edge_res)
     if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1 and results:
-        curvs = np.asarray([float(edge_res["curv"]) for edge_res in results], dtype=curvature_np_dtype())
+        valid_results = [
+            edge_res for edge_res in results
+            if not edge_res.get("source_node_zero") and not edge_res.get("target_node_zero")
+        ]
+        source_node_zero_count = sum(1 for edge_res in results if edge_res.get("source_node_zero"))
+        target_node_zero_count = sum(1 for edge_res in results if edge_res.get("target_node_zero"))
+        if not valid_results:
+            return results
+        curvs = np.asarray([float(edge_res["curv"]) for edge_res in valid_results], dtype=curvature_np_dtype())
         raw_idx = int(np.argmin(curvs))
         smoothed_curvs = sliding_median_low_pass(curvs, _SHARED_LPF_WINDOW)
         if _SHARED_SAVE_PARAMETER_LOGS:
             detailed_results = []
-            for idx, edge_res in enumerate(results):
+            valid_idx = 0
+            for edge_res in results:
                 detailed_res = dict(edge_res)
-                detailed_res["curv"] = curvature_np_dtype()(curvs[idx])
-                detailed_res["lpf_curv"] = curvature_np_dtype()(smoothed_curvs[idx])
+                if not edge_res.get("source_node_zero") and not edge_res.get("target_node_zero"):
+                    detailed_res["curv"] = curvature_np_dtype()(curvs[valid_idx])
+                    detailed_res["lpf_curv"] = curvature_np_dtype()(smoothed_curvs[valid_idx])
+                    valid_idx += 1
                 detailed_results.append(detailed_res)
             return detailed_results
 
         lpf_idx = int(np.argmin(smoothed_curvs))
-        best_res = dict(results[raw_idx])
+        best_res = dict(valid_results[raw_idx])
         best_res["curv"] = curvature_np_dtype()(curvs[raw_idx])
         best_res["lpf_curv"] = curvature_np_dtype()(smoothed_curvs[lpf_idx])
+        best_res["source_node_zero_count"] = source_node_zero_count
+        best_res["target_node_zero_count"] = target_node_zero_count
         return [best_res]
     return results
 
@@ -778,6 +1043,25 @@ def _build_seq_node_values(node_tensor, seq_len):
     return np.abs(values, out=values)
 
 
+def _build_next_node_values(operations, graph_data, short_name, seq_len):
+    node_tensor = graph_data.get("next_out")
+    if node_tensor is None:
+        return None
+
+    if short_name == "q_proj":
+        tensor = node_tensor.detach().cpu() if torch.is_tensor(node_tensor) else torch.as_tensor(node_tensor)
+        if torch.is_floating_point(tensor):
+            tensor = tensor.to(dtype=curvature_torch_dtype())
+        if tensor.dim() != 4 or tensor.shape[0] != 1:
+            return None
+        tensor = tensor.squeeze(0)  # [q_heads, seq_q, seq_k]
+        tensor = tensor[:, :int(seq_len), :].transpose(0, 1).contiguous()
+        values = tensor.reshape(tensor.shape[0], -1).numpy().astype(curvature_np_dtype(), copy=False)
+        return np.abs(values, out=values)
+
+    return _build_seq_node_values(node_tensor, seq_len)
+
+
 def _source_node_tensor_for_op(operations, graph_data, short_name):
     if short_name in {"q_proj", "k_proj", "v_proj"} and "layer_input" in operations:
         return operations["layer_input"]
@@ -793,7 +1077,9 @@ def _source_node_tensor_for_op(operations, graph_data, short_name):
 def _reset_shared_state():
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
-    global _SHARED_SOURCE_NODE_VALUES, _SHARED_TARGET_NODE_VALUES
+    global _SHARED_SOURCE_NODE_VALUES, _SHARED_TARGET_NODE_VALUES, _SHARED_PREV_NODE_VALUES, _SHARED_NEXT_NODE_VALUES
+    global _SHARED_RESIDUAL_NODE_VALUES, _SHARED_RESIDUAL_NODE_META
+    global _SHARED_OT_PREV_SCORE, _SHARED_OT_NEXT_SCORE
     global _SHARED_SHORT_NAME, _SHARED_SAMPLE_IDX, _SHARED_MODEL_META, _SHARED_SEQ_LEN
     global _SHARED_TOP_K, _SHARED_SEQ_SELECT, _SHARED_LPF_WINDOW, _SHARED_SAVE_PARAMETER_LOGS
 
@@ -808,6 +1094,12 @@ def _reset_shared_state():
     _SPK = None
     _SHARED_SOURCE_NODE_VALUES = None
     _SHARED_TARGET_NODE_VALUES = None
+    _SHARED_PREV_NODE_VALUES = None
+    _SHARED_NEXT_NODE_VALUES = None
+    _SHARED_RESIDUAL_NODE_VALUES = None
+    _SHARED_RESIDUAL_NODE_META = None
+    _SHARED_OT_PREV_SCORE = None
+    _SHARED_OT_NEXT_SCORE = None
     _SHARED_SHORT_NAME = None
     _SHARED_SAMPLE_IDX = None
     _SHARED_MODEL_META = None
@@ -865,7 +1157,9 @@ def compute_op_curvature(
 ):
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
-    global _SHARED_SOURCE_NODE_VALUES, _SHARED_TARGET_NODE_VALUES
+    global _SHARED_SOURCE_NODE_VALUES, _SHARED_TARGET_NODE_VALUES, _SHARED_PREV_NODE_VALUES, _SHARED_NEXT_NODE_VALUES
+    global _SHARED_OT_PREV_SCORE, _SHARED_OT_NEXT_SCORE
+    global _SHARED_RESIDUAL_NODE_VALUES, _SHARED_RESIDUAL_NODE_META
     global _SHARED_SHORT_NAME, _SHARED_SAMPLE_IDX, _SHARED_MODEL_META, _SHARED_SEQ_LEN
     global _SHARED_TOP_K, _SHARED_SEQ_SELECT, _SHARED_LPF_WINDOW, _SHARED_SAVE_PARAMETER_LOGS
 
@@ -892,7 +1186,7 @@ def compute_op_curvature(
         sp_cache=sp_cache,
         device=device,
         model_meta=_SHARED_MODEL_META,
-        include_qk_next=short_name not in {"q_proj", "k_proj"},
+        include_qk_next=short_name in {"q_proj", "k_proj"},
     )
     if sp is None:
         return None
@@ -920,26 +1214,47 @@ def compute_op_curvature(
     next_out_distribution = None
     
     # if is o_proj, prev is A
-    if (short_name not in ["o_proj"]) and graph_data["prev_in"] is not None:
+    prev_in_tensor = graph_data["prev_in"]
+    residual_names = graph_data.get("residual_names", [])
+    if short_name not in ["o_proj"]:
+        prev_in_tensor = _append_residual_prev_nodes(operations, prev_in_tensor, residual_names)
+    _SHARED_PREV_NODE_VALUES = (
+        _build_seq_node_values(prev_in_tensor, seq_len)
+        if (parameter_log_root or residual_names)
+        else None
+    )
+
+    if (short_name not in ["o_proj"]) and prev_in_tensor is not None:
         prev_in_distribution = _build_node_distribution(
-            graph_data["prev_in"],
+            prev_in_tensor,
             graph_data["prev_in_name"],
             alpha,
             l2_norm=l2_norm,
             l2_norm_mode=l2_norm_mode,
-            l2_reference=l2_reference(graph_data["prev_in_name"]),
+            l2_reference=None if residual_names else l2_reference(graph_data["prev_in_name"]),
         )
         
     # if is q, k, v, the next is A or attention out     
-    if (short_name not in ["q_proj", "k_proj", "v_proj"]) and graph_data["next_out"] is not None:
-        next_out_distribution = _build_node_distribution(
-            graph_data["next_out"],
-            graph_data["next_out_name"],
-            alpha,
-            l2_norm=l2_norm,
-            l2_norm_mode=l2_norm_mode,
-            l2_reference=l2_reference(graph_data["next_out_name"]),
-        ) # [batch, seq, hidden size]
+    if (short_name in {"q_proj", "k_proj"} or short_name not in ["v_proj"]) and graph_data["next_out"] is not None:
+        if short_name in {"q_proj", "k_proj"}:
+            next_out_distribution = _build_qk_out_node_distribution(
+                short_name,
+                graph_data["next_out"],
+                alpha,
+                l2_norm=l2_norm,
+                l2_norm_mode=l2_norm_mode,
+                l2_reference=l2_reference(graph_data["next_out_name"]),
+                repeat=repeat,
+            )
+        else:
+            next_out_distribution = _build_node_distribution(
+                graph_data["next_out"],
+                graph_data["next_out_name"],
+                alpha,
+                l2_norm=l2_norm,
+                l2_norm_mode=l2_norm_mode,
+                l2_reference=l2_reference(graph_data["next_out_name"]),
+            ) # [batch, seq, hidden size]
         
     
     if prev_in_distribution is None and next_out_distribution is None:
@@ -967,6 +1282,15 @@ def compute_op_curvature(
         seq_len,
     )
     _SHARED_TARGET_NODE_VALUES = _build_seq_node_values(operations.get(short_name), seq_len)
+    _SHARED_NEXT_NODE_VALUES = _build_next_node_values(operations, graph_data, short_name, seq_len)
+    prev_width = 0 if graph_data["prev_in"] is None else int(graph_data["prev_in"].shape[-1])
+    residual_start = prev_width if residual_names else None
+    _SHARED_RESIDUAL_NODE_VALUES, _SHARED_RESIDUAL_NODE_META = _build_residual_node_values(
+        operations,
+        residual_names,
+        seq_len,
+        prev_width,
+    )
     
     curvature = torch.full((out_dim, in_dim), float("inf"), dtype=curvature_torch_dtype())
     lpf_curvature = None
@@ -974,7 +1298,10 @@ def compute_op_curvature(
     curr_dist_np = np.asarray(curr_dist, dtype=curvature_np_dtype())
     curr_dist_finite_edges = int(np.isfinite(curr_dist_np).sum())
     curr_dist_infinite_edges = int(np.isinf(curr_dist_np).sum())
-    finite_edges = np.argwhere(np.isfinite(curr_dist_np) & (curr_dist_np > 0))
+    curr_weight_magnitude_np = np.asarray(sp["curr_weight_magnitude"], dtype=curvature_np_dtype())
+    nonzero_weight_mask = curr_weight_magnitude_np != 0
+    zero_weight_parameter_count = int((~nonzero_weight_mask).sum())
+    finite_edges = np.argwhere(np.isfinite(curr_dist_np) & (curr_dist_np > 0) & nonzero_weight_mask)
 
     analysis_path = analysis_utils.start_curvature_analysis(
         layer_id=layer_id,
@@ -1053,6 +1380,8 @@ def compute_op_curvature(
     base_next_meta = None
     source_node_meta = None
     target_node_meta = None
+    prev_node_meta = None
+    next_node_meta = None
 
     if _SHARED_PREV_IN is not None:
         shm, base_prev_meta = _to_shared_numpy(np.asarray(_SHARED_PREV_IN, dtype=curvature_np_dtype()))
@@ -1071,6 +1400,18 @@ def compute_op_curvature(
     if _SHARED_TARGET_NODE_VALUES is not None:
         shm, target_node_meta = _to_shared_numpy(
             np.asarray(_SHARED_TARGET_NODE_VALUES, dtype=curvature_np_dtype())
+        )
+        base_owned_shms.append(shm)
+
+    if _SHARED_PREV_NODE_VALUES is not None:
+        shm, prev_node_meta = _to_shared_numpy(
+            np.asarray(_SHARED_PREV_NODE_VALUES, dtype=curvature_np_dtype())
+        )
+        base_owned_shms.append(shm)
+
+    if _SHARED_NEXT_NODE_VALUES is not None:
+        shm, next_node_meta = _to_shared_numpy(
+            np.asarray(_SHARED_NEXT_NODE_VALUES, dtype=curvature_np_dtype())
         )
         base_owned_shms.append(shm)
 
@@ -1107,11 +1448,9 @@ def compute_op_curvature(
     q_parameter_cost_stats = _finite_array_stats(curr_dist_np) if short_name == "q_proj" else None
     q_old_cost_stats = None
     q_new_cost_stats = None
-    beta_count = 0
-    beta_sum = 0.0
-    beta_sum_sq = 0.0
-    beta_min = float("inf")
-    beta_max = float("-inf")
+    beta_expected_count = 0
+    source_node_zero_count = 0
+    target_node_zero_count = 0
     t1 = time.time()
     
     if l2_norm:
@@ -1125,25 +1464,45 @@ def compute_op_curvature(
     if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1:
         lpf_curvature = torch.full((out_dim, in_dim), float("inf"), dtype=curvature_torch_dtype())
 
-    prev_score = None
-    next_score = None
-    if _SHARED_TOP_K != -1 and not l2_norm and seq_len > 1:
-        prev_score, next_score = metric_utils.build_neighbor_score_matrices(
+    ot_prev_score = None
+    ot_next_score = None
+    if not l2_norm and seq_len > 1:
+        ot_prev_score, ot_next_score = metric_utils.build_ot_neighbor_score_matrices(
             seq_len=seq_len,
             sp=sp,
             alpha=alpha,
             prev_in_distribution=prev_in_distribution,
             next_out_distribution=next_out_distribution,
+            short_name=short_name,
+            edge_indices=finite_edges,
+            residual_start=residual_start,
+            prev_node_values=_SHARED_PREV_NODE_VALUES,
         )
+    prev_score = ot_prev_score
+    next_score = ot_next_score
 
     prev_score_meta = None
     next_score_meta = None
     if prev_score is not None and not np.isscalar(prev_score):
-        shm, prev_score_meta = _to_shared_numpy(np.asarray(prev_score, dtype=curvature_np_dtype()))
-        base_owned_shms.append(shm)
+        if isinstance(prev_score, dict):
+            prev_score = {
+                col: np.asarray(values, dtype=curvature_np_dtype())
+                for col, values in prev_score.items()
+            }
+        else:
+            shm, prev_score_meta = _to_shared_numpy(np.asarray(prev_score, dtype=curvature_np_dtype()))
+            base_owned_shms.append(shm)
     if next_score is not None and not np.isscalar(next_score):
-        shm, next_score_meta = _to_shared_numpy(np.asarray(next_score, dtype=curvature_np_dtype()))
-        base_owned_shms.append(shm)
+        if isinstance(next_score, dict):
+            next_score = {
+                col: np.asarray(values, dtype=curvature_np_dtype())
+                for col, values in next_score.items()
+            }
+        elif metric_utils.is_compact_score(next_score):
+            pass
+        else:
+            shm, next_score_meta = _to_shared_numpy(np.asarray(next_score, dtype=curvature_np_dtype()))
+            base_owned_shms.append(shm)
     metric_utils.set_shared_metric_state(
         prev_score,
         next_score,
@@ -1151,10 +1510,13 @@ def compute_op_curvature(
         top_k=_SHARED_TOP_K,
         seq_select=_SHARED_SEQ_SELECT,
     )
+    _SHARED_OT_PREV_SCORE = ot_prev_score
+    _SHARED_OT_NEXT_SCORE = ot_next_score
 
     try:
         selected_seq_count = metric_utils.selected_seq_count()
         total_edge_seq_tasks = len(finite_edges) * max(selected_seq_count, 0)
+        beta_expected_count = total_edge_seq_tasks
         edge_batch_size = _edge_batch_size(selected_seq_count)
         print(
             f"Will evaluate {selected_seq_count} seq positions with {_SHARED_SEQ_SELECT} selection "
@@ -1163,7 +1525,7 @@ def compute_op_curvature(
         print(f"Using edge batch size {edge_batch_size} per worker task.")
         if _SHARED_TOP_K == -1 and _SHARED_LPF_WINDOW > 1:
             print(f"Using sliding median low-pass filter with window={_SHARED_LPF_WINDOW}.")
-        print(f'Start creating Pool....')
+        print('Start creating Pool....')
 
         with ctx.Pool(processes=proc, initializer=_init_worker,
             initargs=(
@@ -1172,10 +1534,16 @@ def compute_op_curvature(
                 base_next_meta,
                 source_node_meta,
                 target_node_meta,
+                prev_node_meta,
+                next_node_meta,
                 seq_prev_metas,
                 seq_next_metas,
                 prev_score_meta,
                 next_score_meta,
+                prev_score if isinstance(prev_score, dict) else None,
+                next_score if isinstance(next_score, dict) else None,
+                ot_prev_score,
+                ot_next_score,
             ),) as pool:
             for edge_batch_results in pool.imap_unordered(
                 _compute_edge_batch_with_top_seq,
@@ -1205,6 +1573,10 @@ def compute_op_curvature(
                                 short_name,
                                 edge_res,
                             )
+                        source_node_zero = bool(edge_res.get("source_node_zero", False))
+                        target_node_zero = bool(edge_res.get("target_node_zero", False))
+                        source_node_zero_count += int(edge_res.get("source_node_zero_count", source_node_zero))
+                        target_node_zero_count += int(edge_res.get("target_node_zero_count", target_node_zero))
                         v_idx = edge_res["v_idx"]
                         u_idx = edge_res["u_idx"]
                         curv = float(edge_res["curv"])
@@ -1219,14 +1591,8 @@ def compute_op_curvature(
                         mu_nu_count += 1
                         cost_has_inf = cost_has_inf or bool(edge_res["cost_has_inf"])
                         cost_inf_count += int(edge_res["cost_inf_count"])
-                        if "duv_beta" in edge_res:
-                            beta = float(edge_res["duv_beta"])
-                            if np.isfinite(beta):
-                                beta_count += 1
-                                beta_sum += beta
-                                beta_sum_sq += beta * beta
-                                beta_min = min(beta_min, beta)
-                                beta_max = max(beta_max, beta)
+                        if source_node_zero or target_node_zero:
+                            continue
                         if short_name == "q_proj":
                             q_old_cost_stats = _merge_cost_stats(
                                 q_old_cost_stats,
@@ -1273,15 +1639,16 @@ def compute_op_curvature(
         avg_nu_len=avg_nu_len,
         curr_dist_finite_edges=curr_dist_finite_edges,
         curr_dist_infinite_edges=curr_dist_infinite_edges,
+        sampled_edge_count=len(finite_edges),
         cost_has_inf=cost_has_inf,
         cost_inf_count=cost_inf_count,
         runtime_sec=runtime_sec,
         beta_stats={
-            "count": beta_count,
-            "sum": beta_sum,
-            "sum_sq": beta_sum_sq,
-            "min": beta_min,
-            "max": beta_max,
+            "count": 0,
+            "expected_count": beta_expected_count,
+            "source_node_zero_count": source_node_zero_count,
+            "target_node_zero_count": target_node_zero_count,
+            "zero_weight_parameter_count": zero_weight_parameter_count,
         },
     )
 

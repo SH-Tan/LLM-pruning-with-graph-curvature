@@ -153,6 +153,51 @@ def _build_node_distribution(
     return dist.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
 
 
+def _build_node_distribution_row_from_values(values, alpha, eps=1e-7):
+    values = np.asarray(values, dtype=curvature_np_dtype()).reshape(-1)
+    node_values = np.abs(values)
+    valid_raw = np.isfinite(node_values) & (node_values != 0)
+    if not np.any(valid_raw):
+        return np.zeros_like(node_values, dtype=curvature_np_dtype())
+
+    xmin = np.min(node_values[valid_raw])
+    xmax = np.max(node_values[valid_raw])
+    denom = max(float(xmax - xmin), 1e-4)
+    norm = np.zeros_like(node_values, dtype=curvature_np_dtype())
+    norm[valid_raw] = (node_values[valid_raw] - xmin) / denom
+    norm[valid_raw & (norm == 0)] = 1e-4
+
+    scaled = np.zeros_like(node_values, dtype=curvature_np_dtype())
+    scaled[valid_raw] = 1.0 / norm[valid_raw]
+    valid = np.isfinite(scaled) & (scaled != 0)
+    weights = np.exp(-(scaled ** 2)) * valid
+    weight_sum = float(weights.sum())
+    if weight_sum > eps:
+        dist = ((1.0 - alpha) * weights) / weight_sum
+    else:
+        dist = np.zeros_like(weights, dtype=curvature_np_dtype())
+        dist[valid] = -1.0
+
+    positive = dist > 0
+    positive_count = int(positive.sum())
+    if positive_count > 250:
+        keep_count = max(1, int(positive_count * 0.05))
+        top_idx = np.argpartition(-dist, keep_count - 1)[:keep_count]
+        keep = np.zeros(dist.shape, dtype=bool)
+        keep[top_idx] = True
+        scaled = np.where(keep, scaled, 0.0)
+        valid = np.isfinite(scaled) & (scaled != 0)
+        weights = np.exp(-(scaled ** 2)) * valid
+        weight_sum = float(weights.sum())
+        if weight_sum > eps:
+            dist = ((1.0 - alpha) * weights) / weight_sum
+        else:
+            dist = np.zeros_like(weights, dtype=curvature_np_dtype())
+            dist[valid] = -1.0
+
+    return dist.astype(curvature_np_dtype(), copy=False)
+
+
 
 
 

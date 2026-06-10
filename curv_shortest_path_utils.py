@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 from curv_dtype_utils import curvature_torch_dtype
 from graph_relation import _resolve_graph_sets
@@ -21,13 +22,13 @@ def _cost_to_magnitude(matrix):
     return mag
 
 
-def _max_reduce_magnitudes(matrices):
-    if not matrices:
-        return None
-    if len(matrices) == 1:
-        return _cost_to_magnitude(next(iter(matrices.values()))).cpu().contiguous().numpy()
-    mags = [_cost_to_magnitude(v).cpu() for v in matrices.values()]
-    return torch.stack(mags, dim=0).max(dim=0).values.contiguous().numpy()
+def _residual_to_curr_out(residual_matrix, curr_dist, chunk_k=256, chunk_p=256):
+    if (
+        residual_matrix.shape[0] == curr_dist.shape[0]
+        and residual_matrix.shape[1] == curr_dist.shape[0]
+    ):
+        return curr_dist + torch.diagonal(residual_matrix).reshape(-1, 1)
+    return _min_plus_torch(residual_matrix, curr_dist, chunk_k=chunk_k, chunk_p=chunk_p)
 
 
 def _min_plus_torch(a, b, chunk_k=256, chunk_p=256):
@@ -83,6 +84,7 @@ def build_shortest_path_cache(
         return None, graph_data
 
     prev_dists = _all_cost_matrices(layer_cache, graph_data["prev_cost_names"], device=device)
+    residual_dists = _all_cost_matrices(layer_cache, graph_data.get("residual_names", []), device=device)
 
     if short_name in {"q_proj", "k_proj"} and include_qk_next:
         cost_n = graph_data["next_cost_names"][0]
@@ -94,32 +96,84 @@ def build_shortest_path_cache(
             for name in graph_data["next_cost_names"]
         }
         
-        next_weight_magnitude_source = "activation_or_attention_cost"
     else:
         next_names = [] if short_name in {"q_proj", "k_proj"} else graph_data["next_cost_names"]
         next_dists = _all_cost_matrices(layer_cache, next_names, device=device)
-        next_weight_magnitude_source = "nn_weight"
 
     chunk_k, chunk_p = adaptive_chunksize(device=device)
+
+    curr_dist_np = curr_dist.cpu().contiguous().numpy()
+    curr_weight_magnitude_np = _cost_to_magnitude(curr_dist).cpu().contiguous().numpy()
+    curr_out_to_next_np = (
+        _min_reduce_blocks([v.cpu().contiguous().numpy() for v in next_dists.values()])
+        if next_dists
+        else None
+    )
 
     prev_to_curr_out_all = {}
     curr_in_to_next_all = {}
     prev_to_next_all = {}
+    prev_to_curr_in_np = None
 
-    for name, prev_matrix in prev_dists.items():
-        prev_to_curr_out_all[name] = _min_plus_torch(
-            prev_matrix, curr_dist, chunk_k=chunk_k, chunk_p=chunk_p
+    if residual_dists:
+        prev_in_matrices = list(prev_dists.values()) + list(residual_dists.values())
+        if prev_in_matrices:
+            total_prev_in_rows = sum(int(matrix.shape[0]) for matrix in prev_in_matrices)
+            prev_to_curr_in_np = np.empty(
+                (total_prev_in_rows, curr_dist.shape[0]),
+                dtype=curr_dist_np.dtype,
+            )
+            row_start = 0
+            for matrix in prev_in_matrices:
+                row_end = row_start + matrix.shape[0]
+                prev_to_curr_in_np[row_start:row_end] = matrix.cpu().contiguous().numpy()
+                row_start = row_end
+        del prev_in_matrices
+    else:
+        prev_to_curr_in_np = (
+            _min_reduce_blocks([v.cpu().contiguous().numpy() for v in prev_dists.values()])
+            if prev_dists
+            else None
         )
 
     for name, next_matrix in next_dists.items():
-        curr_in_to_next_all[name] = _min_plus_torch(
+        curr_in_to_next = _min_plus_torch(
             curr_dist, next_matrix, chunk_k=chunk_k, chunk_p=chunk_p
         )
+        curr_in_to_next_all[name] = curr_in_to_next.cpu().contiguous().numpy()
+        del curr_in_to_next
 
-    for prev_name, prev_to_curr_out in prev_to_curr_out_all.items():
+    if residual_dists:
+        total_prev_rows = sum(
+            int(prev_matrix.shape[0]) for prev_matrix in prev_dists.values()
+        ) + sum(
+            int(residual_matrix.shape[0]) for residual_matrix in residual_dists.values()
+        )
+        prev_to_curr_out = torch.empty(
+            (total_prev_rows, curr_dist.shape[1]),
+            dtype=curr_dist.dtype,
+            device=curr_dist.device,
+        )
+        row_start = 0
+        for prev_matrix in prev_dists.values():
+            block = _min_plus_torch(
+                prev_matrix, curr_dist, chunk_k=chunk_k, chunk_p=chunk_p
+            )
+            row_end = row_start + block.shape[0]
+            prev_to_curr_out[row_start:row_end] = block
+            row_start = row_end
+            del block
+        for residual_matrix in residual_dists.values():
+            block = _residual_to_curr_out(
+                residual_matrix, curr_dist, chunk_k=chunk_k, chunk_p=chunk_p
+            )
+            row_end = row_start + block.shape[0]
+            prev_to_curr_out[row_start:row_end] = block
+            row_start = row_end
+            del block
         for next_name, next_matrix in next_dists.items():
-            key = f"{prev_name}->{next_name}"
-            prev_to_next_all[key] = (
+            key = f"prev_with_residual->{next_name}"
+            prev_to_next = (
                 _min_plus_torch(prev_to_curr_out, next_matrix, chunk_k=chunk_k, chunk_p=chunk_p)
                 if (prev_to_curr_out.numel() and next_matrix.numel())
                 else torch.empty(
@@ -128,38 +182,46 @@ def build_shortest_path_cache(
                     device=device,
                 )
             )
+            prev_to_next_all[key] = prev_to_next.cpu().contiguous().numpy()
+            del prev_to_next
+        prev_to_curr_out_all["prev_with_residual"] = prev_to_curr_out.cpu().contiguous().numpy()
+        del prev_to_curr_out
+    else:
+        for prev_name, prev_matrix in prev_dists.items():
+            prev_to_curr_out = _min_plus_torch(
+                prev_matrix, curr_dist, chunk_k=chunk_k, chunk_p=chunk_p
+            )
+            for next_name, next_matrix in next_dists.items():
+                key = f"{prev_name}->{next_name}"
+                prev_to_next = (
+                    _min_plus_torch(prev_to_curr_out, next_matrix, chunk_k=chunk_k, chunk_p=chunk_p)
+                    if (prev_to_curr_out.numel() and next_matrix.numel())
+                    else torch.empty(
+                        (prev_to_curr_out.shape[0], next_matrix.shape[1]),
+                        dtype=prev_to_curr_out.dtype,
+                        device=device,
+                    )
+                )
+                prev_to_next_all[key] = prev_to_next.cpu().contiguous().numpy()
+                del prev_to_next
+            prev_to_curr_out_all[prev_name] = prev_to_curr_out.cpu().contiguous().numpy()
+            del prev_to_curr_out
+
+    del prev_dists, residual_dists
+    del curr_dist
+    del next_dists
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     sp = {
-        "curr_dist": curr_dist.cpu().contiguous().numpy(),
-        "curr_weight_magnitude": _cost_to_magnitude(curr_dist).cpu().contiguous().numpy(),
-        "prev_to_curr_in": (
-            _min_reduce_blocks([v.cpu().contiguous().numpy() for v in prev_dists.values()])
-            if prev_dists
-            else None
-        ),
-        "prev_to_curr_in_weight_magnitude": _max_reduce_magnitudes(prev_dists),
-        "prev_to_curr_in_weight_magnitude_source": "nn_weight" if prev_dists else None,
-        "curr_out_to_next": (
-            _min_reduce_blocks([v.cpu().contiguous().numpy() for v in next_dists.values()])
-            if next_dists
-            else None
-        ),
-        "curr_out_to_next_weight_magnitude": _max_reduce_magnitudes(next_dists),
-        "curr_out_to_next_weight_magnitude_source": (
-            next_weight_magnitude_source if next_dists else None
-        ),
-        "prev_to_curr_out_all": {
-            k: v.cpu().contiguous().numpy() for k, v in prev_to_curr_out_all.items()
-        },
-        "curr_in_to_next_all": {
-            k: v.cpu().contiguous().numpy() for k, v in curr_in_to_next_all.items()
-        },
-        "prev_to_next_all": {
-            k: v.cpu().contiguous().numpy() for k, v in prev_to_next_all.items()
-        },
+        "curr_dist": curr_dist_np,
+        "curr_weight_magnitude": curr_weight_magnitude_np,
+        "prev_to_curr_in": prev_to_curr_in_np,
+        "curr_out_to_next": curr_out_to_next_np,
+        "prev_to_curr_out_all": prev_to_curr_out_all,
+        "curr_in_to_next_all": curr_in_to_next_all,
+        "prev_to_next_all": prev_to_next_all,
     }
-    del prev_dists, next_dists, prev_to_curr_out_all, curr_in_to_next_all, prev_to_next_all
-    del curr_dist
 
     sp_cache[short_name] = sp
     return sp, graph_data

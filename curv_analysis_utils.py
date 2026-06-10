@@ -5,8 +5,7 @@ import torch
 
 _AGGREGATE_MARKER = "overall:\n"
 _PARAMETER_CURVATURE_POINTS = {}
-_PARAMETER_NEIGHBOR_COST_POINTS = {}
-_PARAMETER_METRIC_POINTS = {}
+_PARAMETER_OT_NEIGHBOR_POINTS = {}
 _ACTIVE_PARAMETER_LOGS = set()
 _PYPLOT = None
 
@@ -173,8 +172,7 @@ def prepare_parameter_detail_log(log_root, layer_id, short_name, sample_idx, v_i
 
     _ACTIVE_PARAMETER_LOGS.add(log_path)
     _PARAMETER_CURVATURE_POINTS.pop(log_path, None)
-    _PARAMETER_METRIC_POINTS.pop(log_path, None)
-    _PARAMETER_NEIGHBOR_COST_POINTS.pop(log_path, None)
+    _PARAMETER_OT_NEIGHBOR_POINTS.pop(log_path, None)
     return log_path
 
 
@@ -184,6 +182,76 @@ def _write_array_block(f, name, value):
     arr = np.asarray(value, dtype=np.float64)
     with np.printoptions(threshold=np.inf, linewidth=200, precision=8, suppress=False):
         f.write(f"{name}: {arr.tolist()}\n")
+
+
+def _write_residual_node_value_block(f, name, values):
+    if values is None:
+        return
+    f.write(f"{name}:\n")
+    for item in values:
+        extra = ""
+        if item.get("original_weight_magnitude_to_u") is not None:
+            extra += f", original_weight_magnitude_to_u={float(item['original_weight_magnitude_to_u'])}"
+        if item.get("node_times_weight_magnitude") is not None:
+            extra += f", node_times_weight_magnitude={float(item['node_times_weight_magnitude'])}"
+        if item.get("probability_times_node_weight") is not None:
+            extra += f", probability_times_node_weight={float(item['probability_times_node_weight'])}"
+        if item.get("importance") is not None:
+            extra += f", importance={float(item['importance'])}"
+        f.write(
+            "  "
+            f"name={item['name']}, "
+            f"node_idx={int(item['node_idx'])}, "
+            f"local_idx={int(item['local_idx'])}, "
+            f"raw_value={float(item['raw_value'])}, "
+            f"normalized_probability={float(item['normalized_probability'])}, "
+            f"cost_to_u={float(item['cost_to_u'])}"
+            f"{extra}\n"
+        )
+
+
+def _write_out_neighbor_node_value_block(f, values):
+    if values is None:
+        return
+    f.write("out_neighbor_node_values:\n")
+    for item in values:
+        f.write(
+            "  "
+            f"node_idx={int(item['node_idx'])}, "
+            f"raw_value={float(item['raw_value'])}, "
+            f"normalized_probability={float(item['normalized_probability'])}, "
+            f"cost_from_source={float(item['cost_from_source'])}\n"
+        )
+
+
+def _write_mu_node_value_block(f, name, values):
+    if values is None:
+        return
+    f.write(f"{name}:\n")
+    for item in values:
+        parts = []
+        for key in (
+            "node_type",
+            "residual_name",
+            "residual_local_idx",
+            "node_idx",
+            "raw_value",
+            "normalized_probability",
+            "cost_to_u",
+            "original_weight_magnitude_to_u",
+            "node_times_weight_magnitude",
+            "probability_times_node_weight",
+            "importance",
+        ):
+            if item.get(key) is not None:
+                value = item[key]
+                if isinstance(value, (int, np.integer)):
+                    parts.append(f"{key}={int(value)}")
+                elif isinstance(value, (float, np.floating)):
+                    parts.append(f"{key}={float(value)}")
+                else:
+                    parts.append(f"{key}={value}")
+        f.write("  " + ", ".join(parts) + "\n")
 
 
 def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
@@ -202,10 +270,9 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
     metric_next_score = edge_res.get("metric_next_score")
     original_weight_magnitude = edge_res.get("original_weight_magnitude")
     weight_magnitude = edge_res.get("weight_magnitude")
-    prev_cost_sum = edge_res.get("top_prev_to_target_sum")
-    next_cost_sum = edge_res.get("top_next_from_source_sum")
-    neighbor_cost_sum = edge_res.get("top_neighbor_cost_sum")
-
+    ot_prev_cost_sum = edge_res.get("ot_prev_score")
+    ot_next_cost_sum = edge_res.get("ot_next_score")
+    ot_neighbor_cost_sum = edge_res.get("ot_neighbor_score")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             f"parameter: u={u_idx}, v={v_idx}\n"
@@ -223,29 +290,13 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
         )
         _write_array_block(f, "in_neighbors", edge_res.get("in_neighbors"))
         _write_array_block(f, "out_neighbors", edge_res.get("out_neighbors"))
+        _write_out_neighbor_node_value_block(f, edge_res.get("out_neighbor_node_values"))
         _write_array_block(f, "mu", edge_res.get("mu"))
+        _write_mu_node_value_block(f, "mu_importance_values", edge_res.get("mu_importance_values"))
+        if edge_res.get("mu_node_weighted_sum_to_u") is not None:
+            f.write(f"mu_node_weighted_sum_to_u: {float(edge_res['mu_node_weighted_sum_to_u'])}\n")
         _write_array_block(f, "nu", edge_res.get("nu"))
-        _write_array_block(f, "cost_matrix", edge_res.get("cost_matrix"))
-        _write_array_block(f, "prev_neighbors_to_u_cost", edge_res.get("prev_neighbors_to_u_cost"))
-        _write_array_block(
-            f,
-            "prev_neighbors_to_u_weight_magnitude",
-            edge_res.get("prev_neighbors_to_u_weight_magnitude"),
-        )
-        _write_array_block(f, "v_to_out_neighbors_cost", edge_res.get("v_to_out_neighbors_cost"))
-        _write_array_block(
-            f,
-            "v_to_out_neighbors_weight_magnitude",
-            edge_res.get("v_to_out_neighbors_weight_magnitude"),
-        )
         _write_array_block(f, "v_to_out_neighbors_inf_nodes", edge_res.get("v_to_out_neighbors_inf_nodes"))
-        _write_array_block(f, "prev_neighbors_to_v_cost", edge_res.get("prev_neighbors_to_v_cost"))
-        _write_array_block(f, "u_to_out_neighbors_cost", edge_res.get("u_to_out_neighbors_cost"))
-        _write_array_block(
-            f,
-            "prev_neighbors_to_out_neighbors_cost",
-            edge_res.get("prev_neighbors_to_out_neighbors_cost"),
-        )
         if lpf_curv is not None:
             f.write(f"lpf_curv: {float(lpf_curv)}\n")
         if metric_score is not None:
@@ -254,80 +305,60 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
             f.write(f"metric_prev_score: {float(metric_prev_score)}\n")
         if metric_next_score is not None:
             f.write(f"metric_next_score: {float(metric_next_score)}\n")
+        if ot_prev_cost_sum is not None:
+            f.write(f"ot_prev_score: {float(ot_prev_cost_sum)}\n")
+        if ot_next_cost_sum is not None:
+            f.write(f"ot_next_score: {float(ot_next_cost_sum)}\n")
+        if ot_neighbor_cost_sum is not None:
+            f.write(f"ot_neighbor_score: {float(ot_neighbor_cost_sum)}\n")
+        if edge_res.get("emd_error") is not None:
+            f.write(f"emd_error: {edge_res['emd_error']}\n")
         if original_weight_magnitude is not None:
             f.write(f"original_weight_magnitude: {float(original_weight_magnitude)}\n")
         if weight_magnitude is not None:
             f.write(f"weight_magnitude: {float(weight_magnitude)}\n")
-        if edge_res.get("prev_neighbors_to_u_weight_magnitude_source") is not None:
+        if edge_res.get("source_node_raw_value") is not None:
+            f.write(f"source_node_raw_value: {float(edge_res['source_node_raw_value'])}\n")
+        if edge_res.get("source_node_mu_probability") is not None:
+            f.write(f"source_node_mu_probability: {float(edge_res['source_node_mu_probability'])}\n")
+        if edge_res.get("source_node_times_weight_magnitude") is not None:
             f.write(
-                "prev_neighbors_to_u_weight_magnitude_source: "
-                f"{edge_res['prev_neighbors_to_u_weight_magnitude_source']}\n"
+                f"source_node_times_weight_magnitude: "
+                f"{float(edge_res['source_node_times_weight_magnitude'])}\n"
             )
-        if edge_res.get("v_to_out_neighbors_weight_magnitude_source") is not None:
+        if edge_res.get("source_probability_times_node_weight") is not None:
             f.write(
-                "v_to_out_neighbors_weight_magnitude_source: "
-                f"{edge_res['v_to_out_neighbors_weight_magnitude_source']}\n"
+                f"source_probability_times_node_weight: "
+                f"{float(edge_res['source_probability_times_node_weight'])}\n"
             )
+        _write_residual_node_value_block(
+            f,
+            "residual_source_node_values",
+            edge_res.get("residual_source_node_values"),
+        )
         if edge_res.get("v_to_out_neighbors_finite_count") is not None:
             f.write(
                 f"v_to_out_neighbors_finite_count: {int(edge_res['v_to_out_neighbors_finite_count'])}\n"
                 f"v_to_all_out_finite_count: {int(edge_res['v_to_all_out_finite_count'])}\n"
                 f"v_to_all_out_count: {int(edge_res['v_to_all_out_count'])}\n"
             )
-        if neighbor_cost_sum is not None:
-            if prev_cost_sum is not None:
-                f.write(f"top_prev_to_target_sum: {float(prev_cost_sum)}\n")
-            if next_cost_sum is not None:
-                f.write(f"top_next_from_source_sum: {float(next_cost_sum)}\n")
-            f.write(f"top_neighbor_cost_sum: {float(neighbor_cost_sum)}\n")
-            if prev_cost_sum is not None:
-                f.write("top_prev_to_target_nodes:\n")
-                for item in edge_res.get("top_prev_to_target_nodes", []):
-                    f.write(
-                        "  "
-                        f"node_idx={int(item['node_idx'])}, "
-                        f"probability={float(item['probability'])}, "
-                        f"cost_to_target={float(item['cost_to_target'])}, "
-                        f"weighted_cost={float(item['weighted_cost'])}\n"
-                    )
-            if next_cost_sum is not None:
-                f.write("top_next_from_source_nodes:\n")
-                for item in edge_res.get("top_next_from_source_nodes", []):
-                    f.write(
-                        "  "
-                        f"node_idx={int(item['node_idx'])}, "
-                        f"probability={float(item['probability'])}, "
-                        f"cost_from_source={float(item['cost_from_source'])}, "
-                        f"weighted_cost={float(item['weighted_cost'])}\n"
-                    )
         f.write("\n")
 
     points = _PARAMETER_CURVATURE_POINTS.setdefault(log_path, [])
     points.append((seq_idx, curv))
 
-    if metric_score is not None:
-        metric_points = _PARAMETER_METRIC_POINTS.setdefault(log_path, [])
-        metric_points.append(
+    if ot_neighbor_cost_sum is not None:
+        ot_points = _PARAMETER_OT_NEIGHBOR_POINTS.setdefault(log_path, [])
+        ot_points.append(
             (
                 seq_idx,
-                float(metric_score),
-                float("nan") if metric_prev_score is None else float(metric_prev_score),
-                float("nan") if metric_next_score is None else float(metric_next_score),
+                float("nan") if ot_prev_cost_sum is None else float(ot_prev_cost_sum),
+                float("nan") if ot_next_cost_sum is None else float(ot_next_cost_sum),
+                float(ot_neighbor_cost_sum),
                 curv,
             )
         )
 
-    if neighbor_cost_sum is not None:
-        neighbor_points = _PARAMETER_NEIGHBOR_COST_POINTS.setdefault(log_path, [])
-        neighbor_points.append(
-            (
-                seq_idx,
-                float("nan") if prev_cost_sum is None else float(prev_cost_sum),
-                float("nan") if next_cost_sum is None else float(next_cost_sum),
-                float(neighbor_cost_sum),
-                curv,
-            )
-        )
     return log_path
 
 
@@ -336,18 +367,16 @@ def _refresh_parameter_artifacts(log_path):
         return
 
     curvature_points = _PARAMETER_CURVATURE_POINTS.get(log_path)
-    metric_points = _PARAMETER_METRIC_POINTS.get(log_path)
-    neighbor_points = _PARAMETER_NEIGHBOR_COST_POINTS.get(log_path)
+    ot_neighbor_points = _PARAMETER_OT_NEIGHBOR_POINTS.get(log_path)
 
     write_parameter_metric_statistics(
         log_path,
-        metric_points=metric_points,
+        metric_points=ot_neighbor_points,
         curvature_points=curvature_points,
     )
     draw_parameter_curvature(log_path, points=curvature_points)
     draw_parameter_curvature_lpf_comparison(log_path)
-    draw_parameter_metric_curvature_comparison(log_path, points=metric_points)
-    draw_parameter_neighbor_cost_comparison(log_path, points=neighbor_points)
+    draw_parameter_ot_neighbor_cost_comparison(log_path, points=ot_neighbor_points)
 
 
 def _sort_parameter_log_entries(log_path):
@@ -404,25 +433,33 @@ def _read_parameter_curvature_points(log_path):
     return points
 
 
-def _read_parameter_neighbor_cost_points(log_path):
+def _weighted_cost_from_line(line):
+    for part in line.split(","):
+        part = part.strip()
+        if part.startswith("weighted_cost="):
+            return float(part.split("=", 1)[1])
+    return None
+
+
+def _read_parameter_ot_neighbor_points(log_path):
     points = []
     seq_idx = None
     curv = None
     prev_cost_sum = None
     next_cost_sum = None
     neighbor_cost_sum = None
+    active_block = None
 
     def maybe_append():
-        if (
-            seq_idx is not None
-            and curv is not None
-            and neighbor_cost_sum is not None
-        ):
+        total = neighbor_cost_sum
+        if total is None and (prev_cost_sum is not None or next_cost_sum is not None):
+            total = float(prev_cost_sum or 0.0) + float(next_cost_sum or 0.0)
+        if seq_idx is not None and curv is not None and total is not None:
             points.append((
                 seq_idx,
                 float("nan") if prev_cost_sum is None else prev_cost_sum,
                 float("nan") if next_cost_sum is None else next_cost_sum,
-                neighbor_cost_sum,
+                total,
                 curv,
             ))
 
@@ -436,64 +473,45 @@ def _read_parameter_neighbor_cost_points(log_path):
                 prev_cost_sum = None
                 next_cost_sum = None
                 neighbor_cost_sum = None
+                active_block = None
             elif line.startswith("seq_idx:"):
                 seq_idx = int(line.split(":", 1)[1].strip())
+                active_block = None
             elif line.startswith("curv:"):
                 curv = float(line.split(":", 1)[1].strip())
+                active_block = None
             elif line.startswith("top_prev_to_target_sum:"):
                 prev_cost_sum = float(line.split(":", 1)[1].strip())
+                active_block = None
             elif line.startswith("top_next_from_source_sum:"):
                 next_cost_sum = float(line.split(":", 1)[1].strip())
+                active_block = None
             elif line.startswith("top_neighbor_cost_sum:"):
                 neighbor_cost_sum = float(line.split(":", 1)[1].strip())
-
-    maybe_append()
-    points.sort(key=lambda item: item[0])
-    return points
-
-
-def _read_parameter_metric_points(log_path):
-    points = []
-    seq_idx = None
-    curv = None
-    metric_score = None
-    metric_prev_score = None
-    metric_next_score = None
-
-    def maybe_append():
-        if (
-            seq_idx is not None
-            and curv is not None
-            and metric_score is not None
-        ):
-            points.append((
-                seq_idx,
-                metric_score,
-                float("nan") if metric_prev_score is None else metric_prev_score,
-                float("nan") if metric_next_score is None else metric_next_score,
-                curv,
-            ))
-
-    with open(log_path, "r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                maybe_append()
-                seq_idx = None
-                curv = None
-                metric_score = None
-                metric_prev_score = None
-                metric_next_score = None
-            elif line.startswith("seq_idx:"):
-                seq_idx = int(line.split(":", 1)[1].strip())
-            elif line.startswith("curv:"):
-                curv = float(line.split(":", 1)[1].strip())
-            elif line.startswith("metric_score:"):
-                metric_score = float(line.split(":", 1)[1].strip())
-            elif line.startswith("metric_prev_score:"):
-                metric_prev_score = float(line.split(":", 1)[1].strip())
-            elif line.startswith("metric_next_score:"):
-                metric_next_score = float(line.split(":", 1)[1].strip())
+                active_block = None
+            elif line.startswith("ot_prev_score:"):
+                prev_cost_sum = float(line.split(":", 1)[1].strip())
+                active_block = None
+            elif line.startswith("ot_next_score:"):
+                next_cost_sum = float(line.split(":", 1)[1].strip())
+                active_block = None
+            elif line.startswith("ot_neighbor_score:"):
+                neighbor_cost_sum = float(line.split(":", 1)[1].strip())
+                active_block = None
+            elif line == "top_in_neighbors_by_probability_cost_to_target:":
+                active_block = "prev"
+            elif line == "top_out_neighbors_by_probability_cost_from_source:":
+                active_block = "next"
+            elif active_block in {"prev", "next"} and "weighted_cost=" in line:
+                weighted_cost = _weighted_cost_from_line(line)
+                if weighted_cost is None:
+                    continue
+                if active_block == "prev":
+                    prev_cost_sum = float(prev_cost_sum or 0.0) + weighted_cost
+                else:
+                    next_cost_sum = float(next_cost_sum or 0.0) + weighted_cost
+            elif not raw_line.startswith(" "):
+                active_block = None
 
     maybe_append()
     points.sort(key=lambda item: item[0])
@@ -548,9 +566,9 @@ def write_parameter_metric_statistics(log_path, metric_points=None, curvature_po
         return None
 
     if metric_points is None:
-        metric_points = _PARAMETER_METRIC_POINTS.get(log_path)
+        metric_points = _PARAMETER_OT_NEIGHBOR_POINTS.get(log_path)
     if metric_points is None:
-        metric_points = _read_parameter_metric_points(log_path)
+        metric_points = _read_parameter_ot_neighbor_points(log_path)
 
     if curvature_points is None:
         curvature_points = _PARAMETER_CURVATURE_POINTS.get(log_path)
@@ -563,9 +581,9 @@ def write_parameter_metric_statistics(log_path, metric_points=None, curvature_po
     stats_path = os.path.splitext(log_path)[0] + "_statistics.txt"
 
     metric_seq = np.asarray([item[0] for item in metric_points], dtype=np.int64) if metric_points else np.asarray([], dtype=np.int64)
-    metric_total = np.asarray([item[1] for item in metric_points], dtype=np.float64) if metric_points else np.asarray([], dtype=np.float64)
-    metric_prev = np.asarray([item[2] for item in metric_points], dtype=np.float64) if metric_points else np.asarray([], dtype=np.float64)
-    metric_next = np.asarray([item[3] for item in metric_points], dtype=np.float64) if metric_points else np.asarray([], dtype=np.float64)
+    metric_prev = np.asarray([item[1] for item in metric_points], dtype=np.float64) if metric_points else np.asarray([], dtype=np.float64)
+    metric_next = np.asarray([item[2] for item in metric_points], dtype=np.float64) if metric_points else np.asarray([], dtype=np.float64)
+    metric_total = np.asarray([item[3] for item in metric_points], dtype=np.float64) if metric_points else np.asarray([], dtype=np.float64)
     metric_curv = np.asarray([item[4] for item in metric_points], dtype=np.float64) if metric_points else np.asarray([], dtype=np.float64)
     curv_only = np.asarray([item[1] for item in curvature_points], dtype=np.float64) if curvature_points else np.asarray([], dtype=np.float64)
 
@@ -590,12 +608,12 @@ def write_parameter_metric_statistics(log_path, metric_points=None, curvature_po
         f"unique_seq_count: {int(len(np.unique(metric_seq)) if metric_seq.size else 0)}",
     ]
     lines.extend(finite_summary("curvature", curv_only))
-    lines.extend(finite_summary("metric_score", metric_total))
-    lines.extend(finite_summary("metric_prev_score", metric_prev))
-    lines.extend(finite_summary("metric_next_score", metric_next))
-    lines.append(f"pearson_metric_score_curvature: {_safe_pearson(metric_total, metric_curv):.8f}")
-    lines.append(f"pearson_metric_prev_curvature: {_safe_pearson(metric_prev, metric_curv):.8f}")
-    lines.append(f"pearson_metric_next_curvature: {_safe_pearson(metric_next, metric_curv):.8f}")
+    lines.extend(finite_summary("ot_neighbor_score", metric_total))
+    lines.extend(finite_summary("ot_prev_score", metric_prev))
+    lines.extend(finite_summary("ot_next_score", metric_next))
+    lines.append(f"pearson_ot_neighbor_score_curvature: {_safe_pearson(metric_total, metric_curv):.8f}")
+    lines.append(f"pearson_ot_prev_score_curvature: {_safe_pearson(metric_prev, metric_curv):.8f}")
+    lines.append(f"pearson_ot_next_score_curvature: {_safe_pearson(metric_next, metric_curv):.8f}")
 
     with open(stats_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -662,14 +680,14 @@ def draw_parameter_curvature(log_path, points=None):
     return plot_path
 
 
-def draw_parameter_neighbor_cost_comparison(log_path, points=None):
+def draw_parameter_ot_neighbor_cost_comparison(log_path, points=None):
     if log_path is None or not os.path.exists(log_path):
         return None
 
     if points is None:
-        points = _PARAMETER_NEIGHBOR_COST_POINTS.get(log_path)
+        points = _PARAMETER_OT_NEIGHBOR_POINTS.get(log_path)
     if points is None:
-        points = _read_parameter_neighbor_cost_points(log_path)
+        points = _read_parameter_ot_neighbor_points(log_path)
     if not points:
         return None
 
@@ -699,7 +717,7 @@ def draw_parameter_neighbor_cost_comparison(log_path, points=None):
             corr = float(np.corrcoef(finite_total_values, finite_curv)[0, 1])
             corr_text = f", Pearson r={corr:.3f}"
 
-    plot_path = os.path.splitext(log_path)[0] + "_neighbor_cost_curvature_compare.png"
+    plot_path = os.path.splitext(log_path)[0] + "_ot_neighbor_cost_curvature_compare.png"
     fig, (ax_seq, ax_scatter) = plt.subplots(2, 1, figsize=(4.6, 4.8))
 
     if finite_prev.any():
@@ -709,7 +727,7 @@ def draw_parameter_neighbor_cost_comparison(log_path, points=None):
             marker="o",
             linewidth=0.9,
             markersize=1.8,
-            label="prev top10",
+            label="in-to-v score",
         )
     if finite_next.any():
         ax_seq.plot(
@@ -718,7 +736,7 @@ def draw_parameter_neighbor_cost_comparison(log_path, points=None):
             marker="s",
             linewidth=0.9,
             markersize=1.8,
-            label="next top10",
+            label="u-to-out score",
         )
     if finite_total.any():
         ax_seq.plot(
@@ -727,10 +745,10 @@ def draw_parameter_neighbor_cost_comparison(log_path, points=None):
             marker="^",
             linewidth=1.1,
             markersize=2.0,
-            label="sum",
+            label="OT neighbor score",
         )
     ax_seq.set_xlabel("seq id")
-    ax_seq.set_ylabel("top10 prob * cost")
+    ax_seq.set_ylabel("OT neighbor prob * cost")
     ax_seq.grid(True, alpha=0.3)
     ax_seq.legend(fontsize=6, loc="best")
 
@@ -756,111 +774,7 @@ def draw_parameter_neighbor_cost_comparison(log_path, points=None):
 
     if finite_corr.any():
         ax_scatter.scatter(total_sums[finite_corr], curv[finite_corr], s=10, alpha=0.8)
-    ax_scatter.set_xlabel("top10 summed prob * cost")
-    ax_scatter.set_ylabel("curvature")
-    ax_scatter.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=120)
-    plt.close(fig)
-    return plot_path
-
-
-def draw_parameter_metric_curvature_comparison(log_path, points=None):
-    if log_path is None or not os.path.exists(log_path):
-        return None
-
-    if points is None:
-        points = _PARAMETER_METRIC_POINTS.get(log_path)
-    if points is None:
-        points = _read_parameter_metric_points(log_path)
-    if not points:
-        return None
-
-    plt = _get_pyplot(log_path)
-    if plt is None:
-        return None
-
-    ordered_points = sorted(points, key=lambda item: item[0])
-    xs = np.asarray([item[0] for item in ordered_points], dtype=np.int64)
-    metric_score = np.asarray([item[1] for item in ordered_points], dtype=np.float64)
-    metric_prev_score = np.asarray([item[2] for item in ordered_points], dtype=np.float64)
-    metric_next_score = np.asarray([item[3] for item in ordered_points], dtype=np.float64)
-    curv = np.asarray([item[4] for item in ordered_points], dtype=np.float64)
-
-    finite_metric = np.isfinite(metric_score)
-    finite_prev = np.isfinite(metric_prev_score)
-    finite_next = np.isfinite(metric_next_score)
-    finite_corr = finite_metric & np.isfinite(curv)
-    if not (finite_metric.any() or finite_prev.any() or finite_next.any()):
-        return None
-
-    corr_text = ""
-    if finite_corr.sum() > 1:
-        finite_metric_score = metric_score[finite_corr]
-        finite_curv = curv[finite_corr]
-        if np.std(finite_metric_score) > 0 and np.std(finite_curv) > 0:
-            corr = float(np.corrcoef(finite_metric_score, finite_curv)[0, 1])
-            corr_text = f", Pearson r={corr:.3f}"
-
-    plot_path = os.path.splitext(log_path)[0] + "_metric_curvature_compare.png"
-    fig, (ax_seq, ax_scatter) = plt.subplots(2, 1, figsize=(4.6, 4.8))
-
-    if finite_prev.any():
-        ax_seq.plot(
-            xs[finite_prev],
-            metric_prev_score[finite_prev],
-            marker="o",
-            linewidth=0.9,
-            markersize=1.8,
-            label="metric prev",
-        )
-    if finite_next.any():
-        ax_seq.plot(
-            xs[finite_next],
-            metric_next_score[finite_next],
-            marker="s",
-            linewidth=0.9,
-            markersize=1.8,
-            label="metric next",
-        )
-    if finite_metric.any():
-        ax_seq.plot(
-            xs[finite_metric],
-            metric_score[finite_metric],
-            marker="^",
-            linewidth=1.1,
-            markersize=2.0,
-            label="metric sum",
-        )
-    ax_seq.set_xlabel("seq id")
-    ax_seq.set_ylabel("metric score")
-    ax_seq.grid(True, alpha=0.3)
-    ax_seq.legend(fontsize=6, loc="best")
-
-    finite_curv = np.isfinite(curv)
-    if finite_curv.any():
-        ax_curv = ax_seq.twinx()
-        ax_curv.plot(
-            xs[finite_curv],
-            curv[finite_curv],
-            color="tab:red",
-            marker="x",
-            linewidth=0.9,
-            markersize=2.2,
-            label="curvature",
-        )
-        ax_curv.set_ylabel("curvature", color="tab:red")
-        ax_curv.tick_params(axis="y", labelcolor="tab:red")
-
-    ax_seq.set_title(
-        f"{os.path.basename(os.path.dirname(log_path))}{corr_text}",
-        fontsize=8,
-    )
-
-    if finite_corr.any():
-        ax_scatter.scatter(metric_score[finite_corr], curv[finite_corr], s=10, alpha=0.8)
-    ax_scatter.set_xlabel("metric score")
+    ax_scatter.set_xlabel("OT neighbor prob * cost")
     ax_scatter.set_ylabel("curvature")
     ax_scatter.grid(True, alpha=0.3)
 
@@ -943,26 +857,19 @@ def draw_cached_parameter_curvatures(log_root=None):
             drawn_paths.append(plot_path)
         stats_path = write_parameter_metric_statistics(
             log_path,
-            metric_points=_PARAMETER_METRIC_POINTS.get(log_path),
+            metric_points=_PARAMETER_OT_NEIGHBOR_POINTS.get(log_path),
             curvature_points=points,
         )
         if stats_path is not None:
             drawn_paths.append(stats_path)
-        metric_plot_path = draw_parameter_metric_curvature_comparison(
+        ot_plot_path = draw_parameter_ot_neighbor_cost_comparison(
             log_path,
-            points=_PARAMETER_METRIC_POINTS.get(log_path),
+            points=_PARAMETER_OT_NEIGHBOR_POINTS.get(log_path),
         )
-        if metric_plot_path is not None:
-            drawn_paths.append(metric_plot_path)
-        neighbor_plot_path = draw_parameter_neighbor_cost_comparison(
-            log_path,
-            points=_PARAMETER_NEIGHBOR_COST_POINTS.get(log_path),
-        )
-        if neighbor_plot_path is not None:
-            drawn_paths.append(neighbor_plot_path)
+        if ot_plot_path is not None:
+            drawn_paths.append(ot_plot_path)
         _PARAMETER_CURVATURE_POINTS.pop(log_path, None)
-        _PARAMETER_METRIC_POINTS.pop(log_path, None)
-        _PARAMETER_NEIGHBOR_COST_POINTS.pop(log_path, None)
+        _PARAMETER_OT_NEIGHBOR_POINTS.pop(log_path, None)
 
     if root_path is not None and os.path.isdir(root_path):
         for current_root, _, file_names in os.walk(root_path):
@@ -987,15 +894,12 @@ def draw_cached_parameter_curvatures(log_root=None):
                 stats_path = write_parameter_metric_statistics(log_path)
                 if stats_path is not None:
                     drawn_paths.append(stats_path)
-                metric_plot_path = draw_parameter_metric_curvature_comparison(log_path)
-                if metric_plot_path is not None:
-                    drawn_paths.append(metric_plot_path)
+                ot_plot_path = draw_parameter_ot_neighbor_cost_comparison(log_path)
+                if ot_plot_path is not None:
+                    drawn_paths.append(ot_plot_path)
                 lpf_plot_path = draw_parameter_curvature_lpf_comparison(log_path)
                 if lpf_plot_path is not None:
                     drawn_paths.append(lpf_plot_path)
-                neighbor_plot_path = draw_parameter_neighbor_cost_comparison(log_path)
-                if neighbor_plot_path is not None:
-                    drawn_paths.append(neighbor_plot_path)
 
     return drawn_paths
 
@@ -1010,6 +914,7 @@ def append_final_min_curvature_summary(
     curr_dist_infinite_edges,
     cost_has_inf,
     cost_inf_count,
+    sampled_edge_count=None,
     runtime_sec=None,
     beta_stats=None,
 ):
@@ -1019,9 +924,14 @@ def append_final_min_curvature_summary(
         curvature = np.asarray(curvature)
 
     summary = _summarize_curvatures(curvature)
+    finite_entries = int(sampled_edge_count) if sampled_edge_count is not None else summary["finite_count"]
     runtime_sec = float(runtime_sec) if runtime_sec is not None else float("nan")
     beta_stats = beta_stats or {}
     beta_count = int(beta_stats.get("count", 0))
+    beta_expected_count = int(beta_stats.get("expected_count", 0))
+    source_node_zero_count = int(beta_stats.get("source_node_zero_count", 0))
+    target_node_zero_count = int(beta_stats.get("target_node_zero_count", 0))
+    zero_weight_parameter_count = int(beta_stats.get("zero_weight_parameter_count", 0))
     if beta_count > 0:
         beta_mean = float(beta_stats["sum"]) / beta_count
         beta_variance = max(float(beta_stats["sum_sq"]) / beta_count - beta_mean * beta_mean, 0.0)
@@ -1044,7 +954,9 @@ def append_final_min_curvature_summary(
             f"example {int(sample_idx)}: "
             f"curr_dist_finite_edges={int(curr_dist_finite_edges)}, "
             f"curr_dist_infinite_edges={int(curr_dist_infinite_edges)}, "
-            f"finite_entries={summary['finite_count']}, "
+            f"zero_weight_parameters_skipped={zero_weight_parameter_count}, "
+            f"finite_entries={finite_entries}, "
+            f"curvature_finite_entries={summary['finite_count']}, "
             f"positive_edges={summary['positive_count']}, "
             f"negative_edges={summary['negative_count']}, "
             f"zero_edges={summary['zero_count']}, "
@@ -1053,13 +965,16 @@ def append_final_min_curvature_summary(
             f"cost_has_inf={bool(cost_has_inf)}, "
             f"cost_inf_count={int(cost_inf_count)}, "
             f"beta_count={beta_count}, "
+            f"beta_expected_count={beta_expected_count}, "
+            f"source_node_zero_count={source_node_zero_count}, "
+            f"target_node_zero_count={target_node_zero_count}, "
             f"beta_mean={beta_mean:.8f}, "
             f"beta_min={beta_min:.8f}, "
             f"beta_max={beta_max:.8f}, "
             f"beta_variance={beta_variance:.8f}, "
             f"runtime_sec={float(runtime_sec):.6f}, "
             f"min_curv={summary['min_curv']:.8f}, "
-            f"max_curv={summary['max_curv']:.8f}\n"
+            f"max_curv={summary['max_curv']:.8f}\n\n"
         )
 
 

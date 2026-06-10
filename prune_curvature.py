@@ -57,6 +57,7 @@ def _required_layer_cache_names(target_ops, operations, include_prev_down=False,
         rel = GRAPH.get(short, {})
         required.add(short)
         required.update(rel.get("prev", []))
+        required.update(rel.get("residual", []))
         if short not in {"q_proj", "k_proj"}:
             required.update(rel.get("next", []))
     if include_prev_down:
@@ -169,8 +170,8 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
     target_ops = ["q_proj"]
     last_layer_idx = len(layers) - 1
-    layer_start = 1
-    layer_end = last_layer_idx
+    layer_start = 0
+    layer_end = min(last_layer_idx, last_layer_idx)
 
     model.curvature_scores = [{} for _ in range(len(layers))]
     model.curvature_magnitude_fallbacks = [{} for _ in range(len(layers))]
@@ -248,7 +249,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                     if next_prev_layer_outputs is not None:
                         next_prev_layer_outputs[j] = {
                             name: operations[name]
-                            for name in ["o_proj", "gate_up_out", "down_proj"]
+                            for name in ["o_proj", "gate_up_out", "down_proj", "qkv_residual"]
                             if name in operations
                         }
                     next_inps[j].copy_(x_out.squeeze(0))
@@ -316,7 +317,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
                 # prev_* tensors come from layer i-1 and are used as context for layer i curvature.
                 if prev_outputs is not None:
-                    for name in ["o_proj", "gate_up_out", "down_proj"]:
+                    for name in ["o_proj", "gate_up_out", "down_proj", "qkv_residual"]:
                         if name in prev_outputs:
                             operations[f"prev_{name}"] = prev_outputs[name]
 
@@ -326,7 +327,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 if prev_layer_outputs is not None:
                     prev_layer_outputs[j] = {
                         name: operations[name]
-                        for name in ["o_proj", "gate_up_out", "down_proj"]
+                        for name in ["o_proj", "gate_up_out", "down_proj", "qkv_residual"]
                         if name in operations
                     }
 
@@ -342,6 +343,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         include_lm_head=(i == last_layer_idx),
                     )
                     print(f"Building layer cache for: {sorted(required_cache_names)}")
+                    
                     layer_cache = build_layer_cache(
                         model,
                         operations,
