@@ -16,10 +16,10 @@ sample_edge_num=-1
 pp_seqlen="$seq_len 1024"
 calib_data="c4_independent"
 
-curvature_dir="out/llama_8b/unstructured/curvature/residual/"
+curvature_dir="out/llama_8b/unstructured/curvature/noresidual/"
 wanda_dir="out/llama_8b/unstructured/wanda/all_seq_compare/"
 magnitude_dir="out/llama_8b/unstructured/magnitude/all_seq_compare/"
-compare_dir="out/llama_8b/unstructured/per_layer_compare/residual/"
+compare_dir="out/llama_8b/unstructured/per_layer_compare/noresidual/"
 
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 export CUDA_VISIBLE_DEVICES=$cuda_device

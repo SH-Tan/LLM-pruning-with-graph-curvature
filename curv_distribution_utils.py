@@ -309,6 +309,9 @@ def _build_qk_out_node_distribution(
     else:
         # [1, q_heads, seq_q, seq_k] -> [q_heads, seq_q, seq_k]
         A = node.squeeze(0).contiguous()
+    if A.shape[0] == A.shape[2] and A.shape[1] < A.shape[0]:
+        A = A.permute(1, 0, 2).contiguous()
+
     q_heads, seq_q, seq_k = A.shape
     repeat = max(int(repeat), 1)
 
