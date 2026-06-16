@@ -170,8 +170,8 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
     target_ops = ["q_proj"]
     last_layer_idx = len(layers) - 1
-    layer_start = 0
-    layer_end = min(last_layer_idx, last_layer_idx)
+    layer_start = 1
+    layer_end = min(10, last_layer_idx)
 
     model.curvature_scores = [{} for _ in range(len(layers))]
     model.curvature_magnitude_fallbacks = [{} for _ in range(len(layers))]

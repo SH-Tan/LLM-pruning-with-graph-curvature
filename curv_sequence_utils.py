@@ -156,10 +156,24 @@ def _precompute_oproj_prev_distributions(
     l2_norm=False,
     l2_norm_mode="per_example",
     l2_reference=None,
+    attention=None,
+    head_dim=None,
 ):
+    att = None
+    q_heads = None
+    if attention is not None and head_dim is not None:
+        att = torch.as_tensor(attention, dtype=curvature_torch_dtype(), device="cpu").abs()
+        q_heads = torch.div(
+            torch.arange(value_map.shape[0], dtype=torch.long, device="cpu"),
+            int(head_dim),
+            rounding_mode="floor",
+        )
+
     out = []
     for s in range(seq_len):
         masked = masked_oproj_value_map_for_seq(value_map, s, seq_len)
+        if att is not None:
+            masked = masked * att[0, q_heads, s, :seq_len]
         out.append(
             _build_node_distribution(
                 masked,

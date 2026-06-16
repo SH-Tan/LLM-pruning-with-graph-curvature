@@ -120,28 +120,13 @@ def append_qproj_cost_statistics(analysis_path, sample_idx, parameter_cost_stats
     ):
         return
 
-    def fmt(name, stats):
-        if not stats or int(stats.get("count", 0)) <= 0:
-            return f"{name}: unavailable\n"
-        count = int(stats["count"])
-        mean = float(stats["sum"]) / count
-        variance = max(float(stats["sum_sq"]) / count - mean * mean, 0.0)
-        return (
-            f"{name}: "
-            f"count={count}, "
-            f"mean={mean:.8f}, "
-            f"max={float(stats['max']):.8f}, "
-            f"min={float(stats['min']):.8f}, "
-            f"variance={variance:.8f}\n"
-        )
-
     with open(analysis_path, "a", encoding="utf-8") as f:
         f.write(
             "q_proj_cost_statistics:\n"
             f"sample_idx: {int(sample_idx)}\n"
-            + fmt("parameter_cost_1_over_abs_para", parameter_cost_stats)
-            + fmt("old_curr_to_next_cost_before_target_scale", old_cost_stats)
-            + fmt("new_curr_to_next_cost_after_target_scale", new_cost_stats)
+            + _format_stats_line("parameter_cost_1_over_abs_para", parameter_cost_stats)
+            + _format_stats_line("old_curr_to_next_cost_before_target_scale", old_cost_stats)
+            + _format_stats_line("new_curr_to_next_cost_after_target_scale", new_cost_stats)
             + "\n"
         )
 
@@ -182,6 +167,28 @@ def _write_array_block(f, name, value):
     arr = np.asarray(value, dtype=np.float64)
     with np.printoptions(threshold=np.inf, linewidth=200, precision=8, suppress=False):
         f.write(f"{name}: {arr.tolist()}\n")
+
+
+def _format_stats_line(name, stats):
+    if not stats or int(stats.get("count", 0)) <= 0:
+        return f"{name}: unavailable\n"
+    count = int(stats["count"])
+    mean = float(stats["sum"]) / count
+    variance = max(float(stats["sum_sq"]) / count - mean * mean, 0.0)
+    return (
+        f"{name}: "
+        f"count={count}, "
+        f"mean={mean:.8f}, "
+        f"min={float(stats['min']):.8f}, "
+        f"max={float(stats['max']):.8f}, "
+        f"variance={variance:.8f}\n"
+    )
+
+
+def _write_stats_block(f, name, stats):
+    if stats is None:
+        return
+    f.write(_format_stats_line(name, stats))
 
 
 def _write_residual_node_value_block(f, name, values):
@@ -266,13 +273,8 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
     curv = float(edge_res["curv"])
     lpf_curv = edge_res.get("lpf_curv")
     metric_score = edge_res.get("metric_score")
-    metric_prev_score = edge_res.get("metric_prev_score")
-    metric_next_score = edge_res.get("metric_next_score")
     original_weight_magnitude = edge_res.get("original_weight_magnitude")
     weight_magnitude = edge_res.get("weight_magnitude")
-    ot_prev_cost_sum = edge_res.get("ot_prev_score")
-    ot_next_cost_sum = edge_res.get("ot_next_score")
-    ot_neighbor_cost_sum = edge_res.get("ot_neighbor_score")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             f"parameter: u={u_idx}, v={v_idx}\n"
@@ -296,21 +298,15 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
         if edge_res.get("mu_node_weighted_sum_to_u") is not None:
             f.write(f"mu_node_weighted_sum_to_u: {float(edge_res['mu_node_weighted_sum_to_u'])}\n")
         _write_array_block(f, "nu", edge_res.get("nu"))
+        _write_array_block(f, "cost_matrix", edge_res.get("cost_matrix"))
+        _write_stats_block(f, "cost_matrix_statistics", edge_res.get("cost_matrix_stats"))
+        _write_stats_block(f, "q_proj_parameter_cost_1_over_abs_q_statistics", edge_res.get("q_proj_parameter_cost_stats"))
+        _write_stats_block(f, "q_proj_next_cost_1_over_abs_k_matrix_statistics", edge_res.get("q_proj_next_cost_stats"))
         _write_array_block(f, "v_to_out_neighbors_inf_nodes", edge_res.get("v_to_out_neighbors_inf_nodes"))
         if lpf_curv is not None:
             f.write(f"lpf_curv: {float(lpf_curv)}\n")
         if metric_score is not None:
             f.write(f"metric_score: {float(metric_score)}\n")
-        if metric_prev_score is not None:
-            f.write(f"metric_prev_score: {float(metric_prev_score)}\n")
-        if metric_next_score is not None:
-            f.write(f"metric_next_score: {float(metric_next_score)}\n")
-        if ot_prev_cost_sum is not None:
-            f.write(f"ot_prev_score: {float(ot_prev_cost_sum)}\n")
-        if ot_next_cost_sum is not None:
-            f.write(f"ot_next_score: {float(ot_next_cost_sum)}\n")
-        if ot_neighbor_cost_sum is not None:
-            f.write(f"ot_neighbor_score: {float(ot_neighbor_cost_sum)}\n")
         if edge_res.get("emd_error") is not None:
             f.write(f"emd_error: {edge_res['emd_error']}\n")
         if original_weight_magnitude is not None:
@@ -347,14 +343,14 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
     points = _PARAMETER_CURVATURE_POINTS.setdefault(log_path, [])
     points.append((seq_idx, curv))
 
-    if ot_neighbor_cost_sum is not None:
+    if metric_score is not None:
         ot_points = _PARAMETER_OT_NEIGHBOR_POINTS.setdefault(log_path, [])
         ot_points.append(
             (
                 seq_idx,
-                float("nan") if ot_prev_cost_sum is None else float(ot_prev_cost_sum),
-                float("nan") if ot_next_cost_sum is None else float(ot_next_cost_sum),
-                float(ot_neighbor_cost_sum),
+                float("nan"),
+                float("nan"),
+                float(metric_score),
                 curv,
             )
         )
@@ -489,6 +485,9 @@ def _read_parameter_ot_neighbor_points(log_path):
             elif line.startswith("top_neighbor_cost_sum:"):
                 neighbor_cost_sum = float(line.split(":", 1)[1].strip())
                 active_block = None
+            elif line.startswith("metric_score:"):
+                neighbor_cost_sum = float(line.split(":", 1)[1].strip())
+                active_block = None
             elif line.startswith("ot_prev_score:"):
                 prev_cost_sum = float(line.split(":", 1)[1].strip())
                 active_block = None
@@ -608,12 +607,8 @@ def write_parameter_metric_statistics(log_path, metric_points=None, curvature_po
         f"unique_seq_count: {int(len(np.unique(metric_seq)) if metric_seq.size else 0)}",
     ]
     lines.extend(finite_summary("curvature", curv_only))
-    lines.extend(finite_summary("ot_neighbor_score", metric_total))
-    lines.extend(finite_summary("ot_prev_score", metric_prev))
-    lines.extend(finite_summary("ot_next_score", metric_next))
-    lines.append(f"pearson_ot_neighbor_score_curvature: {_safe_pearson(metric_total, metric_curv):.8f}")
-    lines.append(f"pearson_ot_prev_score_curvature: {_safe_pearson(metric_prev, metric_curv):.8f}")
-    lines.append(f"pearson_ot_next_score_curvature: {_safe_pearson(metric_next, metric_curv):.8f}")
+    lines.extend(finite_summary("metric_score", metric_total))
+    lines.append(f"pearson_metric_score_curvature: {_safe_pearson(metric_total, metric_curv):.8f}")
 
     with open(stats_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -717,7 +712,7 @@ def draw_parameter_ot_neighbor_cost_comparison(log_path, points=None):
             corr = float(np.corrcoef(finite_total_values, finite_curv)[0, 1])
             corr_text = f", Pearson r={corr:.3f}"
 
-    plot_path = os.path.splitext(log_path)[0] + "_ot_neighbor_cost_curvature_compare.png"
+    plot_path = os.path.splitext(log_path)[0] + "_metric_score_curvature_compare.png"
     fig, (ax_seq, ax_scatter) = plt.subplots(2, 1, figsize=(4.6, 4.8))
 
     if finite_prev.any():
@@ -745,10 +740,10 @@ def draw_parameter_ot_neighbor_cost_comparison(log_path, points=None):
             marker="^",
             linewidth=1.1,
             markersize=2.0,
-            label="OT neighbor score",
+            label="metric score",
         )
     ax_seq.set_xlabel("seq id")
-    ax_seq.set_ylabel("OT neighbor prob * cost")
+    ax_seq.set_ylabel("metric score")
     ax_seq.grid(True, alpha=0.3)
     ax_seq.legend(fontsize=6, loc="best")
 
@@ -774,7 +769,7 @@ def draw_parameter_ot_neighbor_cost_comparison(log_path, points=None):
 
     if finite_corr.any():
         ax_scatter.scatter(total_sums[finite_corr], curv[finite_corr], s=10, alpha=0.8)
-    ax_scatter.set_xlabel("OT neighbor prob * cost")
+    ax_scatter.set_xlabel("metric score")
     ax_scatter.set_ylabel("curvature")
     ax_scatter.grid(True, alpha=0.3)
 
