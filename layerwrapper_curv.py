@@ -2,6 +2,7 @@ import torch
 import math
 import numpy as np
 import sys
+import os
 
 
 np.set_printoptions(threshold=np.inf)
@@ -111,6 +112,65 @@ def _store_operation(op_bank, name, node, dtype=None):
     op_bank[name] = node # _normalize_node_value_per_sequence(node, name)
 
 
+def _plot_sorted_tensor_distribution(name, tensor, plot_dir):
+    os.makedirs(plot_dir, exist_ok=True)
+    try:
+        os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "matplotlib"))
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        marker_path = os.path.join(plot_dir, "plot_error.txt")
+        with open(marker_path, "w", encoding="utf-8") as f:
+            f.write(f"Could not draw {name} distribution plot: {exc}\n")
+        return
+
+    values = tensor.detach().float().flatten().cpu()
+    sorted_values = torch.sort(values).values.numpy()
+    sorted_abs_values = torch.sort(values.abs()).values.numpy()
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(sorted_values, linewidth=1.0)
+    axes[0].set_title(name)
+    axes[0].set_xlabel("sorted index")
+    axes[0].set_ylabel("value")
+    axes[1].plot(sorted_abs_values, linewidth=1.0)
+    axes[1].set_title(f"{name} abs")
+    axes[1].set_xlabel("sorted index")
+    axes[1].set_ylabel("abs(value)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(plot_dir, f"{name}.png"), dpi=140)
+    plt.close(fig)
+
+
+def _maybe_plot_mlp_gate_distributions(gate, up, act, mlp_hidden, gate_beta):
+    if os.environ.get("CURV_GATE_PLOT_ENABLED") != "1":
+        return
+
+    plot_dir = os.environ.get("CURV_GATE_PLOT_DIR")
+    if not plot_dir:
+        return
+
+    plot_tag = os.environ.get("CURV_GATE_PLOT_TAG")
+    if plot_tag:
+        step_dir = os.path.join(plot_dir, plot_tag)
+    else:
+        plot_idx = getattr(_maybe_plot_mlp_gate_distributions, "_plot_idx", 0)
+        step_dir = os.path.join(plot_dir, f"mlp_gate_{plot_idx:03d}")
+        _maybe_plot_mlp_gate_distributions._plot_idx = plot_idx + 1
+    _plot_sorted_tensor_distribution("gate", gate, step_dir)
+    _plot_sorted_tensor_distribution("up", up, step_dir)
+    _plot_sorted_tensor_distribution("act", act, step_dir)
+    _plot_sorted_tensor_distribution("up_act", mlp_hidden, step_dir)
+    act_up_div_gate = mlp_hidden / gate
+    _plot_sorted_tensor_distribution("act_up_div_gate", act_up_div_gate, step_dir)
+    _plot_sorted_tensor_distribution("gate_beta", gate_beta, step_dir)
+    up_gate_beta = up * gate_beta
+    _plot_sorted_tensor_distribution("up_gate_beta", up_gate_beta, step_dir)
+    del act_up_div_gate
+    del up_gate_beta
+
+
 
 def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer=None, operation_dtype=None):
     operations = {}
@@ -171,7 +231,7 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         x_norm2 = layer.post_attention_layernorm(x_res1)
         
         # ---- residual value for qkv output ----
-        _store_operation(operations, "qkv_residual", x_res1, operation_dtype)
+        # _store_operation(operations, "qkv_residual", x_res1, operation_dtype)
         
         # ---- attention output ----
         _store_operation(operations, "o_proj", x_norm2, operation_dtype)
@@ -181,10 +241,15 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         up = layer.mlp.up_proj(x_norm2)
         act = layer.mlp.act_fn(gate)
         mlp_hidden = act * up
+        gate_beta = torch.sigmoid(gate)
+        # gate_beta = torch.where(gate_beta < 0.4, gate_beta, torch.ones_like(gate_beta))
+        _maybe_plot_mlp_gate_distributions(gate, up, act, mlp_hidden, gate_beta)
+
         down = layer.mlp.down_proj(mlp_hidden)
         x_out = x_res1 + down
         
         _store_operation(operations, "gate_proj", act, operation_dtype)
+        _store_operation(operations, "gate_beta", gate_beta, operation_dtype)
         _store_operation(operations, "up_proj", up, operation_dtype)
         _store_operation(operations, "gate_up_out", mlp_hidden, operation_dtype)
 
@@ -201,7 +266,7 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         del q, k, v, A, attn_output
         del q_linear, k_linear, v_linear
         del attn_context, o, x_res1, x_norm2
-        del gate, up, act, mlp_hidden, down
+        del gate, up, act, gate_beta, mlp_hidden, down
         if next_layer is not None and hasattr(next_layer, "input_layernorm"):
             del next_input, next_input_norm
 

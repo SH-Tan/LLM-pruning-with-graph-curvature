@@ -13,6 +13,8 @@ from prune import (
     prune_scope_from_args,
     score_order_largest,
     select_prune_masks_by_score,
+    should_prune_op,
+    _filter_curvature_scores,
 )
 
 
@@ -89,6 +91,7 @@ def load_curvature_scores_for_layer(
     shared_top_k=None,
     shared_seq_select="top",
     curvature_lpf_window=0,
+    prune_ops=None,
 ):
     pkl_dir = resolve_curvature_pkl_dir(
         base_dir,
@@ -104,7 +107,7 @@ def load_curvature_scores_for_layer(
         return None
 
     _, layer_scores, _ = load_layer_curvature_pkl(pkl_path)
-    return layer_scores
+    return _filter_curvature_scores(layer_scores, prune_ops)
 
 
 def layer_sparsity(model, layer_idx):
@@ -317,6 +320,8 @@ def prune_curvature_layer(
 ):
     group_entries = []
     for op_name, curv in layer_scores.items():
+        if not should_prune_op(args, op_name):
+            continue
         module = _get_prunable_module(model, layer_idx, op_name)
         curv_cpu = align_curvature_to_weight_shape(
             curv,
@@ -505,6 +510,8 @@ def prune_magnitude_layer(
     if prune_n == 0 and scope == "per_layer":
         entries = []
         for name, module in subset.items():
+            if not should_prune_op(args, name):
+                continue
             weight = module.weight.data
             metric = torch.abs(weight)
             candidate_mask = _candidate_mask_from_curvature(layer_curvature_scores, name, weight)
@@ -559,6 +566,8 @@ def prune_magnitude_layer(
         return {"layer_idx": layer_idx, "pruned_params": layer_pruned, "total_params": layer_total}, cutoff
 
     for name, module in subset.items():
+        if not should_prune_op(args, name):
+            continue
         weight = module.weight.data
         metric = torch.abs(weight)
         candidate_mask = _candidate_mask_from_curvature(layer_curvature_scores, name, weight)
@@ -573,7 +582,7 @@ def prune_magnitude_layer(
         eligible_score_count += op_eligible_count
         score_rows.extend(op_score_rows)
         if prune_n != 0:
-            prune_mask = (torch.zeros_like(weight) == 1)
+            prune_mask = torch.zeros_like(weight, dtype=torch.bool)
             selected_scores = []
             for col_idx in range(metric.shape[1]):
                 if col_idx % prune_m != 0:
@@ -657,6 +666,8 @@ def prune_wanda_layer(
     if prune_n == 0 and scope == "per_layer":
         entries = []
         for name, module in subset.items():
+            if not should_prune_op(args, name):
+                continue
             if name not in layer_wanda_scores:
                 raise KeyError(f"Missing precomputed WANDA scores for layer {layer_idx} name {name}")
 
@@ -722,6 +733,8 @@ def prune_wanda_layer(
         return {"layer_idx": layer_idx, "pruned_params": layer_pruned, "total_params": layer_total}, cutoff
 
     for name, module in subset.items():
+        if not should_prune_op(args, name):
+            continue
         if name not in layer_wanda_scores:
             raise KeyError(f"Missing precomputed WANDA scores for layer {layer_idx} name {name}")
 
@@ -747,7 +760,7 @@ def prune_wanda_layer(
         eligible_score_count += op_eligible_count
         score_rows.extend(op_score_rows)
 
-        prune_mask = (torch.zeros_like(metric) == 1)
+        prune_mask = torch.zeros_like(metric, dtype=torch.bool)
         if prune_n != 0:
             selected_scores = []
             for col_idx in range(metric.shape[1]):

@@ -6,6 +6,7 @@ from prune import (
     prune_scope_from_args,
     score_order_largest,
     select_prune_masks_by_score,
+    should_prune_op,
     skip_prune_layer,
 )
 from prune_log_utils import (
@@ -29,6 +30,8 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                 continue
             subset = find_layers(layer)
             for name, module in subset.items():
+                if not should_prune_op(args, name):
+                    continue
                 W = module.weight.data
                 W_metric = torch.abs(W).detach().cpu()
                 candidate_mask = _curvature_candidate_mask(args, model, i, name, W)
@@ -110,6 +113,8 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
         layer_entries = []
         if prune_n == 0 and scope == "per_layer":
             for name, module in subset.items():
+                if not should_prune_op(args, name):
+                    continue
                 W = module.weight.data
                 W_metric = torch.abs(W)
                 candidate_mask = _curvature_candidate_mask(args, model, i, name, W)
@@ -167,12 +172,14 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
             continue
 
         for name in subset:
+            if not should_prune_op(args, name):
+                continue
             W = subset[name].weight.data
             W_metric = torch.abs(W)
             candidate_mask = _curvature_candidate_mask(args, model, i, name, W)
             largest = score_order_largest(args, default=False)
             if prune_n != 0:
-                W_mask = (torch.zeros_like(W) == 1)
+                W_mask = torch.zeros_like(W, dtype=torch.bool)
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
                         tmp = W_metric[:, ii:(ii + prune_m)].float()

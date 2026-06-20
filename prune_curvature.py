@@ -168,10 +168,10 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    target_ops = ["q_proj"]
+    target_ops = ["gate_proj"]
     last_layer_idx = len(layers) - 1
     layer_start = 0
-    layer_end = min(last_layer_idx, last_layer_idx)
+    layer_end = min(6, last_layer_idx)
 
     model.curvature_scores = [{} for _ in range(len(layers))]
     model.curvature_magnitude_fallbacks = [{} for _ in range(len(layers))]
@@ -201,6 +201,17 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
             getattr(args, "curvature_lpf_window", 0),
         )
     curvature_analysis_dir = curvature_pkl_save_dir
+    gate_plot_dir = os.path.join(curvature_save_dir or os.path.dirname(__file__), "plots")
+    prev_gate_plot_enabled = os.environ.get("CURV_GATE_PLOT_ENABLED")
+    prev_gate_plot_dir = os.environ.get("CURV_GATE_PLOT_DIR")
+    prev_gate_plot_tag = os.environ.get("CURV_GATE_PLOT_TAG")
+    os.environ["CURV_GATE_PLOT_ENABLED"] = os.environ.get("CURV_GATE_PLOT_ENABLED", "0")
+    os.environ["CURV_GATE_PLOT_DIR"] = gate_plot_dir
+    collect_layer_data_only = os.environ.get("CURV_COLLECT_LAYER_DATA_ONLY") == "1"
+    if os.environ.get("CURV_GATE_PLOT_ENABLED") == "1" and os.environ.get("CURV_GATE_PLOT_DIR"):
+        print(f"Saving gate distribution plots to {gate_plot_dir}")
+    if collect_layer_data_only:
+        print("Collecting layer data only; skipping curvature calculation.")
     curvature_timing_log_path = getattr(args, "curvature_timing_log_path", None)
     curvature_metadata = _curvature_save_metadata(args)
     raw_curvature_metadata = dict(curvature_metadata)
@@ -235,6 +246,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 next_prev_layer_outputs = [None] * args.nsamples if prev_layer_outputs is not None else None
                 for j in range(args.nsamples):
                     x = inps[j:j + 1].to(model_device, non_blocking=True)
+                    os.environ["CURV_GATE_PLOT_TAG"] = f"layer_{i:03d}/sample_{j:03d}"
                     with torch.no_grad():
                         x_out, operations, _, _, _, _ = collect_layer_data(
                             layer,
@@ -267,15 +279,18 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
             sp_cache = {}
 
             layer_subset = find_layers(layer)
+            layer_target_ops = [short for short in target_ops if short != "lm_head"]
 
             op_modules = {
                 short: next(m for n, m in layer_subset.items() if n.endswith(short))
-                for short in target_ops
+                for short in layer_target_ops
             }
             modules_items = list(op_modules.items())
             has_down_proj_target = "down_proj" in op_modules
 
             for short, module in modules_items:
+                if collect_layer_data_only:
+                    continue
                 W = module.weight
                 module.min_curvature = torch.full(
                     W.shape,
@@ -300,6 +315,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 prev_outputs = prev_layer_outputs[j] if prev_layer_outputs is not None else None
                 next_layer = layers[i + 1] if i < last_layer_idx else None
 
+                os.environ["CURV_GATE_PLOT_TAG"] = f"layer_{i:03d}/sample_{j:03d}"
                 with torch.no_grad():
                     x_out, operations, num_q_heads, num_kv_heads, repeat, head_dim = collect_layer_data(
                         layer,
@@ -334,6 +350,11 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 inps[j].copy_(x_out.squeeze(0))
                 del x_out
                 del prev_outputs
+                if collect_layer_data_only:
+                    del operations, x
+                    if j % 8 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
 
                 if j == 0:
                     required_cache_names = _required_layer_cache_names(
@@ -621,6 +642,13 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 if j % 8 == 0:
                     torch.cuda.empty_cache()
 
+            if collect_layer_data_only:
+                del layer_cache, sp_cache, layer_subset, op_modules, modules_items
+                layer.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
             for short, module in modules_items:
                 if short == "down_proj" and i != last_layer_idx:
                     del module.min_curvature
@@ -675,6 +703,18 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
             if i % 2 == 0:
                 torch.cuda.empty_cache()
     finally:
+        if prev_gate_plot_enabled is None:
+            os.environ.pop("CURV_GATE_PLOT_ENABLED", None)
+        else:
+            os.environ["CURV_GATE_PLOT_ENABLED"] = prev_gate_plot_enabled
+        if prev_gate_plot_dir is None:
+            os.environ.pop("CURV_GATE_PLOT_DIR", None)
+        else:
+            os.environ["CURV_GATE_PLOT_DIR"] = prev_gate_plot_dir
+        if prev_gate_plot_tag is None:
+            os.environ.pop("CURV_GATE_PLOT_TAG", None)
+        else:
+            os.environ["CURV_GATE_PLOT_TAG"] = prev_gate_plot_tag
         model.config.use_cache = use_cache
         if 'inps' in locals():
             del inps

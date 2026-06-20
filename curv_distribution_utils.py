@@ -4,6 +4,8 @@ import os
 
 from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 
+_NEIGHBOR_KEEP_QUANTILE = 0.9
+
 
 def minmax_per_batch_nonzero_nozero(x, eps=1e-4, dim=-1):
     mask = x != 0
@@ -71,6 +73,77 @@ def _min_reduce_blocks(blocks):
     return np.minimum.reduce([np.asarray(b, dtype=curvature_np_dtype()) for b in blocks])
 
 
+def _renormalize_dist_from_scaled_torch(scaled, keep_mask, alpha, eps):
+    weights = torch.exp(-(scaled ** 2)) * keep_mask
+    sum_weights = weights.sum(dim=-1, keepdim=True)
+    dist = torch.where(
+        sum_weights > eps,
+        ((1.0 - alpha) * weights) / sum_weights,
+        torch.zeros_like(weights),
+    )
+    empty_mask = (sum_weights <= eps).expand_as(keep_mask)
+    return torch.where(empty_mask & keep_mask, torch.full_like(dist, -1.0), dist) * keep_mask
+
+
+def _quantile_keep_mask_torch(dist, keep_quantile=_NEIGHBOR_KEEP_QUANTILE):
+    positive = torch.isfinite(dist) & (dist > 0)
+    if keep_quantile <= 0.0 or keep_quantile >= 1.0:
+        return positive
+
+    rows = dist.reshape(-1, dist.shape[-1])
+    positive_rows = positive.reshape_as(rows)
+    keep_rows = torch.zeros_like(positive_rows)
+    row_counts = positive_rows.sum(dim=-1)
+
+    for row_idx in row_counts.nonzero(as_tuple=False).flatten().tolist():
+        row = rows[row_idx]
+        row_positive = row[positive_rows[row_idx]]
+        threshold = torch.quantile(row_positive, keep_quantile)
+        row_keep = positive_rows[row_idx] & (row > threshold)
+        if not bool(row_keep.any()):
+            row_keep = positive_rows[row_idx] & (row == row_positive.max())
+        keep_rows[row_idx] = row_keep
+
+    return keep_rows.reshape_as(dist)
+
+
+def _reduce_distribution_to_top_quantile_torch(scaled, dist, alpha, eps):
+    positive = torch.isfinite(dist) & (dist > 0)
+    if not bool(positive.any()):
+        return dist
+
+    keep_mask = _quantile_keep_mask_torch(dist)
+    reduced = _renormalize_dist_from_scaled_torch(scaled, keep_mask, alpha, eps)
+    row_has_positive = positive.reshape(-1, positive.shape[-1]).any(dim=-1).reshape(*positive.shape[:-1], 1)
+    return torch.where(row_has_positive, reduced, dist)
+
+
+def _renormalize_dist_from_scaled_np(scaled, keep, alpha, eps):
+    weights = np.exp(-(scaled ** 2)) * keep
+    weight_sum = float(weights.sum())
+    if weight_sum > eps:
+        return (((1.0 - alpha) * weights) / weight_sum).astype(curvature_np_dtype(), copy=False)
+
+    dist = np.zeros_like(weights, dtype=curvature_np_dtype())
+    dist[keep] = -1.0
+    return dist
+
+
+def _reduce_distribution_to_top_quantile_np(scaled, dist, alpha, eps, keep_quantile=_NEIGHBOR_KEEP_QUANTILE):
+    positive = np.isfinite(dist) & (dist > 0)
+    if not np.any(positive):
+        return dist.astype(curvature_np_dtype(), copy=False)
+    if keep_quantile <= 0.0 or keep_quantile >= 1.0:
+        keep = positive
+    else:
+        positive_values = dist[positive]
+        threshold = np.quantile(positive_values, keep_quantile)
+        keep = positive & (dist > threshold)
+        if not np.any(keep):
+            keep = positive & (dist == positive_values.max())
+    return _renormalize_dist_from_scaled_np(scaled, keep, alpha, eps)
+
+
 def _build_node_distribution(
     node_tensor,
     node_name,
@@ -119,41 +192,12 @@ def _build_node_distribution(
     dist = torch.where(empty_mask & valid_mask, torch.full_like(dist, -1.0), dist)
 
     dist = dist * valid_mask
-
-    dist_rows = dist.reshape(-1, dist.shape[-1])
-    positive_rows = dist_rows > 0
-    row_nonzero_counts = positive_rows.sum(dim=-1)
-    dense_rows = row_nonzero_counts > 250
-    if dense_rows.any():
-        node_rows = node_tensor.reshape(-1, node_tensor.shape[-1])
-        keep_rows = positive_rows.clone()
-        for row_idx in dense_rows.nonzero(as_tuple=False).flatten().tolist():
-            row = dist_rows[row_idx]
-            keep_count = max(1, int(row_nonzero_counts[row_idx].item() * 0.05))
-            top_idx = torch.topk(row, k=keep_count, largest=True, sorted=False).indices
-            keep_rows[row_idx] = False
-            keep_rows[row_idx, top_idx] = True
-
-        node_rows = torch.where(keep_rows, node_rows, torch.zeros_like(node_rows))
-        node_tensor = node_rows.reshape_as(node_tensor)
-        valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
-        weights = torch.exp(-(node_tensor ** 2)) * valid_mask
-
-        sum_weights = weights.sum(dim=-1, keepdim=True)
-        dist = torch.where(
-            sum_weights > eps,
-            ((1.0 - alpha) * weights) / sum_weights,
-            torch.zeros_like(weights),
-        )
-
-        empty_mask = (sum_weights <= eps).expand_as(valid_mask)
-        dist = torch.where(empty_mask & valid_mask, torch.full_like(dist, -1.0), dist)
-        dist = dist * valid_mask
+    dist = _reduce_distribution_to_top_quantile_torch(node_tensor, dist, alpha, eps)
 
     return dist.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
 
 
-def _build_node_distribution_row_from_values(values, alpha, eps=1e-7):
+def _build_node_distribution_row_from_values(values, alpha, eps=1e-7, apply_neighbor_reduction=True):
     values = np.asarray(values, dtype=curvature_np_dtype()).reshape(-1)
     node_values = np.abs(values)
     valid_raw = np.isfinite(node_values) & (node_values != 0)
@@ -178,22 +222,8 @@ def _build_node_distribution_row_from_values(values, alpha, eps=1e-7):
         dist = np.zeros_like(weights, dtype=curvature_np_dtype())
         dist[valid] = -1.0
 
-    positive = dist > 0
-    positive_count = int(positive.sum())
-    if positive_count > 250:
-        keep_count = max(1, int(positive_count * 0.05))
-        top_idx = np.argpartition(-dist, keep_count - 1)[:keep_count]
-        keep = np.zeros(dist.shape, dtype=bool)
-        keep[top_idx] = True
-        scaled = np.where(keep, scaled, 0.0)
-        valid = np.isfinite(scaled) & (scaled != 0)
-        weights = np.exp(-(scaled ** 2)) * valid
-        weight_sum = float(weights.sum())
-        if weight_sum > eps:
-            dist = ((1.0 - alpha) * weights) / weight_sum
-        else:
-            dist = np.zeros_like(weights, dtype=curvature_np_dtype())
-            dist[valid] = -1.0
+    if apply_neighbor_reduction:
+        dist = _reduce_distribution_to_top_quantile_np(scaled, dist, alpha, eps)
 
     return dist.astype(curvature_np_dtype(), copy=False)
 
@@ -264,6 +294,7 @@ def _build_block_row_node_distribution(
     )
 
     dist = dist * valid_mask
+    dist = _reduce_distribution_to_top_quantile_torch(node_tensor, dist, alpha, eps)
 
     return dist.detach().cpu().numpy().astype(
         curvature_np_dtype(),

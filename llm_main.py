@@ -6,7 +6,9 @@ import numpy as np
 import torch
 from huggingface_hub import login
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import transformers.modeling_utils as transformers_modeling_utils
 
+from cuda_memory_utils import release_cuda_memory
 from llm_main_utils import (
     contains_curvature_pkls,
     curvature_dir,
@@ -19,6 +21,18 @@ from llm_main_utils import (
 from prune import load_curvature_pkls
 from prune_curvature import prune_curvature
 from prune_wanda import compute_wanda_scores
+
+
+def _disable_transformers_allocator_warmup():
+    if getattr(transformers_modeling_utils, "_llm_prune_warmup_disabled", False):
+        return
+
+    def _noop_allocator_warmup(*args, **kwargs):
+        return None
+
+    transformers_modeling_utils.caching_allocator_warmup = _noop_allocator_warmup
+    transformers_modeling_utils._llm_prune_warmup_disabled = True
+
 
 def enable_hf_offline_mode():
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -54,6 +68,8 @@ print("# of gpus: ", torch.cuda.device_count())
 
 def get_llm(model_name, cache_dir="llm_weights", device="cpu", seqlen="1024"):
     print("Loading model:", model_name)
+    _disable_transformers_allocator_warmup()
+    release_cuda_memory()
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -217,6 +233,14 @@ def _build_parser():
         help="Layer indices to skip during all-layer pruning.",
     )
     parser.add_argument(
+        "--prune_ops",
+        type=str,
+        nargs="*",
+        default=None,
+        choices=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"],
+        help="Optional operation names to prune. If omitted, all available prunable ops are used.",
+    )
+    parser.add_argument(
         "--run_pp_eval",
         action="store_true",
         help="Run perplexity evaluation after score/curvature calculation.",
@@ -246,12 +270,16 @@ def _set_seed(seed):
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+    if args.prune_ops is not None:
+        args.prune_ops = tuple(dict.fromkeys(args.prune_ops))
     if args.prunescore_order == "globally":
         args.curvature_prune_scope = "global"
     elif args.prunescore_order == "locally":
         args.curvature_prune_scope = "per_layer"
     elif args.prunescore_order == "per_op":
         args.curvature_prune_scope = "per_layer_op"
+    if args.run_per_layer_eval and args.curvature_prune_scope == "global":
+        parser.error("--run_per_layer_eval supports --prunescore_order locally or per_op, not globally")
 
     sparsity_ratios = resolve_sparsity_ratios(args)
     prune_score_orders = resolve_prune_score_orders(args)
@@ -326,6 +354,7 @@ def main():
                 shared_top_k=args.shared_top_k,
                 shared_seq_select=args.shared_seq_select,
                 curvature_lpf_window=args.curvature_lpf_window,
+                prune_ops=args.prune_ops,
             )
             loaded = sum(len(layer_scores) for layer_scores in model.curvature_scores)
             if loaded > 0:
@@ -340,8 +369,7 @@ def main():
             prune_curvature(args, model, tokenizer, compute_device, prune_n, prune_m)
         base_curvature_scores = model.curvature_scores
         del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        release_cuda_memory()
 
     if args.prune_method == "curvature" and not args.run_pp_eval and not args.run_per_layer_eval:
         print("Skipping PP eval; curvature calculation is complete.")
@@ -355,8 +383,7 @@ def main():
         print(f"precomputing WANDA scores with seqlen={args.seqlen}")
         base_wanda_scores = compute_wanda_scores(args, model, tokenizer, model_device)
         del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        release_cuda_memory()
 
     eval_seq_lens = args.pp_seqlen if len(args.pp_seqlen) >= 1 else [args.seqlen]
 

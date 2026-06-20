@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-import gc
 
+from cuda_memory_utils import release_cuda_memory
 # Import get_loaders function from data module within the same directory
 from data import get_loaders 
 
@@ -25,9 +25,7 @@ def eval_ppl(args, model, tokenizer, device=torch.device("cuda:0")):
     with torch.no_grad():
         ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
     del testloader
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    release_cuda_memory()
     return ppl_test 
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
@@ -78,9 +76,7 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
     ppl = torch.exp(torch.tensor(total_nll / (nsamples * model.seqlen)))
 
     # Empty CUDA cache to save memory
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    release_cuda_memory()
 
     return ppl.item()
 
@@ -130,9 +126,7 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
     ppl = torch.exp(torch.tensor(total_nll / (nsamples * model.seqlen)))
 
     # Empty CUDA cache to save memory
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    release_cuda_memory()
 
     return ppl.item()
 

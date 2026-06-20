@@ -40,10 +40,11 @@ def check_sparsity(model):
         sub_params = 0
         for name in subset:
             W = subset[name].weight.data
-            count += (W==0).sum().item()
+            zero_count = W.numel() - torch.count_nonzero(W).item()
+            count += zero_count
             total_params += W.numel()
 
-            sub_count += (W==0).sum().item()
+            sub_count += zero_count
             sub_params += W.numel()
 
         print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
@@ -223,12 +224,24 @@ def _curvature_seq_tag(shared_top_k=None, shared_seq_select="top", curvature_lpf
     return f"{tag}_pkl"
 
 
+def _filter_curvature_scores(layer_scores, prune_ops=None):
+    if not prune_ops:
+        return layer_scores
+    prune_ops = set(prune_ops)
+    return {
+        op_name: curv
+        for op_name, curv in layer_scores.items()
+        if op_name in prune_ops
+    }
+
+
 def load_curvature_pkls(
     save_dir,
     num_layers,
     shared_top_k=None,
     shared_seq_select="top",
     curvature_lpf_window=0,
+    prune_ops=None,
 ):
     curvature_scores = [{} for _ in range(num_layers)]
     if save_dir is None or not os.path.isdir(save_dir):
@@ -252,7 +265,7 @@ def load_curvature_pkls(
 
         layer_idx, layer_scores, _ = load_layer_curvature_pkl(os.path.join(save_dir, file_name))
         if 0 <= layer_idx < num_layers:
-            curvature_scores[layer_idx] = layer_scores
+            curvature_scores[layer_idx] = _filter_curvature_scores(layer_scores, prune_ops)
 
     return curvature_scores
 
@@ -271,6 +284,7 @@ def _ensure_loaded_curvature_scores(args, model):
         shared_top_k=getattr(args, "shared_top_k", 10),
         shared_seq_select=getattr(args, "shared_seq_select", "top"),
         curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
+        prune_ops=getattr(args, "prune_ops", None),
     )
     loaded = sum(len(layer_scores) for layer_scores in model.curvature_scores)
     print(f"Loaded {loaded} curvature tensors from {load_dir}")
@@ -300,6 +314,14 @@ def _curvature_candidate_mask(args, model, layer_idx, name, weight):
 
 def skip_prune_layer(args, layer_idx):
     return int(layer_idx) in getattr(args, "skip_prune_layer_ids", [])
+
+
+def should_prune_op(args, op_name):
+    prune_ops = getattr(args, "prune_ops", None)
+    if not prune_ops:
+        return True
+    short_name = str(op_name).split(".")[-1]
+    return short_name in prune_ops
 
 
 def prune_scope_from_args(args):

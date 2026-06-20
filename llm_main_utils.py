@@ -2,6 +2,7 @@ import os
 
 import torch
 
+from cuda_memory_utils import release_cuda_memory
 from curv_layer_prune_utils import (
     draw_method_comparison,
     draw_ppl_vs_sparsity,
@@ -129,6 +130,7 @@ def append_eval_run_header(log_file, args, target_ratio, score_order):
             f"l2_norm={args.l2_norm}, "
             f"l2_norm_mode={getattr(args, 'l2_norm_mode', 'per_example')}, "
             f"curvature_prune_scope={getattr(args, 'curvature_prune_scope', 'global')}, "
+            f"prune_ops={','.join(getattr(args, 'prune_ops', None) or ['all'])}, "
             f"shared_top_k={args.shared_top_k}, "
             f"shared_seq_select={args.shared_seq_select}, "
             f"curvature_lpf_window={args.curvature_lpf_window}",
@@ -227,15 +229,19 @@ def resolve_prune_score_orders(args):
 def per_layer_result_tag(args):
     scope = getattr(args, "curvature_prune_scope", "global")
     scope_tag = "local" if scope == "per_layer" else "per_op" if scope == "per_layer_op" else scope
+    prune_ops = getattr(args, "prune_ops", None)
+    op_tag = ""
+    if prune_ops:
+        op_tag = "_" + "-".join(str(op).removesuffix("_proj") for op in prune_ops)
     if args.prune_method != "curvature":
-        return f"{args.prune_method}_{scope_tag}"
+        return f"{args.prune_method}{op_tag}_{scope_tag}"
 
     setting_tag = curvature_seq_tag(
         args.shared_top_k,
         args.shared_seq_select,
         args.curvature_lpf_window,
     ).removesuffix("_pkl")
-    return f"{args.prune_method}_{l2_path_tag(args)}_{setting_tag}_{scope_tag}"
+    return f"{args.prune_method}{op_tag}_{l2_path_tag(args)}_{setting_tag}_{scope_tag}"
 
 
 def pp_result_tag(args):
@@ -331,6 +337,7 @@ def run_per_layer_eval(
                     args.shared_top_k,
                     args.shared_seq_select,
                     args.curvature_lpf_window,
+                    prune_ops=getattr(args, "prune_ops", None),
                 )
             elif args.prune_method == "curvature":
                 layer_curvature_scores = load_curvature_scores_for_layer(
@@ -339,6 +346,7 @@ def run_per_layer_eval(
                     args.shared_top_k,
                     args.shared_seq_select,
                     args.curvature_lpf_window,
+                    prune_ops=getattr(args, "prune_ops", None),
                 )
 
             nonzero_sparsity_idx = 0
@@ -569,8 +577,7 @@ def run_pp_eval(
                         "ppl_test": float(ppl_test),
                     }
                 )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                release_cuda_memory()
 
             if args.save_model:
                 model_save_path = save_model_path(args.save_model, target_ratio, len(sparsity_ratios))
@@ -580,8 +587,7 @@ def run_pp_eval(
                 tokenizer.save_pretrained(model_save_path)
 
             del current_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            release_cuda_memory()
 
             with open(pp_log_path, "a+", encoding="utf-8") as f:
                 print("", file=f, flush=True)

@@ -1,5 +1,5 @@
 import torch
-from prune import align_curvature_to_weight_shape, skip_prune_layer
+from prune import align_curvature_to_weight_shape, should_prune_op, skip_prune_layer
 from prune_log_utils import (
     append_all_layer_pruned_parameter_log,
     collect_pruned_parameter_rows,
@@ -42,6 +42,8 @@ def prune_global_curvature(args, model):
             print(f"Skipping layer {layer_idx}: requested by skip_prune_layer_ids")
             continue
         for op_name, curv in layer_scores.items():
+            if not should_prune_op(args, op_name):
+                continue
             module = _get_prunable_module(model, layer_idx, op_name)
             weight = module.weight.data
             curv_cpu = align_curvature_to_weight_shape(

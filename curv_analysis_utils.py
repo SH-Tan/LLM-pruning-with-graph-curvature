@@ -1,4 +1,5 @@
 import os
+import ast
 import numpy as np
 import torch
 
@@ -6,6 +7,7 @@ import torch
 _AGGREGATE_MARKER = "overall:\n"
 _PARAMETER_CURVATURE_POINTS = {}
 _PARAMETER_OT_NEIGHBOR_POINTS = {}
+_PARAMETER_NEIGHBOR_DISTRIBUTION_POINTS = {}
 _ACTIVE_PARAMETER_LOGS = set()
 _PYPLOT = None
 
@@ -173,6 +175,7 @@ def prepare_parameter_detail_log(log_root, layer_id, short_name, sample_idx, v_i
     _ACTIVE_PARAMETER_LOGS.add(log_path)
     _PARAMETER_CURVATURE_POINTS.pop(log_path, None)
     _PARAMETER_OT_NEIGHBOR_POINTS.pop(log_path, None)
+    _PARAMETER_NEIGHBOR_DISTRIBUTION_POINTS.pop(log_path, None)
     return log_path
 
 
@@ -182,6 +185,14 @@ def _write_array_block(f, name, value):
     arr = np.asarray(value, dtype=np.float64)
     with np.printoptions(threshold=np.inf, linewidth=200, precision=8, suppress=False):
         f.write(f"{name}: {arr.tolist()}\n")
+
+
+def _neighbor_plot_values(edge_res, before_key, reduced_key):
+    values = edge_res.get(before_key)
+    if values is None:
+        values = edge_res.get(reduced_key)
+    arr = np.asarray([] if values is None else values, dtype=np.float64).reshape(-1)
+    return arr[:-1] if arr.size else arr
 
 
 def _write_residual_node_value_block(f, name, values):
@@ -291,10 +302,12 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
         _write_array_block(f, "in_neighbors", edge_res.get("in_neighbors"))
         _write_array_block(f, "out_neighbors", edge_res.get("out_neighbors"))
         _write_out_neighbor_node_value_block(f, edge_res.get("out_neighbor_node_values"))
+        _write_array_block(f, "mu_before_reduction", edge_res.get("mu_before_reduction"))
         _write_array_block(f, "mu", edge_res.get("mu"))
         _write_mu_node_value_block(f, "mu_importance_values", edge_res.get("mu_importance_values"))
         if edge_res.get("mu_node_weighted_sum_to_u") is not None:
             f.write(f"mu_node_weighted_sum_to_u: {float(edge_res['mu_node_weighted_sum_to_u'])}\n")
+        _write_array_block(f, "nu_before_reduction", edge_res.get("nu_before_reduction"))
         _write_array_block(f, "nu", edge_res.get("nu"))
         _write_array_block(f, "v_to_out_neighbors_inf_nodes", edge_res.get("v_to_out_neighbors_inf_nodes"))
         if lpf_curv is not None:
@@ -347,6 +360,13 @@ def append_parameter_detail_log(log_root, layer_id, short_name, edge_res):
     points = _PARAMETER_CURVATURE_POINTS.setdefault(log_path, [])
     points.append((seq_idx, curv))
 
+    neighbor_points = _PARAMETER_NEIGHBOR_DISTRIBUTION_POINTS.setdefault(log_path, [])
+    neighbor_points.append((
+        seq_idx,
+        _neighbor_plot_values(edge_res, "mu_before_reduction", "mu"),
+        _neighbor_plot_values(edge_res, "nu_before_reduction", "nu"),
+    ))
+
     if ot_neighbor_cost_sum is not None:
         ot_points = _PARAMETER_OT_NEIGHBOR_POINTS.setdefault(log_path, [])
         ot_points.append(
@@ -368,6 +388,7 @@ def _refresh_parameter_artifacts(log_path):
 
     curvature_points = _PARAMETER_CURVATURE_POINTS.get(log_path)
     ot_neighbor_points = _PARAMETER_OT_NEIGHBOR_POINTS.get(log_path)
+    neighbor_distribution_points = _PARAMETER_NEIGHBOR_DISTRIBUTION_POINTS.get(log_path)
 
     write_parameter_metric_statistics(
         log_path,
@@ -375,6 +396,7 @@ def _refresh_parameter_artifacts(log_path):
         curvature_points=curvature_points,
     )
     draw_parameter_curvature(log_path, points=curvature_points)
+    draw_parameter_neighbor_distribution(log_path, points=neighbor_distribution_points)
     draw_parameter_curvature_lpf_comparison(log_path)
     draw_parameter_ot_neighbor_cost_comparison(log_path, points=ot_neighbor_points)
 
@@ -548,6 +570,48 @@ def _read_parameter_lpf_points(log_path):
     return points
 
 
+def _read_parameter_neighbor_distribution_points(log_path):
+    points = []
+    seq_idx = None
+    mu_before = None
+    nu_before = None
+    mu = None
+    nu = None
+
+    def maybe_append():
+        mu_source = mu_before if mu_before is not None else mu
+        nu_source = nu_before if nu_before is not None else nu
+        if seq_idx is not None and (mu_source is not None or nu_source is not None):
+            mu_values = np.asarray([] if mu_source is None else mu_source[:-1], dtype=np.float64)
+            nu_values = np.asarray([] if nu_source is None else nu_source[:-1], dtype=np.float64)
+            points.append((seq_idx, mu_values, nu_values))
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                maybe_append()
+                seq_idx = None
+                mu_before = None
+                nu_before = None
+                mu = None
+                nu = None
+            elif line.startswith("seq_idx:"):
+                seq_idx = int(line.split(":", 1)[1].strip())
+            elif line.startswith("mu_before_reduction:"):
+                mu_before = ast.literal_eval(line.split(":", 1)[1].strip())
+            elif line.startswith("nu_before_reduction:"):
+                nu_before = ast.literal_eval(line.split(":", 1)[1].strip())
+            elif line.startswith("mu:"):
+                mu = ast.literal_eval(line.split(":", 1)[1].strip())
+            elif line.startswith("nu:"):
+                nu = ast.literal_eval(line.split(":", 1)[1].strip())
+
+    maybe_append()
+    points.sort(key=lambda item: item[0])
+    return points
+
+
 def _safe_pearson(x, y):
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -676,6 +740,144 @@ def draw_parameter_curvature(log_path, points=None):
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(plot_path, dpi=100)
+    plt.close(fig)
+    return plot_path
+
+
+def _finite_distribution_rows(points, index):
+    rows = []
+    for item in points:
+        arr = np.asarray(item[index], dtype=np.float64).reshape(-1)
+        arr = arr[np.isfinite(arr) & (arr > 0)]
+        if arr.size:
+            rows.append(arr)
+    return rows
+
+
+def _distribution_summary(values):
+    if values.size == 0:
+        return None
+    return {
+        "count": int(values.size),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "mean": float(np.mean(values)),
+        "p10": float(np.percentile(values, 10)),
+        "p50": float(np.percentile(values, 50)),
+        "p90": float(np.percentile(values, 90)),
+    }
+
+
+def _format_distribution_stats(values, label_prefix):
+    stats = _distribution_summary(values)
+    if stats is None:
+        return None
+    return (
+        f"{label_prefix}: n={stats['count']}\n"
+        f"min={stats['min']:.3g}, max={stats['max']:.3g}\n"
+        f"mean={stats['mean']:.3g}, median={stats['p50']:.3g}\n"
+        f"p10={stats['p10']:.3g}, p50={stats['p50']:.3g}, p90={stats['p90']:.3g}"
+    )
+
+
+def _draw_distribution_stats_text(ax, values, label_prefix):
+    text = _format_distribution_stats(values, label_prefix)
+    if text is None:
+        return
+    ax.text(
+        0.02,
+        0.98,
+        text,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=6,
+        bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "none"},
+    )
+
+
+def _representative_distribution_row(rows):
+    if not rows:
+        return None
+    counts = np.asarray([row.size for row in rows], dtype=np.float64)
+    median_count = float(np.median(counts))
+    row_idx = int(np.argmin(np.abs(counts - median_count)))
+    return rows[row_idx]
+
+
+def _draw_single_seq_distribution(ax, rows, title, label_prefix):
+    if not rows:
+        ax.set_title(title, fontsize=8)
+        ax.grid(True, alpha=0.3)
+        return
+
+    values = np.sort(_representative_distribution_row(rows))
+    xs = np.arange(1, values.size + 1)
+    ax.plot(xs, values, linewidth=1.0, color="tab:blue", label="sorted probabilities")
+
+    percentile_lines = (
+        ("min", float(np.min(values)), "tab:gray", "--"),
+        ("p10", float(np.percentile(values, 10)), "tab:gray", "--"),
+        ("p50", float(np.percentile(values, 50)), "tab:red", "-."),
+        ("p90", float(np.percentile(values, 90)), "tab:green", ":"),
+        ("max", float(np.max(values)), "tab:gray", "--"),
+        ("mean", float(np.mean(values)), "tab:orange", "-"),
+        ("median", float(np.median(values)), "tab:purple", ":"),
+    )
+    for name, value, color, linestyle in percentile_lines:
+        ax.axhline(value, linestyle=linestyle, linewidth=0.85, color=color, label=f"{name}={value:.3g}")
+
+    if values.size > 32:
+        ax.set_xscale("log")
+    finite_positive = values[np.isfinite(values) & (values > 0)]
+    if finite_positive.size and float(finite_positive.max() / finite_positive.min()) > 100.0:
+        ax.set_yscale("log")
+
+    ax.set_title(f"{title} (one representative seq, n={values.size})", fontsize=8)
+    ax.set_xlabel("neighbor index sorted small to high")
+    ax.set_ylabel("probability")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=6, loc="best", ncol=2)
+    _draw_distribution_stats_text(ax, values, label_prefix)
+
+
+def draw_parameter_neighbor_distribution(log_path, points=None):
+    if log_path is None or not os.path.exists(log_path):
+        return None
+
+    if points is None:
+        points = _PARAMETER_NEIGHBOR_DISTRIBUTION_POINTS.get(log_path)
+    if points is None:
+        points = _read_parameter_neighbor_distribution_points(log_path)
+    if not points:
+        return None
+
+    mu_rows = _finite_distribution_rows(points, 1)
+    nu_rows = _finite_distribution_rows(points, 2)
+    if not mu_rows and not nu_rows:
+        return None
+
+    plt = _get_pyplot(log_path)
+    if plt is None:
+        return None
+
+    plot_path = os.path.splitext(log_path)[0] + "_neighbor_distribution.png"
+    fig, axes = plt.subplots(2, 1, figsize=(6.4, 5.2))
+    _draw_single_seq_distribution(
+        axes[0],
+        mu_rows,
+        "in-neighbor mu before reduction",
+        "mu",
+    )
+    _draw_single_seq_distribution(
+        axes[1],
+        nu_rows,
+        "out-neighbor nu before reduction",
+        "nu",
+    )
+
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=120)
     plt.close(fig)
     return plot_path
 
@@ -868,8 +1070,15 @@ def draw_cached_parameter_curvatures(log_root=None):
         )
         if ot_plot_path is not None:
             drawn_paths.append(ot_plot_path)
+        neighbor_plot_path = draw_parameter_neighbor_distribution(
+            log_path,
+            points=_PARAMETER_NEIGHBOR_DISTRIBUTION_POINTS.get(log_path),
+        )
+        if neighbor_plot_path is not None:
+            drawn_paths.append(neighbor_plot_path)
         _PARAMETER_CURVATURE_POINTS.pop(log_path, None)
         _PARAMETER_OT_NEIGHBOR_POINTS.pop(log_path, None)
+        _PARAMETER_NEIGHBOR_DISTRIBUTION_POINTS.pop(log_path, None)
 
     if root_path is not None and os.path.isdir(root_path):
         for current_root, _, file_names in os.walk(root_path):
@@ -900,8 +1109,34 @@ def draw_cached_parameter_curvatures(log_root=None):
                 lpf_plot_path = draw_parameter_curvature_lpf_comparison(log_path)
                 if lpf_plot_path is not None:
                     drawn_paths.append(lpf_plot_path)
+                neighbor_plot_path = draw_parameter_neighbor_distribution(log_path)
+                if neighbor_plot_path is not None:
+                    drawn_paths.append(neighbor_plot_path)
 
     return drawn_paths
+
+
+def _format_cost_summary_row(name, stats):
+    if not stats or int(stats.get("count", 0)) <= 0:
+        return (
+            f"{name}: count=0, mean=nan, min=nan, max=nan, "
+            f"variance=nan, median=nan\n"
+        )
+
+    count = int(stats["count"])
+    mean = float(stats["sum"]) / count
+    variance = max(float(stats["sum_sq"]) / count - mean * mean, 0.0)
+    median_count = int(stats.get("median_count", 0))
+    median = float(stats["median_sum"]) / median_count if median_count > 0 else float("nan")
+    return (
+        f"{name}: "
+        f"count={count}, "
+        f"mean={mean:.8f}, "
+        f"min={float(stats['min']):.8f}, "
+        f"max={float(stats['max']):.8f}, "
+        f"variance={variance:.8f}, "
+        f"median={median:.8f}\n"
+    )
 
 
 def append_final_min_curvature_summary(
@@ -917,6 +1152,7 @@ def append_final_min_curvature_summary(
     sampled_edge_count=None,
     runtime_sec=None,
     beta_stats=None,
+    cost_stats=None,
 ):
     if torch.is_tensor(curvature):
         curvature = curvature.detach().cpu().numpy()
@@ -942,6 +1178,10 @@ def append_final_min_curvature_summary(
         beta_variance = float("nan")
         beta_min = float("nan")
         beta_max = float("nan")
+    cost_stats = cost_stats or {}
+    prev_cost_row = _format_cost_summary_row("prev_cost", cost_stats.get("prev"))
+    cur_cost_row = _format_cost_summary_row("cur_cost", cost_stats.get("cur"))
+    next_cost_row = _format_cost_summary_row("next_cost", cost_stats.get("next"))
 
     with open(analysis_path, "r", encoding="utf-8") as f:
         content = _strip_aggregate_footer(f.read())
@@ -964,17 +1204,21 @@ def append_final_min_curvature_summary(
             f"avg_len(nu)={float(avg_nu_len):.8f}, "
             f"cost_has_inf={bool(cost_has_inf)}, "
             f"cost_inf_count={int(cost_inf_count)}, "
-            f"beta_count={beta_count}, "
-            f"beta_expected_count={beta_expected_count}, "
-            f"source_node_zero_count={source_node_zero_count}, "
-            f"target_node_zero_count={target_node_zero_count}, "
-            f"beta_mean={beta_mean:.8f}, "
-            f"beta_min={beta_min:.8f}, "
-            f"beta_max={beta_max:.8f}, "
-            f"beta_variance={beta_variance:.8f}, "
             f"runtime_sec={float(runtime_sec):.6f}, "
             f"min_curv={summary['min_curv']:.8f}, "
-            f"max_curv={summary['max_curv']:.8f}\n\n"
+            f"max_curv={summary['max_curv']:.8f}\n"
+            f"{prev_cost_row}"
+            f"{cur_cost_row}"
+            f"{next_cost_row}"
+            f"beta: "
+            f"count={beta_count}, "
+            f"expected_count={beta_expected_count}, "
+            f"source_node_zero_count={source_node_zero_count}, "
+            f"target_node_zero_count={target_node_zero_count}, "
+            f"mean={beta_mean:.8f}, "
+            f"min={beta_min:.8f}, "
+            f"max={beta_max:.8f}, "
+            f"variance={beta_variance:.8f}\n\n"
         )
 
 

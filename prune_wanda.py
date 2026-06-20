@@ -1,5 +1,6 @@
 import torch
 
+from cuda_memory_utils import release_cuda_memory
 from data_c4 import get_loaders_c4
 from layerwrapper import WrappedGPT
 from prune import (
@@ -9,6 +10,7 @@ from prune import (
     prune_scope_from_args,
     score_order_largest,
     select_prune_masks_by_score,
+    should_prune_op,
     skip_prune_layer,
 )
 from prune_log_utils import (
@@ -53,6 +55,11 @@ def compute_wanda_scores(args, model, tokenizer, device=torch.device("cuda:0")):
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
+        subset = {
+            name: module
+            for name, module in subset.items()
+            if should_prune_op(args, name)
+        }
 
         if hasattr(model, "hf_device_map") and (f"model.layers.{i}" in model.hf_device_map):
             dev = model.hf_device_map[f"model.layers.{i}"]
@@ -84,6 +91,7 @@ def compute_wanda_scores(args, model, tokenizer, device=torch.device("cuda:0")):
                     position_ids=position_ids,
                     position_embeddings=(cos, sin),
                 )[0]
+                del cos, sin
 
         for h in handles:
             h.remove()
@@ -93,16 +101,17 @@ def compute_wanda_scores(args, model, tokenizer, device=torch.device("cuda:0")):
             weight_cpu = subset[name].weight.detach().cpu()
             scaler_cpu = wrapped_layers[name].scaler_row.detach().cpu()
             W_metric = torch.abs(weight_cpu) * torch.sqrt(scaler_cpu.reshape((1, -1)))
-            model.wanda_scores[i][name] = W_metric.clone()
+            model.wanda_scores[i][name] = W_metric
             del weight_cpu, scaler_cpu
-            del W_metric
 
         inps, outs = outs, inps
         del wrapped_layers, handles
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     model.config.use_cache = use_cache
-    del inps, outs
-    torch.cuda.empty_cache()
+    del inps, outs, attention_mask, position_ids
+    release_cuda_memory()
     return model.wanda_scores
 
 
@@ -121,6 +130,8 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
             subset = find_layers(layer)
             layer_scores = wanda_scores[i] if i < len(wanda_scores) else {}
             for name, module in subset.items():
+                if not should_prune_op(args, name):
+                    continue
                 print(f"pruning layer {i} name {name}")
                 if name not in layer_scores:
                     raise KeyError(f"Missing precomputed WANDA scores for layer {i} name {name}")
@@ -216,6 +227,8 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
         if prune_n == 0 and not args.use_variant and scope == "per_layer":
             layer_entries = []
             for name, module in subset.items():
+                if not should_prune_op(args, name):
+                    continue
                 print(f"pruning layer {i} name {name}")
                 if name not in layer_scores:
                     raise KeyError(f"Missing precomputed WANDA scores for layer {i} name {name}")
@@ -288,6 +301,8 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
             continue
 
         for name in subset:
+            if not should_prune_op(args, name):
+                continue
             print(f"pruning layer {i} name {name}")
             if name not in layer_scores:
                 raise KeyError(f"Missing precomputed WANDA scores for layer {i} name {name}")
@@ -304,7 +319,7 @@ def _apply_wanda_scores(args, model, wanda_scores, prune_n=0, prune_m=0):
             if candidate_mask is not None:
                 candidate_mask = candidate_mask.cpu()
 
-            W_mask = (torch.zeros_like(W_metric) == 1)
+            W_mask = torch.zeros_like(W_metric, dtype=torch.bool)
             if prune_n != 0:
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
