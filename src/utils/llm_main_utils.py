@@ -5,16 +5,16 @@ import subprocess
 
 import torch
 
-from cuda_memory_utils import release_cuda_memory
-from curv_layer_prune_utils import (
+from utils.cuda_memory_utils import release_cuda_memory
+from pruning.curv_layer_prune_utils import (
     draw_method_comparison,
     draw_ppl_vs_sparsity,
     prune_scoped_curvature,
     save_eval_records_csv,
 )
-from curv_prune_utils import prune_global_curvature
-from eval import eval_ppl
-from per_layer_eval_utils import (
+from pruning.curv_prune_utils import prune_global_curvature
+from evaluation.eval import eval_ppl
+from pruning.per_layer_eval_utils import (
     draw_per_layer_method_comparison,
     draw_per_layer_ppl_vs_sparsity,
     layer_sparsity,
@@ -25,9 +25,9 @@ from per_layer_eval_utils import (
     prune_wanda_layer,
     save_per_layer_records_csv,
 )
-from prune import check_sparsity
-from prune_magnitude import prune_magnitude
-from prune_wanda import prune_wanda
+from pruning.prune import check_sparsity
+from pruning.prune_magnitude import prune_magnitude
+from pruning.prune_wanda import prune_wanda
 
 
 def l2_path_tag(args):

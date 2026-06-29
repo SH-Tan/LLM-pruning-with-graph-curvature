@@ -2,7 +2,7 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-from curv_dtype_utils import curvature_np_dtype
+from curvature_utils.curv_dtype_utils import curvature_np_dtype
 
 
 def _to_shared_numpy(arr: np.ndarray):

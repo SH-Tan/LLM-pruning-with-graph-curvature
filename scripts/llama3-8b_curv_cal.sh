@@ -46,7 +46,7 @@ run_curvature_calculation() {
     fi
 
     echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select, lpf_window=$curvature_lpf_window, mlp_activation=$mlp_activation"
-    "$python_bin" llm_main.py \
+    "$python_bin" src/llm_main.py \
         --model $model \
         --prune_method curvature \
         --sparsity_ratio $curv_sparsity_ratios \

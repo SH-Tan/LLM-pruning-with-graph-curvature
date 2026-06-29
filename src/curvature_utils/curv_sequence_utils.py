@@ -1,7 +1,7 @@
 import torch
 
-from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
-from curv_distribution_utils import _build_node_distribution
+from curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
+from curvature_utils.curv_distribution_utils import _build_node_distribution
 
 
 def _build_vproj_to_att_out_value_map(

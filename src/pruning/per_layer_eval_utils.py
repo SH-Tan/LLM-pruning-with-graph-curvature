@@ -5,8 +5,8 @@ import os
 import numpy as np
 import torch
 
-from curv_prune_utils import _get_prunable_module
-from prune import (
+from pruning.curv_prune_utils import _get_prunable_module
+from pruning.prune import (
     align_curvature_to_weight_shape,
     find_layers,
     load_layer_curvature_pkl,

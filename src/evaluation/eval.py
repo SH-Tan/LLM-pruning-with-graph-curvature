@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 
-from cuda_memory_utils import release_cuda_memory
+from utils.cuda_memory_utils import release_cuda_memory
 # Import get_loaders function from data module within the same directory
-from data import get_loaders 
+from data_loaders.data import get_loaders 
 
 import fnmatch
 

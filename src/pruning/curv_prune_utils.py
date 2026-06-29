@@ -1,6 +1,6 @@
 import torch
-from prune import align_curvature_to_weight_shape, should_prune_op, skip_prune_layer
-from prune_log_utils import (
+from pruning.prune import align_curvature_to_weight_shape, should_prune_op, skip_prune_layer
+from pruning.prune_log_utils import (
     append_all_layer_pruned_parameter_log,
     collect_pruned_parameter_rows,
 )

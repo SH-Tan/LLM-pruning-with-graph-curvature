@@ -58,7 +58,8 @@ print(model)
 
 model_n = model_name.split('/')[1]
 
-with open(model_n + ".txt", "w+") as f:
+os.makedirs("model_architectures", exist_ok=True)
+with open(os.path.join("model_architectures", model_n + ".txt"), "w+") as f:
     # traced = fx.symbolic_trace(model.model.layers[0])
     layer = model.model.layers[0]
     f.write("\n===== execution order =====\n")

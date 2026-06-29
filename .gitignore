@@ -275,6 +275,8 @@ Lidar/*.txt
 curv_analysis/
 curv_pkl/
 *.txt
+model_architectures/
+model_architectures/*.txt
 *.ipynb
 out/
 .codex

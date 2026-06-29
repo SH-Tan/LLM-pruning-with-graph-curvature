@@ -1,6 +1,6 @@
 import numpy as np
 
-from curv_dtype_utils import curvature_np_dtype
+from curvature_utils.curv_dtype_utils import curvature_np_dtype
 
 
 def sliding_median_low_pass(values, window_size=5):

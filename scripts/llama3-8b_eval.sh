@@ -2,7 +2,7 @@
 set -e
 
 # PPL eval from saved curvature PKLs for Llama-3-8B.
-# Uses the Transformers model path in llm_main.py; no downstream/vLLM eval.
+# Uses the Transformers model path in src/llm_main.py; no downstream/vLLM eval.
 model="${MODEL:-meta-llama/Meta-Llama-3-8B}"
 python_bin="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
 sparsity_ratios="${SPARSITY_RATIOS:-0 0.3 0.4 0.5 0.6 0.7 0.9 1}"
@@ -41,7 +41,7 @@ run_python_command() {
     prune_score_order=$4
     eval_flag=$5
 
-    "$python_bin" llm_main.py \
+    "$python_bin" src/llm_main.py \
         --model $model \
         --prune_method $prune_method \
         --sparsity_ratio $sparsity_ratios \

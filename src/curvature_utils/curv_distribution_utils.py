@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import os
 
-from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
+from curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 
 _NEIGHBOR_KEEP_QUANTILE = 0.9
 

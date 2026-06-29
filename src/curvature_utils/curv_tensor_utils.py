@@ -1,13 +1,13 @@
 import numpy as np
 import os
 import torch
-from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
-from layerwrapper_curv import (
+from curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
+from curvature_utils.layerwrapper_curv import (
     _reshape_for_heads,
     _repeat_kv,
 )
 
-from curv_model_utils import _operation_distance_matrix_torch
+from curvature_utils.curv_model_utils import _operation_distance_matrix_torch
 
 
 _DEBUG_LOG_DIR = os.path.join(os.path.dirname(__file__), "cost_inf_debug")

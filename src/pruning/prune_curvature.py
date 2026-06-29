@@ -3,15 +3,15 @@ import time
 
 import torch
 
-import curv_analysis_utils as analysis_utils
-from curv_dtype_utils import curvature_torch_dtype, set_curvature_dtype
-from cal_curvature import compute_op_curvature
-from curv_shortest_path_utils import build_shortest_path_cache
-from curv_tensor_utils import build_layer_cache
-from data_c4 import get_loaders_c4
-from graph_relation import GRAPH
-from layerwrapper_curv import collect_layer_data, _make_lm_head_op
-from prune import (
+import curvature_utils.curv_analysis_utils as analysis_utils
+from curvature_utils.curv_dtype_utils import curvature_torch_dtype, set_curvature_dtype
+from curvature_utils.cal_curvature import compute_op_curvature
+from curvature_utils.curv_shortest_path_utils import build_shortest_path_cache
+from curvature_utils.curv_tensor_utils import build_layer_cache
+from data_loaders.data_c4 import get_loaders_c4
+from curvature_utils.graph_relation import GRAPH
+from curvature_utils.layerwrapper_curv import collect_layer_data, _make_lm_head_op
+from pruning.prune import (
     align_curvature_to_weight_shape,
     find_layers,
     prepare_calibration_input,
@@ -331,7 +331,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
                 print("Finish getting layer data!!!")
 
-                # prev_* tensors come from layer i-1 and are used as context for layer i curvature.
+                # prev_* tensors come from layer i-1 and are used as context for layer i curvature_utils.
                 if prev_outputs is not None:
                     for name in ["o_proj", "gate_up_out", "down_proj", "qkv_residual"]:
                         if name in prev_outputs:

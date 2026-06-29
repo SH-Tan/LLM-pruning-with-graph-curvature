@@ -1155,7 +1155,7 @@ def append_final_min_curvature_summary(
     cost_stats=None,
 ):
     if torch.is_tensor(curvature):
-        curvature = curvature.detach().cpu().numpy()
+        curvature = curvature_utils.detach().cpu().numpy()
     else:
         curvature = np.asarray(curvature)
 
@@ -1224,7 +1224,7 @@ def append_final_min_curvature_summary(
 
 def append_final_curvature_overall(layer_id, short_name, curvature, seq_len, dataset_name, analysis_dir=None):
     if torch.is_tensor(curvature):
-        curvature = curvature.detach().cpu().numpy()
+        curvature = curvature_utils.detach().cpu().numpy()
     else:
         curvature = np.asarray(curvature)
 
@@ -1240,7 +1240,7 @@ def append_final_curvature_overall(layer_id, short_name, curvature, seq_len, dat
             f"layer_id: {int(layer_id)}\n"
             f"op_name: {short_name}\n"
             f"dataset_name: {dataset_name}\n"
-            f"curvature_shape: {tuple(curvature.shape)}\n"
+            f"curvature_shape: {tuple(curvature_utils.shape)}\n"
             f"seq_len: {int(seq_len)}\n"
             "\n"
         )

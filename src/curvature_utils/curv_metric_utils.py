@@ -1,6 +1,6 @@
 import numpy as np
 
-from curv_dtype_utils import curvature_np_dtype
+from curvature_utils.curv_dtype_utils import curvature_np_dtype
 
 _SHARED_PREV_SCORE = None
 _SHARED_NEXT_SCORE = None

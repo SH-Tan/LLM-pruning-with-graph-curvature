@@ -60,7 +60,7 @@ run_python_command() {
         fi
     fi
 
-    "$python_bin" llm_main.py \
+    "$python_bin" src/llm_main.py \
         --model $model \
         --prune_method $prune_method \
         --sparsity_ratio $sparsity_ratios \

@@ -1,9 +1,9 @@
 import torch
 
-from cuda_memory_utils import release_cuda_memory
-from data_c4 import get_loaders_c4
-from layerwrapper import WrappedGPT
-from prune import (
+from utils.cuda_memory_utils import release_cuda_memory
+from data_loaders.data_c4 import get_loaders_c4
+from pruning.layerwrapper import WrappedGPT
+from pruning.prune import (
     find_layers,
     prepare_calibration_input,
     _curvature_candidate_mask,
@@ -13,7 +13,7 @@ from prune import (
     should_prune_op,
     skip_prune_layer,
 )
-from prune_log_utils import (
+from pruning.prune_log_utils import (
     append_all_layer_pruned_parameter_log,
     append_layer_pruned_parameter_log,
     collect_pruned_parameter_rows,

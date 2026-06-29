@@ -29,7 +29,7 @@ export CURV_COLLECT_LAYER_DATA_ONLY=1
 export CURV_GATE_PLOT_MAX_POINTS="${CURV_GATE_PLOT_MAX_POINTS:-200000}"
 
 echo "Running gate plot only: model=$model, nsamples=$nsamples, seq_len=$seq_len"
-"$python_bin" llm_main.py \
+"$python_bin" src/llm_main.py \
     --model $model \
     --prune_method curvature \
     --sparsity_ratio $sparsity_ratios \

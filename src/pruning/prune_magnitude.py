@@ -1,6 +1,6 @@
 import torch
 
-from prune import (
+from pruning.prune import (
     find_layers,
     _curvature_candidate_mask,
     prune_scope_from_args,
@@ -9,7 +9,7 @@ from prune import (
     should_prune_op,
     skip_prune_layer,
 )
-from prune_log_utils import (
+from pruning.prune_log_utils import (
     append_all_layer_pruned_parameter_log,
     append_layer_pruned_parameter_log,
     collect_pruned_parameter_rows,

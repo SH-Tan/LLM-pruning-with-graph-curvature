@@ -1,10 +1,10 @@
 import torch
 import numpy as np
 
-from curv_dtype_utils import curvature_torch_dtype
-from graph_relation import _resolve_graph_sets
-from curv_distribution_utils import _min_reduce_blocks
-from curv_tensor_utils import (
+from curvature_utils.curv_dtype_utils import curvature_torch_dtype
+from curvature_utils.graph_relation import _resolve_graph_sets
+from curvature_utils.curv_distribution_utils import _min_reduce_blocks
+from curvature_utils.curv_tensor_utils import (
     _all_cost_matrices,
     _get_matrix_torch,
     _get_qk_next_cost,

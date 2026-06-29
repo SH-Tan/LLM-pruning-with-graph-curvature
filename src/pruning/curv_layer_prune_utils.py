@@ -5,9 +5,9 @@ import os
 import numpy as np
 import torch
 
-from prune import align_curvature_to_weight_shape, should_prune_op, skip_prune_layer
-from curv_prune_utils import _get_prunable_module, _is_magnitude_fallback
-from prune_log_utils import append_layer_pruned_parameter_log, collect_pruned_parameter_rows
+from pruning.prune import align_curvature_to_weight_shape, should_prune_op, skip_prune_layer
+from pruning.curv_prune_utils import _get_prunable_module, _is_magnitude_fallback
+from pruning.prune_log_utils import append_layer_pruned_parameter_log, collect_pruned_parameter_rows
 
 
 def _curvature_score_order(args):

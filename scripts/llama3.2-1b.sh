@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=$cuda_device
 
 # Define function to run python command
 run_python_command () {
-    python llm_main.py \
+    python src/llm_main.py \
     --model $model \
     --prune_method $1 \
     --sparsity_ratio $2 \

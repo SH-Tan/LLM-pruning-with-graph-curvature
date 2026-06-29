@@ -9,8 +9,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.activations import ACT2FN
 import transformers.modeling_utils as transformers_modeling_utils
 
-from cuda_memory_utils import release_cuda_memory
-from llm_main_utils import (
+from utils.cuda_memory_utils import release_cuda_memory
+from utils.llm_main_utils import (
     contains_curvature_pkls,
     curvature_dir,
     log_path,
@@ -19,9 +19,9 @@ from llm_main_utils import (
     run_per_layer_eval,
     run_pp_eval,
 )
-from prune import load_curvature_pkls
-from prune_curvature import prune_curvature
-from prune_wanda import compute_wanda_scores
+from pruning.prune import load_curvature_pkls
+from pruning.prune_curvature import prune_curvature
+from pruning.prune_wanda import compute_wanda_scores
 
 
 def _disable_transformers_allocator_warmup():

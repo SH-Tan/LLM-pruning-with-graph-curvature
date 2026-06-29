@@ -3,10 +3,10 @@ import torch
 import ot
 import os
 
-import curv_analysis_utils as analysis_utils
-from curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
-from curv_filter_utils import sliding_median_low_pass
-from curv_distribution_utils import (
+import curvature_utils.curv_analysis_utils as analysis_utils
+from curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
+from curvature_utils.curv_filter_utils import sliding_median_low_pass
+from curvature_utils.curv_distribution_utils import (
     _build_node_distribution,
     _build_node_distribution_row_from_values,
     _build_qk_out_node_distribution,
@@ -14,7 +14,7 @@ from curv_distribution_utils import (
     _min_reduce_blocks,
 )
 
-from curv_sequence_utils import (
+from curvature_utils.curv_sequence_utils import (
     _build_att_out_to_o_cost,
     _build_oproj_to_att_in_value_map,
     _build_vproj_to_att_out_cost,
@@ -22,10 +22,10 @@ from curv_sequence_utils import (
     _precompute_oproj_prev_distributions,
     _precompute_vproj_next_distributions,
 )
-from curv_shortest_path_utils import build_shortest_path_cache
-from curv_shared_utils import _from_shared_numpy, _to_shared_numpy, _load_worker_seq_distribution, _to_shared_seq_metas
-import curv_metric_utils as metric_utils
-from curv_tensor_utils import _build_v_to_att_out_template, _build_x_to_out_cost
+from curvature_utils.curv_shortest_path_utils import build_shortest_path_cache
+from curvature_utils.curv_shared_utils import _from_shared_numpy, _to_shared_numpy, _load_worker_seq_distribution, _to_shared_seq_metas
+import curvature_utils.curv_metric_utils as metric_utils
+from curvature_utils.curv_tensor_utils import _build_v_to_att_out_template, _build_x_to_out_cost
 
 from multiprocessing import get_context
 import multiprocessing as mp
@@ -1470,7 +1470,7 @@ def compute_op_curvature(
         layer_id=layer_id,
         short_name=short_name,
         sample_idx=sample_idx,
-        curvature_shape=curvature.shape,
+        curvature_shape=curvature_utils.shape,
         seq_len=seq_len,
         dataset_name=dataset_name,
         analysis_dir=analysis_dir,

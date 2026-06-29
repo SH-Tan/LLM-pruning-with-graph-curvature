@@ -1,4 +1,4 @@
-from curv_distribution_utils import _resolve_node_name
+from curvature_utils.curv_distribution_utils import _resolve_node_name
 
 GRAPH = {
     "prev_down_proj": {"layer": 0, "prev": ["prev_up_proj", "prev_gate_proj"], "next": ["v_proj"], "prev_in": ["prev_o_proj"], "next_out": ["v_proj"]},

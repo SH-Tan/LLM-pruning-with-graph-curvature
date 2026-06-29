@@ -1,6 +1,6 @@
 import torch
 
-from curv_dtype_utils import curvature_torch_dtype
+from curvature_utils.curv_dtype_utils import curvature_torch_dtype
 
 def _weight_from_model(model, short_name, layer_id, device=None):
     if short_name.startswith("prev_"):
