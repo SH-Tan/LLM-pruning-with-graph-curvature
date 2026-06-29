@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from huggingface_hub import login
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.activations import ACT2FN
 import transformers.modeling_utils as transformers_modeling_utils
 
 from cuda_memory_utils import release_cuda_memory
@@ -66,15 +67,47 @@ safe_hf_login(os.environ.get("HF_TOKEN"))
 print("# of gpus: ", torch.cuda.device_count())
 
 
-def get_llm(model_name, cache_dir="llm_weights", device="cpu", seqlen="1024"):
+def _model_torch_dtype(dtype_name):
+    if dtype_name == "auto":
+        return "auto"
+    if dtype_name == "float16":
+        return torch.float16
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    if dtype_name == "float32":
+        return torch.float32
+    raise ValueError(f"Unsupported model_dtype: {dtype_name}")
+
+
+def _set_mlp_activation(model, activation_name):
+    if activation_name == "model":
+        return
+
+    act_fn = ACT2FN[activation_name]
+    for layer in model.model.layers:
+        layer.mlp.act_fn = act_fn
+    model.config.hidden_act = activation_name
+    print(f"Using MLP gate activation: {activation_name}")
+
+
+def get_llm(
+    model_name,
+    cache_dir="llm_weights",
+    device="cpu",
+    seqlen="1024",
+    model_dtype="auto",
+    mlp_activation="model",
+):
     print("Loading model:", model_name)
     _disable_transformers_allocator_warmup()
     release_cuda_memory()
+    torch_dtype = _model_torch_dtype(model_dtype)
+    print(f"Loading model with dtype={model_dtype}")
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.float16,
+            dtype=torch_dtype,
             cache_dir=cache_dir,
             low_cpu_mem_usage=True,
             device_map=device,
@@ -86,7 +119,7 @@ def get_llm(model_name, cache_dir="llm_weights", device="cpu", seqlen="1024"):
         print(f"Falling back to local cached model files: {exc}")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.float16,
+            dtype=torch_dtype,
             cache_dir=cache_dir,
             low_cpu_mem_usage=True,
             device_map=device,
@@ -98,6 +131,7 @@ def get_llm(model_name, cache_dir="llm_weights", device="cpu", seqlen="1024"):
     else:
         print("Model loaded with device_map, but hf_device_map not directly accessible")
 
+    _set_mlp_activation(model, mlp_activation)
     model.seqlen = seqlen
     return model
 
@@ -133,6 +167,20 @@ def _build_parser():
         help="Order used when sweeping multiple sparsity ratios.",
     )
     parser.add_argument("--cache_dir", default="llm_weights", type=str)
+    parser.add_argument(
+        "--model_dtype",
+        type=str,
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+        help="Torch dtype used when loading the model; auto follows the checkpoint config.",
+    )
+    parser.add_argument(
+        "--mlp_activation",
+        type=str,
+        choices=["model", "relu"],
+        default="model",
+        help="Override the model MLP gate activation; model keeps the checkpoint default.",
+    )
     parser.add_argument("--save", type=str, default=None, help="Path to save results.")
     parser.add_argument("--save_model", type=str, default=None, help="Path to save the pruned model.")
     parser.add_argument("--model_device", type=str, default="cuda:0", help="Device for model load.")
@@ -194,7 +242,7 @@ def _build_parser():
         "--curvature_dtype",
         type=str,
         choices=["float32", "float64"],
-        default="float64",
+        default="float32",
         help="Floating-point precision used for curvature distance/distribution computation.",
     )
     parser.add_argument(
@@ -254,6 +302,43 @@ def _build_parser():
         help="Perplexity eval sequence lengths, e.g. --pp_seqlen 32 128 256.",
     )
     parser.add_argument("--eval_zero_shot", type=int, default=0, help="evaluate on downsteam zero shot tasks")
+    parser.add_argument(
+        "--run_downstream_eval",
+        action="store_true",
+        help="Run vLLM downstream accuracy after PPL for each pruned sparsity checkpoint.",
+    )
+    parser.add_argument(
+        "--downstream_only",
+        action="store_true",
+        help="Skip perplexity evaluation and run only downstream vLLM accuracy.",
+    )
+    parser.add_argument(
+        "--keep_downstream_model",
+        action="store_true",
+        help="Keep temporary pruned checkpoints saved for downstream vLLM eval.",
+    )
+    parser.add_argument("--downstream_task_data", type=str, default="downstream_test/dataset/mathqa500/test.parquet")
+    parser.add_argument("--downstream_prompt_key", type=str, default="prompt")
+    parser.add_argument("--downstream_response_key", type=str, default="")
+    parser.add_argument("--downstream_reward_score_dir", type=str, default="")
+    parser.add_argument("--downstream_output_dir", type=str, default="")
+    parser.add_argument("--downstream_model_dir", type=str, default="")
+    parser.add_argument("--downstream_vllm_python", type=str, default="")
+    parser.add_argument("--downstream_max_examples", type=int, default=500)
+    parser.add_argument("--downstream_start_index", type=int, default=0)
+    parser.add_argument("--downstream_shuffle", action="store_true")
+    parser.add_argument("--downstream_batch_size", type=int, default=1)
+    parser.add_argument("--downstream_generation_max_batch_tokens", type=int, default=32768)
+    parser.add_argument("--downstream_max_prompt_length", type=int, default=2048)
+    parser.add_argument("--downstream_max_new_tokens", type=int, default=2048)
+    parser.add_argument("--downstream_min_tokens", type=int, default=16)
+    parser.add_argument("--downstream_temperature", type=float, default=0.0)
+    parser.add_argument("--downstream_top_p", type=float, default=1.0)
+    parser.add_argument("--downstream_top_k", type=int, default=0)
+    parser.add_argument("--downstream_response_log_max", type=int, default=50)
+    parser.add_argument("--downstream_tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--downstream_gpu_memory_utilization", type=float, default=0.7)
+    parser.add_argument("--downstream_dtype", type=str, default="auto")
     return parser
 
 
@@ -309,6 +394,9 @@ def main():
 
     print(f"Using {model_device} model device, {compute_device} for computing")
 
+    def load_llm(model_name, cache_dir, device, seqlen):
+        return get_llm(model_name, cache_dir, device, seqlen, args.model_dtype, args.mlp_activation)
+
     prune_n, prune_m = 0, 0
     if args.sparsity_type != "unstructured":
         assert all(ratio == 0.5 for ratio in sparsity_ratios), (
@@ -344,7 +432,7 @@ def main():
         )
     ):
         print(f"loading llm model {args.model} for curvature precomputation")
-        model = get_llm(args.model, args.cache_dir, model_device, args.seqlen)
+        model = load_llm(args.model, args.cache_dir, model_device, args.seqlen)
         model.eval()
         if args.load_curvature_dir is not None:
             print(f"loading curvature scores from {args.load_curvature_dir}")
@@ -377,7 +465,7 @@ def main():
 
     if needs_pruning and args.prune_method == "wanda":
         print(f"loading llm model {args.model} for WANDA score precomputation")
-        model = get_llm(args.model, args.cache_dir, model_device, args.seqlen)
+        model = load_llm(args.model, args.cache_dir, model_device, args.seqlen)
         model.eval()
         model.seqlen = args.seqlen
         print(f"precomputing WANDA scores with seqlen={args.seqlen}")
@@ -390,7 +478,7 @@ def main():
     if args.run_per_layer_eval:
         run_per_layer_eval(
             args,
-            get_llm,
+            load_llm,
             tokenizer,
             model_device,
             sparsity_ratios,
@@ -410,7 +498,7 @@ def main():
 
     run_pp_eval(
         args,
-        get_llm,
+        load_llm,
         tokenizer,
         model_device,
         sparsity_ratios,

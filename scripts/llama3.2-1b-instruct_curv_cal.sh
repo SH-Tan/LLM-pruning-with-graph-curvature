@@ -1,8 +1,8 @@
 #!/bin/sh
 set -e
 
-# Curvature calculation for Llama-3-8B, with optional eval after it finishes.
-model="${MODEL:-meta-llama/Meta-Llama-3-8B}"
+# Curvature calculation for Llama-3.2-1B-Instruct, with optional eval after it finishes.
+model="${MODEL:-meta-llama/Llama-3.2-1B-Instruct}"
 python_bin="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
 sparsity_ratios="${SPARSITY_RATIOS:-0 0.3 0.4 0.5 0.6 0.7 0.9 1}"
 curv_sparsity_ratios="${CURV_SPARSITY_RATIOS:-0}"
@@ -15,7 +15,7 @@ seq_len="${SEQ_LEN:-512}"
 sample_edge_ratio="${SAMPLE_EDGE_RATIO:-0.05}"
 sample_edge_num="${SAMPLE_EDGE_NUM:--1}"
 calib_data="${CALIB_DATA:-c4_independent}"
-curvature_dir="${CURVATURE_DIR:-out/llama_8b/unstructured/curvature/gate_up_resid/}"
+curvature_dir="${CURVATURE_DIR:-out/llama3.2_1b_instruct/unstructured/curvature/gate_wores_relu/}"
 curvature_dtype="${CURVATURE_DTYPE:-float32}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 save_parameter_metric_logs="${SAVE_PARAMETER_METRIC_LOGS:-0}"
@@ -23,7 +23,6 @@ run_eval_after_curv="${RUN_EVAL_AFTER_CURV:-1}"
 run_all_layer_eval="${RUN_ALL_LAYER_EVAL:-${RUN_PP_EVAL:-1}}"
 run_per_layer_eval="${RUN_PER_LAYER_EVAL:-0}"
 run_downstream_test="${RUN_DOWNSTREAM_TEST:-0}"
-mlp_activation="${MLP_ACTIVATION:-model}"
 
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 export CUDA_VISIBLE_DEVICES=$cuda_device
@@ -45,7 +44,7 @@ run_curvature_calculation() {
         parameter_log_flag="--save_parameter_metric_logs"
     fi
 
-    echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select, lpf_window=$curvature_lpf_window, mlp_activation=$mlp_activation"
+    echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select, lpf_window=$curvature_lpf_window"
     "$python_bin" llm_main.py \
         --model $model \
         --prune_method curvature \
@@ -67,7 +66,6 @@ run_curvature_calculation() {
         --curvature_lpf_window $curvature_lpf_window \
         --curvature_dtype $curvature_dtype \
         --model_dtype $model_dtype \
-        --mlp_activation $mlp_activation \
         $parameter_log_flag \
         $l2_flag
 }
@@ -92,8 +90,6 @@ run_curvature_calculation() {
 # seq_select="top"
 # curvature_lpf_window=0
 # run_curvature_calculation 1 "all_examples"
-
-
 
 top_k_seq="${TOP_K_SEQ:-10}"
 seq_select="${SEQ_SELECT:-top}"
@@ -122,6 +118,5 @@ if [ "$run_eval_after_curv" = "1" ]; then
     RUN_ALL_LAYER_EVAL="$run_all_layer_eval" \
     RUN_PER_LAYER_EVAL="$run_per_layer_eval" \
     RUN_DOWNSTREAM_TEST="$run_downstream_test" \
-    MLP_ACTIVATION="$mlp_activation" \
-    sh scripts/llama3-8b_eval.sh
+    sh scripts/llama3.2-1b-instruct_eval.sh
 fi

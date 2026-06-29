@@ -7,8 +7,8 @@ GRAPH = {
     "v_proj": {"layer": 1, "prev": ["prev_down_proj"], "next": ["A"], "prev_in": ["prev_gate_up_out"], "next_out": ["Att_out"]},
     "A": {"layer": 2, "prev": [], "next": ["v_proj"], "prev_in": [], "next_out": ["v_proj"]},
     "o_proj": {"layer": 3, "prev": ["A"], "next": ["gate_proj", "up_proj"], "prev_in": ["v_proj"], "next_out": ["gate_up_out"]},
-    "gate_proj": {"layer": 4.1, "prev": ["o_proj"], "next": ["down_proj"], "prev_in": ["Att_out"], "next_out": ["down_proj"]},
-    "up_proj": {"layer": 4.2, "prev": ["o_proj"], "next": ["down_proj"], "prev_in": ["Att_out"], "next_out": ["down_proj"]},
+    "gate_proj": {"layer": 4.1, "prev": ["o_proj"], "next": ["down_proj"], "prev_in": ["Att_out"], "next_out": ["down_proj"], "residual":["o_residual"]},
+    "up_proj": {"layer": 4.2, "prev": ["o_proj"], "next": ["down_proj"], "prev_in": ["Att_out"], "next_out": ["down_proj"], "residual":["o_residual"]},
     "down_proj": {"layer": 5, "prev": ["up_proj", "gate_proj"], "next": ["v_proj"], "prev_in": ["o_proj"], "next_out": ["lm_head"]},
     "lm_head": {"layer": 6, "prev": ["down_proj"], "next": [], "prev_in": ["gate_up_out"], "next_out": []},
 }

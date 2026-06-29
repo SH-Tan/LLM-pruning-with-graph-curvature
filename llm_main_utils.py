@@ -1,4 +1,7 @@
+import json
 import os
+import shutil
+import subprocess
 
 import torch
 
@@ -218,6 +221,163 @@ def save_model_path(base_path, ratio, total_runs):
         return base_path
     tag = f"{ratio:.4f}".rstrip("0").rstrip(".").replace(".", "p") or "0"
     return f"{base_path}_sparsity_{tag}"
+
+
+def best_free_gpu_ids(count=1):
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except Exception:
+        return None
+
+    gpu_free_memory = []
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            gpu_free_memory.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            continue
+    if not gpu_free_memory:
+        return None
+    gpu_free_memory.sort(key=lambda item: item[1], reverse=True)
+    return ",".join(str(index) for index, _ in gpu_free_memory[:count])
+
+
+def downstream_model_path(args, compare_dir, compare_tag, ratio, total_runs, score_order, num_score_orders):
+    base_path = getattr(args, "downstream_model_dir", "") or getattr(args, "save_model", "")
+    if not base_path:
+        base_path = os.path.join(compare_dir, "downstream_checkpoints", compare_tag)
+    model_path = save_model_path(base_path, ratio, total_runs)
+    if num_score_orders > 1:
+        model_path = os.path.join(model_path, score_order)
+    return model_path
+
+
+def save_vllm_tokenizer_files(args, fallback_tokenizer, model_save_path):
+    source_path = args.model if os.path.isdir(args.model) else None
+    if source_path is None:
+        from huggingface_hub import snapshot_download
+        source_path = snapshot_download(args.model, local_files_only=True)
+
+    fallback_tokenizer.save_pretrained(model_save_path)
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "tokenizer.model",
+        "vocab.json",
+        "merges.txt",
+    ):
+        source_file = os.path.join(source_path, name)
+        if os.path.exists(source_file):
+            shutil.copy2(source_file, os.path.join(model_save_path, name))
+
+
+def run_downstream_vllm_eval(args, model_path, compare_dir, compare_tag, target_ratio, score_order):
+    output_dir = getattr(args, "downstream_output_dir", "") or os.path.join(compare_dir, "downstream_results")
+    os.makedirs(output_dir, exist_ok=True)
+    ratio_tag = f"{target_ratio:.4f}".rstrip("0").rstrip(".").replace(".", "p") or "0"
+    result_prefix = f"{compare_tag}_{score_order}_sparsity_{ratio_tag}"
+    output_path = os.path.join(output_dir, f"{result_prefix}_responses.jsonl")
+    metrics_path = os.path.join(output_dir, f"{result_prefix}_metrics.json")
+    vllm_python = (
+        getattr(args, "downstream_vllm_python", "")
+        or os.environ.get("VLLM_PYTHON", "")
+        or "/home/tans5/anaconda3/envs/vllm/bin/python"
+    )
+    if not os.path.exists(vllm_python):
+        vllm_python = "python"
+
+    cmd = [
+        vllm_python,
+        "-m",
+        "downstream_test.vllm_accuracy_runner",
+        "--model_path",
+        model_path,
+        "--dataset_path",
+        getattr(args, "downstream_task_data", "downstream_test/dataset/mathqa500/test.parquet"),
+        "--output_path",
+        output_path,
+        "--metrics_path",
+        metrics_path,
+        "--prompt_key",
+        getattr(args, "downstream_prompt_key", "prompt"),
+        "--start_index",
+        str(getattr(args, "downstream_start_index", 0)),
+        "--seed",
+        str(getattr(args, "seed", 42)),
+        "--max_examples",
+        str(getattr(args, "downstream_max_examples", 500)),
+        "--batch_size",
+        str(getattr(args, "downstream_batch_size", 1)),
+        "--generation_max_batch_tokens",
+        str(getattr(args, "downstream_generation_max_batch_tokens", 32768)),
+        "--max_prompt_length",
+        str(getattr(args, "downstream_max_prompt_length", 2048)),
+        "--max_new_tokens",
+        str(getattr(args, "downstream_max_new_tokens", 2048)),
+        "--min_tokens",
+        str(getattr(args, "downstream_min_tokens", 16)),
+        "--temperature",
+        str(getattr(args, "downstream_temperature", 0.0)),
+        "--top_p",
+        str(getattr(args, "downstream_top_p", 1.0)),
+        "--top_k",
+        str(getattr(args, "downstream_top_k", 0)),
+        "--response_log_max",
+        str(getattr(args, "downstream_response_log_max", 50)),
+        "--tensor_parallel_size",
+        str(getattr(args, "downstream_tensor_parallel_size", 1)),
+        "--gpu_memory_utilization",
+        str(getattr(args, "downstream_gpu_memory_utilization", 0.7)),
+        "--dtype",
+        getattr(args, "downstream_dtype", "auto"),
+    ]
+    response_key = getattr(args, "downstream_response_key", "")
+    if response_key:
+        cmd.extend(["--response_key", response_key])
+    reward_score_dir = getattr(args, "downstream_reward_score_dir", "")
+    if reward_score_dir:
+        cmd.extend(["--reward_score_dir", reward_score_dir])
+    if getattr(args, "downstream_shuffle", False):
+        cmd.append("--shuffle")
+
+    env = os.environ.copy()
+    tensor_parallel_size = max(1, int(getattr(args, "downstream_tensor_parallel_size", 1)))
+    if "DOWNSTREAM_CUDA_VISIBLE_DEVICES" in env:
+        env["CUDA_VISIBLE_DEVICES"] = env["DOWNSTREAM_CUDA_VISIBLE_DEVICES"]
+    else:
+        gpu_ids = best_free_gpu_ids(tensor_parallel_size)
+        if gpu_ids:
+            env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+
+    print(f"running downstream vLLM eval: model_path={model_path}")
+    print(f"downstream vLLM CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '')}")
+    subprocess.run(cmd, check=True, env=env)
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        metrics = json.load(f)
+    accuracy = metrics.get("accuracy", metrics.get("pass@1"))
+    print(f"downstream accuracy sparsity={target_ratio:.4f} score_order={score_order}: {accuracy}")
+    return metrics_path
+
+
+def cleanup_downstream_model(model_path):
+    if not model_path or not os.path.exists(model_path):
+        return
+    if os.path.isdir(model_path):
+        shutil.rmtree(model_path)
+    else:
+        os.remove(model_path)
+    print(f"cleaned downstream model checkpoint: {model_path}")
 
 
 def resolve_prune_score_orders(args):
@@ -549,45 +709,74 @@ def run_pp_eval(
             print(f"sparsity sanity check {actual_sparsity_ratio:.4f}")
             print("*" * 30)
 
-            for seq in eval_seq_lens:
-                current_model.seqlen = seq
-                ppl_test = eval_ppl(args, current_model, tokenizer, model_device)
-                eval_mode = "fixed_score_seq_len" if args.prune_method == "wanda" else "standard_eval"
-                print(f"wikitext perplexity {ppl_test} using pp_seqlen = {seq}")
-                append_eval_result(
-                    pp_log_path,
-                    args,
-                    score_order,
-                    target_ratio,
-                    actual_sparsity_ratio,
-                    eval_mode,
-                    args.seqlen,
-                    seq,
-                    ppl_test,
-                )
-                eval_records.append(
-                    {
-                        "method": args.prune_method,
-                        "method_tag": per_layer_result_tag(args),
-                        "prune_scope": args.curvature_prune_scope,
-                        "score_order": score_order,
-                        "target_sparsity": float(target_ratio),
-                        "actual_sparsity": float(actual_sparsity_ratio),
-                        "pp_seq_len": int(seq),
-                        "ppl_test": float(ppl_test),
-                    }
-                )
-                release_cuda_memory()
+            if not getattr(args, "downstream_only", False):
+                for seq in eval_seq_lens:
+                    current_model.seqlen = seq
+                    ppl_test = eval_ppl(args, current_model, tokenizer, model_device)
+                    eval_mode = "fixed_score_seq_len" if args.prune_method == "wanda" else "standard_eval"
+                    print(f"wikitext perplexity {ppl_test} using pp_seqlen = {seq}")
+                    append_eval_result(
+                        pp_log_path,
+                        args,
+                        score_order,
+                        target_ratio,
+                        actual_sparsity_ratio,
+                        eval_mode,
+                        args.seqlen,
+                        seq,
+                        ppl_test,
+                    )
+                    eval_records.append(
+                        {
+                            "method": args.prune_method,
+                            "method_tag": per_layer_result_tag(args),
+                            "prune_scope": args.curvature_prune_scope,
+                            "score_order": score_order,
+                            "target_sparsity": float(target_ratio),
+                            "actual_sparsity": float(actual_sparsity_ratio),
+                            "pp_seq_len": int(seq),
+                            "ppl_test": float(ppl_test),
+                        }
+                    )
+                    release_cuda_memory()
 
-            if args.save_model:
-                model_save_path = save_model_path(args.save_model, target_ratio, len(sparsity_ratios))
-                if len(prune_score_orders) > 1:
-                    model_save_path = os.path.join(model_save_path, score_order)
+            model_save_path = None
+            if args.save_model or getattr(args, "run_downstream_eval", False):
+                if getattr(args, "run_downstream_eval", False):
+                    model_save_path = downstream_model_path(
+                        args,
+                        compare_dir,
+                        compare_tag,
+                        target_ratio,
+                        len(sparsity_ratios),
+                        score_order,
+                        len(prune_score_orders),
+                    )
+                else:
+                    model_save_path = save_model_path(args.save_model, target_ratio, len(sparsity_ratios))
+                    if len(prune_score_orders) > 1:
+                        model_save_path = os.path.join(model_save_path, score_order)
                 current_model.save_pretrained(model_save_path)
-                tokenizer.save_pretrained(model_save_path)
+                if getattr(args, "run_downstream_eval", False):
+                    save_vllm_tokenizer_files(args, tokenizer, model_save_path)
+                else:
+                    tokenizer.save_pretrained(model_save_path)
 
             del current_model
             release_cuda_memory()
+
+            if getattr(args, "run_downstream_eval", False):
+                run_downstream_vllm_eval(
+                    args,
+                    model_save_path,
+                    compare_dir,
+                    compare_tag,
+                    target_ratio,
+                    score_order,
+                )
+                if not getattr(args, "keep_downstream_model", False):
+                    cleanup_downstream_model(model_save_path)
+                release_cuda_memory()
 
             with open(pp_log_path, "a+", encoding="utf-8") as f:
                 print("", file=f, flush=True)

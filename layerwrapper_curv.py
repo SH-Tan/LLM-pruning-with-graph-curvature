@@ -23,7 +23,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
         if attn_mask.dtype == torch.bool:
             attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
         else:
-            attn_bias = attn_mask + attn_bias
+            attn_bias = attn_mask.to(dtype=query.dtype) + attn_bias
 
     if enable_gqa:
         key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
@@ -112,7 +112,7 @@ def _store_operation(op_bank, name, node, dtype=None):
     op_bank[name] = node # _normalize_node_value_per_sequence(node, name)
 
 
-def _plot_sorted_tensor_distribution(name, tensor, plot_dir):
+def _plot_sorted_input_distribution(name, tensor, plot_dir):
     os.makedirs(plot_dir, exist_ok=True)
     try:
         os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "matplotlib"))
@@ -126,24 +126,99 @@ def _plot_sorted_tensor_distribution(name, tensor, plot_dir):
             f.write(f"Could not draw {name} distribution plot: {exc}\n")
         return
 
-    values = tensor.detach().float().flatten().cpu()
-    sorted_values = torch.sort(values).values.numpy()
-    sorted_abs_values = torch.sort(values.abs()).values.numpy()
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].plot(sorted_values, linewidth=1.0)
-    axes[0].set_title(name)
-    axes[0].set_xlabel("sorted index")
-    axes[0].set_ylabel("value")
-    axes[1].plot(sorted_abs_values, linewidth=1.0)
-    axes[1].set_title(f"{name} abs")
-    axes[1].set_xlabel("sorted index")
-    axes[1].set_ylabel("abs(value)")
-    fig.tight_layout()
-    fig.savefig(os.path.join(plot_dir, f"{name}.png"), dpi=140)
-    plt.close(fig)
+    def _plot_values(ax, values, title, ylabel):
+        sorted_values = torch.sort(values).values.cpu().numpy()
+        max_points = int(os.environ.get("CURV_GATE_PLOT_MAX_POINTS", "200000"))
+        if sorted_values.size > max_points:
+            idx = np.linspace(0, sorted_values.size - 1, max_points, dtype=np.int64)
+            sorted_values = sorted_values[idx]
+        ax.plot(sorted_values, linewidth=1.0)
+        ax.set_title(title)
+        ax.set_xlabel("sorted index")
+        ax.set_ylabel(ylabel)
+
+    marker_path = os.path.join(plot_dir, "plot_error.txt")
+    try:
+        values = tensor.detach()
+        if values.dim() > 1 and values.shape[0] == 1:
+            values = values.squeeze(0)
+        if values.dim() != 2:
+            values = values.reshape(-1, values.shape[-1])
+
+        chunk_size = int(os.environ.get("CURV_GATE_PLOT_SEQ_CHUNK", "256"))
+        if os.environ.get("CURV_GATE_PLOT_PER_SAMPLE", "1") == "1":
+            seq_l2_chunks = []
+            for start in range(0, values.shape[0], chunk_size):
+                chunk = values[start:start + chunk_size].float()
+                chunk = torch.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+                seq_l2_chunks.append(torch.linalg.vector_norm(chunk, ord=2, dim=-1).cpu())
+                del chunk
+            seq_l2 = torch.cat(seq_l2_chunks)
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+            _plot_values(ax, seq_l2, f"{name} seq L2", "L2 norm")
+            fig.tight_layout()
+            fig.savefig(os.path.join(plot_dir, f"{name}_seq_l2.png"), dpi=140)
+            plt.close(fig)
+            del seq_l2
+
+            sample_count = min(10, values.shape[0])
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(os.environ.get("CURV_GATE_PLOT_SEED", "0")))
+            seq_idx = torch.randperm(values.shape[0], generator=generator)[:sample_count]
+            sampled = values.index_select(0, seq_idx.to(values.device)).float().abs().cpu()
+            sampled = torch.nan_to_num(sampled, nan=0.0, posinf=0.0, neginf=0.0)
+
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+            for row, idx in zip(sampled, seq_idx.tolist()):
+                sorted_values = torch.sort(row).values.numpy()
+                ax.plot(sorted_values, linewidth=0.8, label=f"seq {idx}")
+            ax.set_title(f"{name} sampled seq abs")
+            ax.set_xlabel("sorted hidden index")
+            ax.set_ylabel("abs(value)")
+            ax.legend(fontsize=7)
+            fig.tight_layout()
+            fig.savefig(os.path.join(plot_dir, f"{name}_sampled_seq_abs.png"), dpi=140)
+            plt.close(fig)
+            del sampled
+
+        if os.environ.get("CURV_GATE_PLOT_WANDA_L2") == "1":
+            layer_dir = os.path.dirname(plot_dir) if os.path.basename(plot_dir).startswith("sample_") else plot_dir
+            wanda_dir = os.path.join(layer_dir, "wanda_l2")
+            os.makedirs(wanda_dir, exist_ok=True)
+            acc_path = os.path.join(wanda_dir, f"{name}_sumsq.npz")
+            reset_acc = os.path.basename(plot_dir) == "sample_000"
+
+            sumsq = torch.zeros(values.shape[-1], dtype=torch.float64, device="cpu")
+            for start in range(0, values.shape[0], chunk_size):
+                chunk = values[start:start + chunk_size].float()
+                chunk = torch.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+                sumsq += chunk.square().sum(dim=0).double().cpu()
+                del chunk
+            count = values.shape[0]
+            if os.path.exists(acc_path) and not reset_acc:
+                acc = np.load(acc_path)
+                sumsq += torch.from_numpy(acc["sumsq"])
+                count += int(acc["count"])
+            np.savez(acc_path, sumsq=sumsq.numpy(), count=np.array(count, dtype=np.int64))
+
+            wanda_l2 = torch.sqrt(sumsq)
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+            _plot_values(ax, wanda_l2, f"{name} Wanda L2", "L2 norm over examples and seq")
+            fig.tight_layout()
+            fig.savefig(os.path.join(wanda_dir, f"{name}_wanda_l2.png"), dpi=140)
+            plt.close(fig)
+            del wanda_l2, sumsq
+        del values
+    except Exception as exc:
+        with open(marker_path, "a", encoding="utf-8") as f:
+            f.write(f"Could not draw {name} distribution plot: {exc}\n")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
 
 
-def _maybe_plot_mlp_gate_distributions(gate, up, act, mlp_hidden, gate_beta):
+def _maybe_plot_mlp_gate_distributions(x_norm, attn_context, x_norm2, mlp_hidden):
     if os.environ.get("CURV_GATE_PLOT_ENABLED") != "1":
         return
 
@@ -158,17 +233,29 @@ def _maybe_plot_mlp_gate_distributions(gate, up, act, mlp_hidden, gate_beta):
         plot_idx = getattr(_maybe_plot_mlp_gate_distributions, "_plot_idx", 0)
         step_dir = os.path.join(plot_dir, f"mlp_gate_{plot_idx:03d}")
         _maybe_plot_mlp_gate_distributions._plot_idx = plot_idx + 1
-    _plot_sorted_tensor_distribution("gate", gate, step_dir)
-    _plot_sorted_tensor_distribution("up", up, step_dir)
-    _plot_sorted_tensor_distribution("act", act, step_dir)
-    _plot_sorted_tensor_distribution("up_act", mlp_hidden, step_dir)
-    act_up_div_gate = mlp_hidden / gate
-    _plot_sorted_tensor_distribution("act_up_div_gate", act_up_div_gate, step_dir)
-    _plot_sorted_tensor_distribution("gate_beta", gate_beta, step_dir)
-    up_gate_beta = up * gate_beta
-    _plot_sorted_tensor_distribution("up_gate_beta", up_gate_beta, step_dir)
-    del act_up_div_gate
-    del up_gate_beta
+    _plot_sorted_input_distribution("x_norm", x_norm, step_dir)
+    _plot_sorted_input_distribution("attn_context", attn_context, step_dir)
+    _plot_sorted_input_distribution("x_norm2", x_norm2, step_dir)
+    _plot_sorted_input_distribution("mlp_hidden", mlp_hidden, step_dir)
+
+
+def _print_finite_stats(name, tensor):
+    if os.environ.get("CURV_GATE_PRINT_STATS") != "1":
+        return
+    values = tensor.detach()
+    finite = torch.isfinite(values)
+    finite_count = int(finite.sum().item())
+    total_count = values.numel()
+    if finite_count > 0:
+        finite_values = values[finite].float()
+        print(
+            f"{name}: shape={tuple(values.shape)}, finite={finite_count}/{total_count}, "
+            f"min={float(finite_values.min().item()):.6g}, "
+            f"max={float(finite_values.max().item()):.6g}, "
+            f"mean={float(finite_values.mean().item()):.6g}"
+        )
+    else:
+        print(f"{name}: shape={tuple(values.shape)}, finite=0/{total_count}")
 
 
 
@@ -229,9 +316,12 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         o = layer.self_attn.o_proj(attn_context)
         x_res1 = x_in + o
         x_norm2 = layer.post_attention_layernorm(x_res1)
+        _print_finite_stats("attn_context", attn_context)
+        _print_finite_stats("x_norm2", x_norm2)
         
         # ---- residual value for qkv output ----
         # _store_operation(operations, "qkv_residual", x_res1, operation_dtype)
+        _store_operation(operations, "o_residual", x_in, operation_dtype)
         
         # ---- attention output ----
         _store_operation(operations, "o_proj", x_norm2, operation_dtype)
@@ -241,34 +331,40 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         up = layer.mlp.up_proj(x_norm2)
         act = layer.mlp.act_fn(gate)
         mlp_hidden = act * up
-        gate_beta = torch.sigmoid(gate)
-        # gate_beta = torch.where(gate_beta < 0.4, gate_beta, torch.ones_like(gate_beta))
-        _maybe_plot_mlp_gate_distributions(gate, up, act, mlp_hidden, gate_beta)
+        
+        gate_beta = torch.ones_like(gate)
+        
+        # gate_beta = torch.sigmoid(gate)
+        # gate_beta.ge_(0.2)
+        # gate_beta = gate_beta.to(dtype=gate.dtype)
+        # _maybe_plot_mlp_gate_distributions(x_norm, attn_context, x_norm2, mlp_hidden)
 
         down = layer.mlp.down_proj(mlp_hidden)
         x_out = x_res1 + down
         
-        _store_operation(operations, "gate_proj", act, operation_dtype)
         _store_operation(operations, "gate_beta", gate_beta, operation_dtype)
+        _store_operation(operations, "gate_proj", act, operation_dtype)
         _store_operation(operations, "up_proj", up, operation_dtype)
         _store_operation(operations, "gate_up_out", mlp_hidden, operation_dtype)
 
-        if next_layer is not None and hasattr(next_layer, "input_layernorm"):
-            next_ln = next_layer.input_layernorm
-            next_ln_device = next_ln.weight.device
-            next_input = x_out.to(next_ln_device)
-            next_input_norm = next_ln(next_input)
-            _store_operation(operations, "down_proj", next_input_norm, operation_dtype)
-        else:
-            _store_operation(operations, "down_proj", x_out, operation_dtype)
+        # if next_layer is not None and hasattr(next_layer, "input_layernorm"):
+        #     next_ln = next_layer.input_layernorm
+        #     next_ln_device = next_ln.weight.device
+        #     next_input = x_out.to(next_ln_device)
+        #     next_input_norm = next_ln(next_input)
+        #     _store_operation(operations, "down_proj", next_input_norm, operation_dtype)
+        #     del next_input, next_input_norm
+
+        # else:
+            # _store_operation(operations, "down_proj", x_out, operation_dtype)
+        
+        _store_operation(operations, "down_proj", down, operation_dtype)
             
         # ---- cleanup (GPU memory critical) ----
         del q, k, v, A, attn_output
         del q_linear, k_linear, v_linear
         del attn_context, o, x_res1, x_norm2
-        del gate, up, act, gate_beta, mlp_hidden, down
-        if next_layer is not None and hasattr(next_layer, "input_layernorm"):
-            del next_input, next_input_norm
+        del gate, gate_beta, up, act, mlp_hidden, down
 
     return x_out, operations, num_heads, num_kv_heads, num_kv_groups, head_dim
 

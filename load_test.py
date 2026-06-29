@@ -33,14 +33,14 @@ print(f"Using {device} device")
 # model_name = "meta-llama/Meta-Llama-3-8B"
 # model_name = "meta-llama/Llama-3.2-1B"
 # model_name = "Qwen/Qwen2.5-0.5B"
-model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+model_name = "meta-llama/Llama-3.2-3B-Instruct"
 
 print("Loading model:", model_name)
 
 cache_dir="llm_weights"
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
     device_map="auto",
     cache_dir=cache_dir, 
     low_cpu_mem_usage=True, 

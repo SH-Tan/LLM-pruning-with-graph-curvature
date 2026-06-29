@@ -128,7 +128,7 @@ def build_layer_cache(model, operations, layer_id, cache=None, device="cuda", re
             if real_name in {"layer_input", "A", "Att_out", "gate_up_out"}:
                 continue
    
-        if name == "prev_qkv_residual":
+        if name.endswith("_residual"):
             dist_matrix = _residual_distance_matrix_torch(operations, name, device)
             if dist_matrix is None:
                 continue

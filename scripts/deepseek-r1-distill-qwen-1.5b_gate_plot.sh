@@ -17,6 +17,7 @@ sample_edge_num="-1"
 calib_data="${CALIB_DATA:-c4_independent}"
 curvature_dir="${CURVATURE_DIR:-out/deepseek_r1_distill_qwen_1.5b/gate_plot/}"
 curvature_dtype="${CURVATURE_DTYPE:-float32}"
+model_dtype="${MODEL_DTYPE:-bfloat16}"
 top_k_seq="${TOP_K_SEQ:-10}"
 seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
@@ -25,6 +26,7 @@ cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd ","
 export CUDA_VISIBLE_DEVICES=$cuda_device
 export CURV_GATE_PLOT_ENABLED=1
 export CURV_COLLECT_LAYER_DATA_ONLY=1
+export CURV_GATE_PLOT_MAX_POINTS="${CURV_GATE_PLOT_MAX_POINTS:-200000}"
 
 echo "Running gate plot only: model=$model, nsamples=$nsamples, seq_len=$seq_len"
 "$python_bin" llm_main.py \
@@ -46,4 +48,5 @@ echo "Running gate plot only: model=$model, nsamples=$nsamples, seq_len=$seq_len
     --shared_top_k $top_k_seq \
     --shared_seq_select $seq_select \
     --curvature_lpf_window $curvature_lpf_window \
-    --curvature_dtype $curvature_dtype
+    --curvature_dtype $curvature_dtype \
+    --model_dtype $model_dtype

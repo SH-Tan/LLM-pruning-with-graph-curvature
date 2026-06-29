@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 
-_CURVATURE_DTYPE_NAME = "float64"
+_CURVATURE_DTYPE_NAME = "float32"
 
 
 def set_curvature_dtype(dtype_name):
