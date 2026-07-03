@@ -1470,7 +1470,7 @@ def compute_op_curvature(
         layer_id=layer_id,
         short_name=short_name,
         sample_idx=sample_idx,
-        curvature_shape=curvature_utils.shape,
+        curvature_shape=curvature.shape,
         seq_len=seq_len,
         dataset_name=dataset_name,
         analysis_dir=analysis_dir,

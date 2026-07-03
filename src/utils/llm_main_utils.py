@@ -1,7 +1,7 @@
-import json
 import os
 import shutil
 import subprocess
+import sys
 
 import torch
 
@@ -14,6 +14,16 @@ from pruning.curv_layer_prune_utils import (
 )
 from pruning.curv_prune_utils import prune_global_curvature
 from evaluation.eval import eval_ppl
+from evaluation.lm_eval_pipeline import (
+    DEFAULT_FINAL_TASKS,
+    MMLU_CATEGORY_TASKS,
+    MMLU_SUMMARY_TASKS,
+    append_scores_to_csv,
+    extract_main_scores,
+    find_latest_result_json,
+    run_lm_eval,
+    save_pruned_model,
+)
 from pruning.per_layer_eval_utils import (
     draw_per_layer_method_comparison,
     draw_per_layer_ppl_vs_sparsity,
@@ -268,7 +278,7 @@ def save_vllm_tokenizer_files(args, fallback_tokenizer, model_save_path):
         source_path = snapshot_download(args.model, local_files_only=True)
 
     fallback_tokenizer.save_pretrained(model_save_path)
-    for name in (
+    tokenizer_files = (
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
@@ -276,19 +286,121 @@ def save_vllm_tokenizer_files(args, fallback_tokenizer, model_save_path):
         "tokenizer.model",
         "vocab.json",
         "merges.txt",
-    ):
+    )
+    for name in tokenizer_files:
         source_file = os.path.join(source_path, name)
         if os.path.exists(source_file):
             shutil.copy2(source_file, os.path.join(model_save_path, name))
 
 
-def run_downstream_vllm_eval(args, model_path, compare_dir, compare_tag, target_ratio, score_order):
-    output_dir = getattr(args, "downstream_output_dir", "") or os.path.join(compare_dir, "downstream_results")
+def downstream_checkpoint_complete(model_path):
+    if not model_path or not os.path.isdir(model_path):
+        return False
+    has_config = os.path.isfile(os.path.join(model_path, "config.json"))
+    has_tokenizer = os.path.isfile(os.path.join(model_path, "tokenizer_config.json")) and (
+        os.path.isfile(os.path.join(model_path, "tokenizer.json"))
+        or os.path.isfile(os.path.join(model_path, "tokenizer.model"))
+    )
+    has_weights = (
+        os.path.isfile(os.path.join(model_path, "model.safetensors"))
+        or os.path.isfile(os.path.join(model_path, "model.safetensors.index.json"))
+        or any(name.endswith(".safetensors") for name in os.listdir(model_path))
+    )
+    return has_config and has_tokenizer and has_weights
+
+
+def save_downstream_checkpoint(args, model, tokenizer, model_path):
+    if downstream_checkpoint_complete(model_path):
+        print(f"reusing downstream checkpoint: {model_path}")
+        return
+
+    tmp_path = f"{model_path}.tmp"
+    if os.path.exists(tmp_path):
+        shutil.rmtree(tmp_path)
+    if os.path.exists(model_path):
+        shutil.rmtree(model_path)
+
+    shard_size = getattr(args, "downstream_save_shard_size", "2GB")
+    model.save_pretrained(tmp_path, safe_serialization=True, max_shard_size=shard_size)
+    save_vllm_tokenizer_files(args, tokenizer, tmp_path)
+    os.replace(tmp_path, model_path)
+    print(f"saved downstream checkpoint: {model_path}")
+
+
+def parse_downstream_suite(args):
+    if getattr(args, "downstream_suite", "") != "core":
+        return None
+
+    benchmarks = [item for item in getattr(args, "downstream_suite_benchmarks", "").split(";") if item]
+    task_groups = [item for item in getattr(args, "downstream_suite_tasks", "").split(";") if item]
+    backends = [item for item in getattr(args, "downstream_suite_backends", "").split(";") if item]
+    fewshots = [item for item in getattr(args, "downstream_suite_fewshots", "").split(";") if item]
+    limits = [item for item in getattr(args, "downstream_suite_limits", "").split(";")]
+    if not benchmarks:
+        return None
+    if not (len(benchmarks) == len(task_groups) == len(backends) == len(fewshots) == len(limits)):
+        raise ValueError("Downstream suite fields must have the same number of semicolon-separated entries.")
+
+    suite = []
+    for benchmark, tasks, backend, fewshot, limit in zip(benchmarks, task_groups, backends, fewshots, limits):
+        suite.append(
+            {
+                "benchmark": benchmark,
+                "tasks": [task for task in tasks.split(",") if task],
+                "backend": backend,
+                "num_fewshot": int(fewshot),
+                "limit": limit or None,
+            }
+        )
+    return suite
+
+
+def hf_max_memory_per_gpu(memory_fraction, cuda_visible_devices=None):
+    fraction = min(max(float(memory_fraction), 0.05), 0.95)
+    if not torch.cuda.is_available():
+        return None
+    device_idx = 0
+    if cuda_visible_devices:
+        first_device = str(cuda_visible_devices).split(",", 1)[0].strip()
+        if first_device.isdigit() and int(first_device) < torch.cuda.device_count():
+            device_idx = int(first_device)
+    total_bytes = torch.cuda.get_device_properties(device_idx).total_memory
+    gib = max(1, int(total_bytes * fraction / (1024 ** 3)))
+    return f"{gib}GiB"
+
+
+def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ratio, score_order):
+    output_dir = getattr(args, "downstream_output_dir", "") or os.path.join(compare_dir, "lm_eval_results")
     os.makedirs(output_dir, exist_ok=True)
     ratio_tag = f"{target_ratio:.4f}".rstrip("0").rstrip(".").replace(".", "p") or "0"
     result_prefix = f"{compare_tag}_{score_order}_sparsity_{ratio_tag}"
-    output_path = os.path.join(output_dir, f"{result_prefix}_responses.jsonl")
-    metrics_path = os.path.join(output_dir, f"{result_prefix}_metrics.json")
+    output_path = os.path.join(output_dir, result_prefix)
+    summary_csv = getattr(args, "downstream_summary_csv", "") or os.path.join("eval_results", "summary.csv")
+    device = "cuda:0"
+    batch_size = getattr(args, "downstream_batch_size", "auto")
+    hf_batch_size = getattr(args, "downstream_hf_batch_size", "auto")
+    hf_max_batch_size = int(getattr(args, "downstream_hf_max_batch_size", 8))
+    hf_gpu_memory_utilization = float(getattr(args, "downstream_hf_gpu_memory_utilization", 0.6))
+    final_tasks = getattr(args, "downstream_tasks", None) or DEFAULT_FINAL_TASKS
+    benchmarks = parse_downstream_suite(args)
+    eval_tasks = MMLU_CATEGORY_TASKS if final_tasks == ["mmlu"] else final_tasks
+    num_fewshot = getattr(args, "downstream_num_fewshot", 5)
+    apply_chat_template = bool(getattr(args, "downstream_apply_chat_template", False))
+    fewshot_as_multiturn = bool(getattr(args, "downstream_fewshot_as_multiturn", False))
+    gen_kwargs = getattr(args, "downstream_gen_kwargs", "") or None
+    limit = getattr(args, "downstream_limit", "") or None
+    cache_requests = getattr(args, "downstream_cache_requests", "true") or None
+    request_cache_path = getattr(args, "downstream_request_cache_path", "") or None
+    include_path = getattr(args, "downstream_include_path", "") or None
+    log_samples = bool(getattr(args, "downstream_log_samples", False))
+    dtype = getattr(args, "downstream_dtype", "bfloat16")
+    default_backend = getattr(args, "downstream_lm_eval_backend", "vllm")
+    tensor_parallel_size = max(1, int(getattr(args, "downstream_tensor_parallel_size", 1)))
+    data_parallel_size = max(1, int(getattr(args, "downstream_data_parallel_size", 1)))
+    gpu_memory_utilization = min(float(getattr(args, "downstream_gpu_memory_utilization", 0.7)), 0.7)
+    max_model_len = int(getattr(args, "downstream_max_model_len", 2048))
+    max_num_batched_tokens = int(getattr(args, "downstream_max_num_batched_tokens", 8192))
+    max_num_seqs = int(getattr(args, "downstream_max_num_seqs", 64))
     vllm_python = (
         getattr(args, "downstream_vllm_python", "")
         or os.environ.get("VLLM_PYTHON", "")
@@ -296,78 +408,134 @@ def run_downstream_vllm_eval(args, model_path, compare_dir, compare_tag, target_
     )
     if not os.path.exists(vllm_python):
         vllm_python = "python"
-
-    cmd = [
-        vllm_python,
-        "-m",
-        "downstream_test.vllm_accuracy_runner",
-        "--model_path",
-        model_path,
-        "--dataset_path",
-        getattr(args, "downstream_task_data", "downstream_test/dataset/mathqa500/test.parquet"),
-        "--output_path",
-        output_path,
-        "--metrics_path",
-        metrics_path,
-        "--prompt_key",
-        getattr(args, "downstream_prompt_key", "prompt"),
-        "--start_index",
-        str(getattr(args, "downstream_start_index", 0)),
-        "--seed",
-        str(getattr(args, "seed", 42)),
-        "--max_examples",
-        str(getattr(args, "downstream_max_examples", 500)),
-        "--batch_size",
-        str(getattr(args, "downstream_batch_size", 1)),
-        "--generation_max_batch_tokens",
-        str(getattr(args, "downstream_generation_max_batch_tokens", 32768)),
-        "--max_prompt_length",
-        str(getattr(args, "downstream_max_prompt_length", 2048)),
-        "--max_new_tokens",
-        str(getattr(args, "downstream_max_new_tokens", 2048)),
-        "--min_tokens",
-        str(getattr(args, "downstream_min_tokens", 16)),
-        "--temperature",
-        str(getattr(args, "downstream_temperature", 0.0)),
-        "--top_p",
-        str(getattr(args, "downstream_top_p", 1.0)),
-        "--top_k",
-        str(getattr(args, "downstream_top_k", 0)),
-        "--response_log_max",
-        str(getattr(args, "downstream_response_log_max", 50)),
-        "--tensor_parallel_size",
-        str(getattr(args, "downstream_tensor_parallel_size", 1)),
-        "--gpu_memory_utilization",
-        str(getattr(args, "downstream_gpu_memory_utilization", 0.7)),
-        "--dtype",
-        getattr(args, "downstream_dtype", "auto"),
-    ]
-    response_key = getattr(args, "downstream_response_key", "")
-    if response_key:
-        cmd.extend(["--response_key", response_key])
-    reward_score_dir = getattr(args, "downstream_reward_score_dir", "")
-    if reward_score_dir:
-        cmd.extend(["--reward_score_dir", reward_score_dir])
-    if getattr(args, "downstream_shuffle", False):
-        cmd.append("--shuffle")
-
     env = os.environ.copy()
-    tensor_parallel_size = max(1, int(getattr(args, "downstream_tensor_parallel_size", 1)))
     if "DOWNSTREAM_CUDA_VISIBLE_DEVICES" in env:
         env["CUDA_VISIBLE_DEVICES"] = env["DOWNSTREAM_CUDA_VISIBLE_DEVICES"]
     else:
-        gpu_ids = best_free_gpu_ids(tensor_parallel_size)
+        gpu_ids = best_free_gpu_ids(tensor_parallel_size * data_parallel_size)
         if gpu_ids:
             env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    def run_one_benchmark(benchmark, tasks, backend, shot_count, task_limit, include_tasks=None):
+        benchmark_output_path = output_path if benchmark == "single" else os.path.join(output_path, benchmark)
+        lm_eval_python = vllm_python if backend == "vllm" else sys.executable
+        model_args_extra = None
+        benchmark_batch_size = batch_size
+        if backend == "vllm":
+            model_args_extra = (
+                f"tensor_parallel_size={tensor_parallel_size},"
+                f"data_parallel_size={data_parallel_size},"
+                f"gpu_memory_utilization={gpu_memory_utilization},"
+                f"max_model_len={max_model_len},"
+                f"max_num_batched_tokens={max_num_batched_tokens},"
+                f"max_num_seqs={max_num_seqs}"
+            )
+        elif backend == "hf":
+            benchmark_batch_size = hf_batch_size
+            model_args = [f"max_batch_size={hf_max_batch_size}"]
+            hf_memory_cap = hf_max_memory_per_gpu(
+                hf_gpu_memory_utilization,
+                cuda_visible_devices=env.get("CUDA_VISIBLE_DEVICES", ""),
+            )
+            if hf_memory_cap is not None:
+                model_args.extend(["parallelize=True", f"max_memory_per_gpu={hf_memory_cap}"])
+            model_args_extra = ",".join(model_args)
 
-    print(f"running downstream vLLM eval: model_path={model_path}")
-    print(f"downstream vLLM CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '')}")
-    subprocess.run(cmd, check=True, env=env)
-    with open(metrics_path, "r", encoding="utf-8") as f:
-        metrics = json.load(f)
-    accuracy = metrics.get("accuracy", metrics.get("pass@1"))
-    print(f"downstream accuracy sparsity={target_ratio:.4f} score_order={score_order}: {accuracy}")
-    return metrics_path
+        print(f"running downstream lm-eval {backend} final: benchmark={benchmark} tasks={','.join(tasks)}")
+        print(f"downstream lm-eval python={lm_eval_python}")
+        print(f"downstream lm-eval CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '')}")
+        print(f"downstream lm-eval gpu_memory_utilization={gpu_memory_utilization}")
+        print(
+            "downstream lm-eval vLLM limits: "
+            f"batch_size={batch_size}, max_model_len={max_model_len}, "
+            f"max_num_batched_tokens={max_num_batched_tokens}, max_num_seqs={max_num_seqs}, "
+            f"tensor_parallel_size={tensor_parallel_size}, data_parallel_size={data_parallel_size}"
+        )
+        print(
+            "downstream lm-eval HF limits: "
+            f"batch_size={hf_batch_size}, max_batch_size={hf_max_batch_size}, "
+            f"gpu_memory_utilization={hf_gpu_memory_utilization}"
+        )
+        print(
+            "downstream lm-eval shared args: "
+            f"dtype={dtype}, num_fewshot={shot_count}, "
+            f"apply_chat_template={apply_chat_template}, fewshot_as_multiturn={fewshot_as_multiturn}, "
+            f"gen_kwargs={gen_kwargs}, limit={task_limit}, batch_size={benchmark_batch_size}, "
+            f"cache_requests={cache_requests}, request_cache_path={request_cache_path}"
+        )
+        run_lm_eval(
+            model_path,
+            tasks,
+            benchmark_output_path,
+            device=device,
+            batch_size=benchmark_batch_size,
+            limit=task_limit,
+            backend=backend,
+            dtype=dtype,
+            num_fewshot=shot_count,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            gen_kwargs=gen_kwargs,
+            model_args_extra=model_args_extra,
+            cache_requests=cache_requests,
+            request_cache_path=request_cache_path,
+            include_path=include_path,
+            log_samples=log_samples,
+            python_bin=lm_eval_python,
+            env=env,
+        )
+        result_json = find_latest_result_json(benchmark_output_path)
+        scores = extract_main_scores(
+            result_json,
+            include_tasks=include_tasks,
+            include_sample_len=include_tasks is not None,
+        )
+        append_scores_to_csv(
+            scores,
+            args.model,
+            target_ratio,
+            summary_csv,
+            metadata={
+                "prune_method": args.prune_method,
+                "method_tag": compare_tag,
+                "prune_scope": getattr(args, "curvature_prune_scope", "global"),
+                "score_order": score_order,
+                "prune_ops": " ".join(getattr(args, "prune_ops", None) or []),
+                "benchmark": benchmark,
+                "lm_eval_backend": backend,
+                "dtype": dtype,
+                "num_fewshot": shot_count,
+                "apply_chat_template": apply_chat_template,
+                "fewshot_as_multiturn": fewshot_as_multiturn,
+                "gen_kwargs": gen_kwargs or "",
+                "limit": task_limit or "",
+                "batch_size": benchmark_batch_size,
+                "cache_requests": cache_requests or "",
+            },
+        )
+
+    if benchmarks:
+        for benchmark in benchmarks:
+            include_tasks = MMLU_SUMMARY_TASKS if benchmark["benchmark"] == "mmlu" else None
+            run_one_benchmark(
+                benchmark["benchmark"],
+                benchmark["tasks"],
+                benchmark["backend"],
+                benchmark["num_fewshot"],
+                benchmark.get("limit"),
+                include_tasks=include_tasks,
+            )
+    else:
+        include_tasks = MMLU_SUMMARY_TASKS if final_tasks == ["mmlu"] else None
+        run_one_benchmark(
+            "single",
+            eval_tasks,
+            default_backend,
+            num_fewshot,
+            limit,
+            include_tasks=include_tasks,
+        )
+    print(f"downstream lm-eval summary saved to {summary_csv}")
+    return output_path
 
 
 def cleanup_downstream_model(model_path):
@@ -649,6 +817,7 @@ def run_pp_eval(
     save_filepath,
     base_curvature_scores=None,
     base_wanda_scores=None,
+    base_wanda_input_scalers=None,
 ):
     result_dir = os.path.dirname(save_filepath)
     compare_dir = args.per_layer_compare_dir or result_dir
@@ -699,7 +868,10 @@ def run_pp_eval(
                         score_order=score_order,
                     )
                 elif args.prune_method == "wanda":
-                    current_model.wanda_scores = base_wanda_scores
+                    if base_wanda_input_scalers is not None:
+                        current_model.wanda_input_scalers = base_wanda_input_scalers
+                    else:
+                        current_model.wanda_scores = base_wanda_scores
                     prune_wanda(args, current_model, tokenizer, model_device, prune_n, prune_m)
                 elif args.prune_method == "magnitude":
                     prune_magnitude(args, current_model, tokenizer, model_device, prune_n, prune_m)
@@ -756,17 +928,16 @@ def run_pp_eval(
                     model_save_path = save_model_path(args.save_model, target_ratio, len(sparsity_ratios))
                     if len(prune_score_orders) > 1:
                         model_save_path = os.path.join(model_save_path, score_order)
-                current_model.save_pretrained(model_save_path)
                 if getattr(args, "run_downstream_eval", False):
-                    save_vllm_tokenizer_files(args, tokenizer, model_save_path)
+                    save_downstream_checkpoint(args, current_model, tokenizer, model_save_path)
                 else:
-                    tokenizer.save_pretrained(model_save_path)
+                    save_pruned_model(current_model, tokenizer, model_save_path)
 
             del current_model
             release_cuda_memory()
 
             if getattr(args, "run_downstream_eval", False):
-                run_downstream_vllm_eval(
+                run_downstream_lm_eval(
                     args,
                     model_save_path,
                     compare_dir,

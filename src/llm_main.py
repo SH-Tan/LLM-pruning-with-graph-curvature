@@ -21,7 +21,7 @@ from utils.llm_main_utils import (
 )
 from pruning.prune import load_curvature_pkls
 from pruning.prune_curvature import prune_curvature
-from pruning.prune_wanda import compute_wanda_scores
+from pruning.prune_wanda import compute_wanda_input_scalers, compute_wanda_scores
 
 
 def _disable_transformers_allocator_warmup():
@@ -305,7 +305,7 @@ def _build_parser():
     parser.add_argument(
         "--run_downstream_eval",
         action="store_true",
-        help="Run vLLM downstream accuracy after PPL for each pruned sparsity checkpoint.",
+        help="Run lm-eval downstream accuracy after PPL for each pruned sparsity checkpoint.",
     )
     parser.add_argument(
         "--downstream_only",
@@ -315,30 +315,47 @@ def _build_parser():
     parser.add_argument(
         "--keep_downstream_model",
         action="store_true",
-        help="Keep temporary pruned checkpoints saved for downstream vLLM eval.",
+        help="Keep temporary pruned checkpoints saved for downstream lm-eval.",
     )
-    parser.add_argument("--downstream_task_data", type=str, default="downstream_test/dataset/mathqa500/test.parquet")
-    parser.add_argument("--downstream_prompt_key", type=str, default="prompt")
-    parser.add_argument("--downstream_response_key", type=str, default="")
-    parser.add_argument("--downstream_reward_score_dir", type=str, default="")
+    parser.add_argument(
+        "--downstream_tasks",
+        type=str,
+        nargs="*",
+        default=["hellaswag", "piqa", "winogrande", "arc_easy", "arc_challenge", "boolq"],
+        help="lm-eval task names for final downstream evaluation.",
+    )
+    parser.add_argument("--downstream_summary_csv", type=str, default="eval_results/summary.csv")
+    parser.add_argument("--downstream_suite", type=str, default="")
+    parser.add_argument("--downstream_suite_benchmarks", type=str, default="")
+    parser.add_argument("--downstream_suite_tasks", type=str, default="")
+    parser.add_argument("--downstream_suite_backends", type=str, default="")
+    parser.add_argument("--downstream_suite_fewshots", type=str, default="")
+    parser.add_argument("--downstream_suite_limits", type=str, default="")
+    parser.add_argument("--downstream_num_fewshot", type=int, default=5)
+    parser.add_argument("--downstream_apply_chat_template", action="store_true")
+    parser.add_argument("--downstream_fewshot_as_multiturn", action="store_true")
+    parser.add_argument("--downstream_gen_kwargs", type=str, default="")
+    parser.add_argument("--downstream_limit", type=str, default="")
     parser.add_argument("--downstream_output_dir", type=str, default="")
     parser.add_argument("--downstream_model_dir", type=str, default="")
+    parser.add_argument("--downstream_lm_eval_backend", type=str, default="vllm", choices=["hf", "vllm"])
     parser.add_argument("--downstream_vllm_python", type=str, default="")
-    parser.add_argument("--downstream_max_examples", type=int, default=500)
-    parser.add_argument("--downstream_start_index", type=int, default=0)
-    parser.add_argument("--downstream_shuffle", action="store_true")
-    parser.add_argument("--downstream_batch_size", type=int, default=1)
-    parser.add_argument("--downstream_generation_max_batch_tokens", type=int, default=32768)
-    parser.add_argument("--downstream_max_prompt_length", type=int, default=2048)
-    parser.add_argument("--downstream_max_new_tokens", type=int, default=2048)
-    parser.add_argument("--downstream_min_tokens", type=int, default=16)
-    parser.add_argument("--downstream_temperature", type=float, default=0.0)
-    parser.add_argument("--downstream_top_p", type=float, default=1.0)
-    parser.add_argument("--downstream_top_k", type=int, default=0)
-    parser.add_argument("--downstream_response_log_max", type=int, default=50)
+    parser.add_argument("--downstream_batch_size", type=str, default="auto")
+    parser.add_argument("--downstream_hf_batch_size", type=str, default="auto")
+    parser.add_argument("--downstream_hf_max_batch_size", type=int, default=8)
+    parser.add_argument("--downstream_hf_gpu_memory_utilization", type=float, default=0.6)
     parser.add_argument("--downstream_tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--downstream_data_parallel_size", type=int, default=1)
     parser.add_argument("--downstream_gpu_memory_utilization", type=float, default=0.7)
-    parser.add_argument("--downstream_dtype", type=str, default="auto")
+    parser.add_argument("--downstream_dtype", type=str, default="bfloat16")
+    parser.add_argument("--downstream_max_model_len", type=int, default=2048)
+    parser.add_argument("--downstream_max_num_batched_tokens", type=int, default=8192)
+    parser.add_argument("--downstream_max_num_seqs", type=int, default=64)
+    parser.add_argument("--downstream_save_shard_size", type=str, default="2GB")
+    parser.add_argument("--downstream_cache_requests", type=str, default="true")
+    parser.add_argument("--downstream_request_cache_path", type=str, default="eval_results/lm_eval_request_cache")
+    parser.add_argument("--downstream_include_path", type=str, default="")
+    parser.add_argument("--downstream_log_samples", action="store_true")
     return parser
 
 
@@ -410,6 +427,7 @@ def main():
     needs_pruning = any(ratio != 0 for ratio in sparsity_ratios)
     base_curvature_scores = None
     base_wanda_scores = None
+    base_wanda_input_scalers = None
 
     if args.load_curvature_dir is not None:
         if contains_curvature_pkls(
@@ -468,8 +486,12 @@ def main():
         model = load_llm(args.model, args.cache_dir, model_device, args.seqlen)
         model.eval()
         model.seqlen = args.seqlen
-        print(f"precomputing WANDA scores with seqlen={args.seqlen}")
-        base_wanda_scores = compute_wanda_scores(args, model, tokenizer, model_device)
+        if args.run_per_layer_eval or args.curvature_prune_scope == "global":
+            print(f"precomputing WANDA scores with seqlen={args.seqlen}")
+            base_wanda_scores = compute_wanda_scores(args, model, tokenizer, model_device)
+        else:
+            print(f"precomputing WANDA input scalers with seqlen={args.seqlen}")
+            base_wanda_input_scalers = compute_wanda_input_scalers(args, model, tokenizer, model_device)
         del model
         release_cuda_memory()
 
@@ -509,6 +531,7 @@ def main():
         save_filepath,
         base_curvature_scores=base_curvature_scores,
         base_wanda_scores=base_wanda_scores,
+        base_wanda_input_scalers=base_wanda_input_scalers,
     )
 
 

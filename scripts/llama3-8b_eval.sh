@@ -1,10 +1,9 @@
 #!/bin/sh
 set -e
 
-# PPL eval from saved curvature PKLs for Llama-3-8B.
-# Uses the Transformers model path in src/llm_main.py; no downstream/vLLM eval.
+# PPL and lm-eval downstream eval from saved curvature PKLs for Llama-3-8B.
 model="${MODEL:-meta-llama/Meta-Llama-3-8B}"
-python_bin="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
+python_bin="${PYTHON_BIN:-python}"
 sparsity_ratios="${SPARSITY_RATIOS:-0 0.3 0.4 0.5 0.6 0.7 0.9 1}"
 nsamples="${NSAMPLES:-5}"
 seed="${SEED:-13}"
@@ -23,6 +22,35 @@ seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
 run_all_layer_eval="${RUN_ALL_LAYER_EVAL:-${RUN_PP_EVAL:-1}}"
 run_per_layer_eval="${RUN_PER_LAYER_EVAL:-0}"
+run_downstream_test="${RUN_DOWNSTREAM_TEST:-1}"
+downstream_only="${DOWNSTREAM_ONLY:-1}"
+downstream_tasks="${DOWNSTREAM_TASKS:-mmlu}"
+downstream_batch_size="${DOWNSTREAM_BATCH_SIZE:-auto}"
+downstream_output_dir="${DOWNSTREAM_OUTPUT_DIR:-}"
+downstream_summary_csv="${DOWNSTREAM_SUMMARY_CSV:-eval_results/summary.csv}"
+downstream_suite="${DOWNSTREAM_SUITE:-core}"
+downstream_suite_benchmarks="${DOWNSTREAM_SUITE_BENCHMARKS:-mmlu;agieval_en;commonsense_qa;winogrande;triviaqa;boolq;squadv2}"
+downstream_suite_tasks="${DOWNSTREAM_SUITE_TASKS:-mmlu_stem,mmlu_social_sciences;agieval_en;commonsense_qa;winogrande;triviaqa;boolq;squadv2}"
+downstream_suite_backends="${DOWNSTREAM_SUITE_BACKENDS:-hf;hf;hf;hf;vllm;hf;vllm}"
+downstream_suite_fewshots="${DOWNSTREAM_SUITE_FEWSHOTS:-5;0;7;5;5;0;1}"
+downstream_suite_limits="${DOWNSTREAM_SUITE_LIMITS:-0.25;0.5;1000;1000;500;1000;500}"
+downstream_num_fewshot="${DOWNSTREAM_NUM_FEWSHOT:-5}"
+downstream_apply_chat_template="${DOWNSTREAM_APPLY_CHAT_TEMPLATE:-0}"
+downstream_fewshot_as_multiturn="${DOWNSTREAM_FEWSHOT_AS_MULTITURN:-0}"
+downstream_gen_kwargs="${DOWNSTREAM_GEN_KWARGS:-}"
+downstream_limit="${DOWNSTREAM_LIMIT:-}"
+downstream_lm_eval_backend="${DOWNSTREAM_LM_EVAL_BACKEND:-hf}"
+downstream_vllm_python="${DOWNSTREAM_VLLM_PYTHON:-/home/tans5/anaconda3/envs/vllm/bin/python}"
+downstream_gpu_memory_utilization="${DOWNSTREAM_GPU_MEMORY_UTILIZATION:-0.7}"
+downstream_tensor_parallel_size="${DOWNSTREAM_TENSOR_PARALLEL_SIZE:-1}"
+downstream_data_parallel_size="${DOWNSTREAM_DATA_PARALLEL_SIZE:-1}"
+downstream_dtype="${DOWNSTREAM_DTYPE:-bfloat16}"
+downstream_max_model_len="${DOWNSTREAM_MAX_MODEL_LEN:-2048}"
+downstream_max_num_batched_tokens="${DOWNSTREAM_MAX_NUM_BATCHED_TOKENS:-8192}"
+downstream_max_num_seqs="${DOWNSTREAM_MAX_NUM_SEQS:-64}"
+downstream_save_shard_size="${DOWNSTREAM_SAVE_SHARD_SIZE:-2GB}"
+downstream_cache_requests="${DOWNSTREAM_CACHE_REQUESTS:-true}"
+downstream_request_cache_path="${DOWNSTREAM_REQUEST_CACHE_PATH:-eval_results/lm_eval_request_cache}"
 
 curvature_dir="${CURVATURE_DIR:-out/llama_8b/unstructured/curvature/gate_up_resid/}"
 wanda_dir="${WANDA_DIR:-out/llama_8b/unstructured/wanda/all_seq_compare/}"
@@ -40,6 +68,20 @@ run_python_command() {
     prunescore_order=$3
     prune_score_order=$4
     eval_flag=$5
+
+    downstream_flag=""
+    if [ "$run_downstream_test" = "1" ] && [ "$eval_flag" = "--run_pp_eval" ]; then
+        downstream_flag="--run_downstream_eval"
+        if [ "$downstream_only" = "1" ]; then
+            downstream_flag="$downstream_flag --downstream_only"
+        fi
+        if [ "$downstream_apply_chat_template" = "1" ]; then
+            downstream_flag="$downstream_flag --downstream_apply_chat_template"
+        fi
+        if [ "$downstream_fewshot_as_multiturn" = "1" ]; then
+            downstream_flag="$downstream_flag --downstream_fewshot_as_multiturn"
+        fi
+    fi
 
     "$python_bin" src/llm_main.py \
         --model $model \
@@ -69,6 +111,32 @@ run_python_command() {
         --per_layer_compare_dir $compare_dir \
         --model_dtype $model_dtype \
         --mlp_activation $mlp_activation \
+        --downstream_tasks $downstream_tasks \
+        --downstream_batch_size "$downstream_batch_size" \
+        --downstream_output_dir "$downstream_output_dir" \
+        --downstream_summary_csv "$downstream_summary_csv" \
+        --downstream_suite "$downstream_suite" \
+        --downstream_suite_benchmarks "$downstream_suite_benchmarks" \
+        --downstream_suite_tasks "$downstream_suite_tasks" \
+        --downstream_suite_backends "$downstream_suite_backends" \
+        --downstream_suite_fewshots "$downstream_suite_fewshots" \
+        --downstream_suite_limits "$downstream_suite_limits" \
+        --downstream_num_fewshot "$downstream_num_fewshot" \
+        --downstream_gen_kwargs "$downstream_gen_kwargs" \
+        --downstream_limit "$downstream_limit" \
+        --downstream_lm_eval_backend "$downstream_lm_eval_backend" \
+        --downstream_vllm_python "$downstream_vllm_python" \
+        --downstream_gpu_memory_utilization "$downstream_gpu_memory_utilization" \
+        --downstream_tensor_parallel_size "$downstream_tensor_parallel_size" \
+        --downstream_data_parallel_size "$downstream_data_parallel_size" \
+        --downstream_dtype "$downstream_dtype" \
+        --downstream_max_model_len "$downstream_max_model_len" \
+        --downstream_max_num_batched_tokens "$downstream_max_num_batched_tokens" \
+        --downstream_max_num_seqs "$downstream_max_num_seqs" \
+        --downstream_save_shard_size "$downstream_save_shard_size" \
+        --downstream_cache_requests "$downstream_cache_requests" \
+        --downstream_request_cache_path "$downstream_request_cache_path" \
+        $downstream_flag \
         $eval_flag
 }
 
