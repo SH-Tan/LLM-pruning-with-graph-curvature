@@ -280,3 +280,4 @@ model_architectures/*.txt
 *.ipynb
 out/
 .codex
+eval_results/
