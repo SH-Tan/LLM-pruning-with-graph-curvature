@@ -9,6 +9,8 @@ from pruning.prune import align_curvature_to_weight_shape, should_prune_op, skip
 from pruning.curv_prune_utils import _get_prunable_module, _is_magnitude_fallback
 from pruning.prune_log_utils import append_layer_pruned_parameter_log, collect_pruned_parameter_rows
 
+PPL_PLOT_MAX_SPARSITY = 0.7
+
 
 def _curvature_score_order(args):
     return getattr(args, "prune_score_order", "high_to_low") == "high_to_low"
@@ -265,6 +267,12 @@ def draw_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
     records = _read_eval_records(csv_paths)
     if not records:
         return None
+    records = [
+        record for record in records
+        if float(record["target_sparsity"]) <= PPL_PLOT_MAX_SPARSITY
+    ]
+    if not records:
+        return None
 
     try:
         mpl_config_dir = os.path.join("/tmp", "matplotlib")
@@ -375,6 +383,12 @@ def draw_method_comparison(compare_dir, plot_dir, eval_seq_lens=None):
 
 
 def draw_ppl_vs_sparsity(records, plot_path):
+    if not records:
+        return None
+    records = [
+        record for record in records
+        if float(record["target_sparsity"]) <= PPL_PLOT_MAX_SPARSITY
+    ]
     if not records:
         return None
 

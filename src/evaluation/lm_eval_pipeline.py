@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -61,6 +62,54 @@ def _lm_eval_cache_root(request_cache_path=None):
     return Path("eval_results") / "hf_eval_cache"
 
 
+def _hash_tokenizer_files(model_path):
+    digest = hashlib.sha1()
+    found = False
+    for name in (
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "tokenizer.model",
+        "vocab.json",
+        "merges.txt",
+    ):
+        path = Path(model_path) / name
+        if not path.is_file():
+            continue
+        found = True
+        digest.update(name.encode("utf-8"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()[:12] if found else None
+
+
+def _short_tokenizer_path(model_path, request_cache_path=None):
+    tokenizer_hash = _hash_tokenizer_files(model_path)
+    if tokenizer_hash is None:
+        return None
+
+    root = Path(request_cache_path).parent if request_cache_path else Path("eval_results")
+    short_root = root / "lm_eval_tokenizers"
+    short_root.mkdir(parents=True, exist_ok=True)
+    short_path = short_root / f"tok_{tokenizer_hash}"
+    target_path = Path(model_path).resolve()
+
+    if short_path.is_symlink():
+        if short_path.resolve() == target_path:
+            return str(short_path)
+        short_path.unlink()
+    if short_path.exists():
+        return str(short_path)
+
+    try:
+        short_path.symlink_to(target_path, target_is_directory=True)
+        return str(short_path)
+    except OSError:
+        return str(model_path)
+
+
 def run_lm_eval(
     model_path,
     tasks,
@@ -79,13 +128,22 @@ def run_lm_eval(
     request_cache_path=None,
     include_path=None,
     log_samples=False,
+    log_samples_limit=0,
     python_bin=None,
     env=None,
 ):
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     task_arg = ",".join(tasks)
-    model_args = f"pretrained={model_path},dtype={dtype},trust_remote_code=True"
+    tokenizer_path = _short_tokenizer_path(model_path, request_cache_path)
+    model_args_parts = [
+        f"pretrained={model_path}",
+        f"dtype={dtype}",
+        "trust_remote_code=True",
+    ]
+    if tokenizer_path:
+        model_args_parts.append(f"tokenizer={tokenizer_path}")
+    model_args = ",".join(model_args_parts)
     if model_args_extra:
         model_args = f"{model_args},{model_args_extra}"
     cmd = _lm_eval_command(python_bin) + [
@@ -133,6 +191,25 @@ def run_lm_eval(
         cmd.append("--confirm_run_unsafe_code")
         env["HF_ALLOW_CODE_EVAL"] = "1"
     subprocess.run(cmd, check=True, env=env)
+    trim_sample_logs(output_path, log_samples_limit)
+
+
+def trim_sample_logs(output_path, max_samples):
+    max_samples = int(max_samples or 0)
+    if max_samples <= 0:
+        return
+
+    for sample_path in Path(output_path).rglob("samples*.jsonl"):
+        tmp_path = sample_path.with_suffix(sample_path.suffix + ".tmp")
+        kept = 0
+        with sample_path.open("r", encoding="utf-8") as src, tmp_path.open("w", encoding="utf-8") as dst:
+            for line in src:
+                if kept >= max_samples:
+                    break
+                dst.write(line)
+                kept += 1
+        os.replace(tmp_path, sample_path)
+        print(f"kept {kept} logged samples in {sample_path}")
 
 
 def find_latest_result_json(output_path):
@@ -160,6 +237,18 @@ def extract_main_scores(result_json, include_tasks=None, include_sample_len=Fals
     for task, metrics in data.get("results", {}).items():
         if include_tasks is not None and task not in include_tasks:
             continue
+        if task == "ifeval":
+            prompt_metric, prompt_score = _metric_value(metrics, "prompt_level_strict_acc")
+            inst_metric, inst_score = _metric_value(metrics, "inst_level_strict_acc")
+            if prompt_metric is not None and inst_metric is not None:
+                rows.append(
+                    {
+                        "task": task,
+                        "metric": "strict_acc_avg",
+                        "score": (float(prompt_score) + float(inst_score)) / 2.0,
+                    }
+                )
+                continue
         for metric_name in ("acc_norm", "acc", "exact_match", "exact", "f1", "contains", "pass@1"):
             metric, score = _metric_value(metrics, metric_name)
             if metric is not None:

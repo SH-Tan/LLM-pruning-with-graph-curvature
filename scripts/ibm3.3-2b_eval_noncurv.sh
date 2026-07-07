@@ -2,10 +2,10 @@
 set -e
 
 # All-layer pruning + downstream eval for non-curvature methods.
-# Default runs magnitude only. Use PRUNE_METHODS="magnitude wanda" to include WANDA.
+# Default runs WANDA and magnitude. Override PRUNE_METHODS to run a subset.
 model="${MODEL:-ibm-granite/granite-3.3-2b-instruct}"
 python_bin="${PYTHON_BIN:-python}"
-sparsity_ratios="${SPARSITY_RATIOS:-0 0.3 0.4 0.5 0.6 0.7 0.9 1}"
+sparsity_ratios="${SPARSITY_RATIOS:-0 0.1 0.3 0.4 0.5 0.6 0.8 1}"
 nsamples="${NSAMPLES:-5}"
 seed="${SEED:-13}"
 alpha="${ALPHA:-0.9}"
@@ -14,7 +14,7 @@ compute_device="${COMPUTE_DEVICE:-cuda:1}"
 seq_len="${SEQ_LEN:-512}"
 pp_seqlen="${PP_SEQLEN:-$seq_len 1024}"
 calib_data="${CALIB_DATA:-c4_independent}"
-prune_ops="${PRUNE_OPS:-}"
+prune_ops="${PRUNE_OPS:-up_proj gate_proj down_proj}"
 skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 run_downstream_test="${RUN_DOWNSTREAM_TEST:-1}"
@@ -27,11 +27,11 @@ downstream_hf_gpu_memory_utilization="${DOWNSTREAM_HF_GPU_MEMORY_UTILIZATION:-0.
 downstream_output_dir="${DOWNSTREAM_OUTPUT_DIR:-}"
 downstream_summary_csv="${DOWNSTREAM_SUMMARY_CSV:-eval_results/summary.csv}"
 downstream_suite="${DOWNSTREAM_SUITE:-core}"
-downstream_suite_benchmarks="${DOWNSTREAM_SUITE_BENCHMARKS:-mmlu;commonsense_qa;winogrande;boolq;truthfulqa;gsm8k;humaneval;math500}"
-downstream_suite_tasks="${DOWNSTREAM_SUITE_TASKS:-mmlu_stem,mmlu_social_sciences;commonsense_qa;winogrande;boolq;truthfulqa_mc1,truthfulqa_mc2;gsm8k;humaneval;minerva_math500}"
-downstream_suite_backends="${DOWNSTREAM_SUITE_BACKENDS:-hf;hf;hf;hf;hf;vllm;vllm;vllm}"
-downstream_suite_fewshots="${DOWNSTREAM_SUITE_FEWSHOTS:-5;7;5;0;0;5;0;4}"
-downstream_suite_limits="${DOWNSTREAM_SUITE_LIMITS:-0.25;1000;1000;1000;500;500;164;500}"
+downstream_suite_benchmarks="${DOWNSTREAM_SUITE_BENCHMARKS:-mmlu;commonsense_qa;winogrande;boolq;truthfulqa;gsm8k}"
+downstream_suite_tasks="${DOWNSTREAM_SUITE_TASKS:-mmlu_stem,mmlu_social_sciences;commonsense_qa;winogrande;boolq;truthfulqa_mc1,truthfulqa_mc2;gsm8k}"
+downstream_suite_backends="${DOWNSTREAM_SUITE_BACKENDS:-hf;hf;hf;hf;hf;vllm}"
+downstream_suite_fewshots="${DOWNSTREAM_SUITE_FEWSHOTS:-5;7;5;0;0;5}"
+downstream_suite_limits="${DOWNSTREAM_SUITE_LIMITS:-0.25;1000;1000;1000;500;500}"
 downstream_num_fewshot="${DOWNSTREAM_NUM_FEWSHOT:-5}"
 downstream_apply_chat_template="${DOWNSTREAM_APPLY_CHAT_TEMPLATE:-0}"
 downstream_fewshot_as_multiturn="${DOWNSTREAM_FEWSHOT_AS_MULTITURN:-0}"
@@ -39,21 +39,27 @@ downstream_gen_kwargs="${DOWNSTREAM_GEN_KWARGS:-max_gen_toks=2048}"
 downstream_limit="${DOWNSTREAM_LIMIT:-}"
 downstream_lm_eval_backend="${DOWNSTREAM_LM_EVAL_BACKEND:-vllm}"
 downstream_vllm_python="${DOWNSTREAM_VLLM_PYTHON:-/home/tans5/anaconda3/envs/vllm/bin/python}"
-downstream_gpu_memory_utilization="${DOWNSTREAM_GPU_MEMORY_UTILIZATION:-0.6}"
+downstream_gpu_memory_utilization="${DOWNSTREAM_GPU_MEMORY_UTILIZATION:-0.8}"
 downstream_tensor_parallel_size="${DOWNSTREAM_TENSOR_PARALLEL_SIZE:-1}"
 downstream_data_parallel_size="${DOWNSTREAM_DATA_PARALLEL_SIZE:-1}"
 downstream_dtype="${DOWNSTREAM_DTYPE:-bfloat16}"
-downstream_max_model_len="${DOWNSTREAM_MAX_MODEL_LEN:-2048}"
-downstream_max_num_batched_tokens="${DOWNSTREAM_MAX_NUM_BATCHED_TOKENS:-8192}"
-downstream_max_num_seqs="${DOWNSTREAM_MAX_NUM_SEQS:-64}"
+downstream_max_model_len="${DOWNSTREAM_MAX_MODEL_LEN:-4096}"
+downstream_max_num_batched_tokens="${DOWNSTREAM_MAX_NUM_BATCHED_TOKENS:-32768}"
+downstream_max_num_seqs="${DOWNSTREAM_MAX_NUM_SEQS:-24}"
 downstream_save_shard_size="${DOWNSTREAM_SAVE_SHARD_SIZE:-2GB}"
 downstream_cache_requests="${DOWNSTREAM_CACHE_REQUESTS:-true}"
 downstream_request_cache_path="${DOWNSTREAM_REQUEST_CACHE_PATH:-eval_results/lm_eval_request_cache}"
 downstream_include_path="${DOWNSTREAM_INCLUDE_PATH:-lm_eval_tasks}"
-downstream_log_samples="${DOWNSTREAM_LOG_SAMPLES:-0}"
+downstream_log_samples="${DOWNSTREAM_LOG_SAMPLES:-1}"
+downstream_log_samples_limit="${DOWNSTREAM_LOG_SAMPLES_LIMIT:-20}"
+downstream_task_data="${DOWNSTREAM_TASK_DATA:-downstream_test/dataset/mathqa500/test.parquet}"
+downstream_local_batch_size="${DOWNSTREAM_LOCAL_BATCH_SIZE:-1}"
+downstream_generation_max_batch_tokens="${DOWNSTREAM_GENERATION_MAX_BATCH_TOKENS:-32768}"
+downstream_max_prompt_length="${DOWNSTREAM_MAX_PROMPT_LENGTH:-2048}"
+downstream_max_new_tokens="${DOWNSTREAM_MAX_NEW_TOKENS:-2048}"
 
-prune_methods="${PRUNE_METHODS:-magnitude}"
-prune_scopes="${PRUNE_SCOPES:-globally locally per_op}"
+prune_methods="${PRUNE_METHODS:-wanda magnitude}"
+prune_scopes="${PRUNE_SCOPES:-per_op}"
 wanda_dir="${WANDA_DIR:-out/ibm_2b_instruct/unstructured/wanda/noncurv_eval/}"
 magnitude_dir="${MAGNITUDE_DIR:-out/ibm_2b_instruct/unstructured/magnitude/noncurv_eval/}"
 compare_dir_root="${COMPARE_DIR_ROOT:-out/ibm_2b_instruct/unstructured/noncurv_all_layer_compare}"
@@ -148,6 +154,12 @@ run_python_command() {
         --downstream_cache_requests "$downstream_cache_requests" \
         --downstream_request_cache_path "$downstream_request_cache_path" \
         --downstream_include_path "$downstream_include_path" \
+        --downstream_log_samples_limit "$downstream_log_samples_limit" \
+        --downstream_task_data "$downstream_task_data" \
+        --downstream_local_batch_size "$downstream_local_batch_size" \
+        --downstream_generation_max_batch_tokens "$downstream_generation_max_batch_tokens" \
+        --downstream_max_prompt_length "$downstream_max_prompt_length" \
+        --downstream_max_new_tokens "$downstream_max_new_tokens" \
         $prune_ops_flag \
         $skip_prune_layer_flag \
         $downstream_log_samples_flag \

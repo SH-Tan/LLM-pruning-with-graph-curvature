@@ -38,11 +38,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using {device} device")
 
 # model_name = "mistralai/Mistral-7B-v0.1"
-model_name = "meta-llama/Meta-Llama-3-8B"
+# model_name = "meta-llama/Meta-Llama-3-8B"
 # model_name = "meta-llama/Llama-3.2-1B"
 # model_name = "Qwen/Qwen2.5-0.5B"
 # model_name = "meta-llama/Llama-3.2-3B-Instruct"
-# model_name = "ibm-granite/granite-3.3-2b-instruct"
+model_name = "ibm-granite/granite-3.3-2b-instruct"
 
 print("Loading model:", model_name)
 

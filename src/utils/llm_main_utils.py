@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -369,6 +370,79 @@ def hf_max_memory_per_gpu(memory_fraction, cuda_visible_devices=None):
     return f"{gib}GiB"
 
 
+def run_local_vllm_downstream_eval(
+    args,
+    model_path,
+    benchmark_output_path,
+    vllm_python,
+    tensor_parallel_size,
+    gpu_memory_utilization,
+    dtype,
+    env,
+    max_examples=None,
+):
+    os.makedirs(benchmark_output_path, exist_ok=True)
+    output_path = os.path.join(benchmark_output_path, "responses.jsonl")
+    metrics_path = os.path.join(benchmark_output_path, "metrics.json")
+    cmd = [
+        vllm_python,
+        "-m",
+        "downstream_test.vllm_accuracy_runner",
+        "--model_path",
+        model_path,
+        "--dataset_path",
+        getattr(args, "downstream_task_data", "downstream_test/dataset/mathqa500/test.parquet"),
+        "--output_path",
+        output_path,
+        "--metrics_path",
+        metrics_path,
+        "--prompt_key",
+        getattr(args, "downstream_prompt_key", "prompt"),
+        "--start_index",
+        str(getattr(args, "downstream_start_index", 0)),
+        "--max_examples",
+        str(max_examples if max_examples is not None else getattr(args, "downstream_max_examples", 500)),
+        "--batch_size",
+        str(getattr(args, "downstream_local_batch_size", 1)),
+        "--generation_max_batch_tokens",
+        str(getattr(args, "downstream_generation_max_batch_tokens", 32768)),
+        "--max_prompt_length",
+        str(getattr(args, "downstream_max_prompt_length", 2048)),
+        "--max_new_tokens",
+        str(getattr(args, "downstream_max_new_tokens", 2048)),
+        "--min_tokens",
+        str(getattr(args, "downstream_min_tokens", 0)),
+        "--temperature",
+        str(getattr(args, "downstream_temperature", 0.0)),
+        "--top_p",
+        str(getattr(args, "downstream_top_p", 1.0)),
+        "--top_k",
+        str(getattr(args, "downstream_top_k", 0)),
+        "--response_log_max",
+        str(getattr(args, "downstream_response_log_max", 0)),
+        "--tensor_parallel_size",
+        str(tensor_parallel_size),
+        "--gpu_memory_utilization",
+        str(gpu_memory_utilization),
+        "--dtype",
+        dtype,
+    ]
+    response_key = getattr(args, "downstream_response_key", "")
+    if response_key:
+        cmd.extend(["--response_key", response_key])
+    reward_score_dir = getattr(args, "downstream_reward_score_dir", "")
+    if reward_score_dir:
+        cmd.extend(["--reward_score_dir", reward_score_dir])
+    if getattr(args, "downstream_shuffle", False):
+        cmd.append("--shuffle")
+
+    print(f"running local downstream vLLM eval: dataset={getattr(args, 'downstream_task_data', '')}")
+    print(f"local downstream output={output_path}")
+    subprocess.run(cmd, check=True, env=env)
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ratio, score_order):
     output_dir = getattr(args, "downstream_output_dir", "") or os.path.join(compare_dir, "lm_eval_results")
     os.makedirs(output_dir, exist_ok=True)
@@ -387,17 +461,19 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
     num_fewshot = getattr(args, "downstream_num_fewshot", 5)
     apply_chat_template = bool(getattr(args, "downstream_apply_chat_template", False))
     fewshot_as_multiturn = bool(getattr(args, "downstream_fewshot_as_multiturn", False))
+    chat_template_args = getattr(args, "downstream_chat_template_args", "") or None
     gen_kwargs = getattr(args, "downstream_gen_kwargs", "") or None
     limit = getattr(args, "downstream_limit", "") or None
     cache_requests = getattr(args, "downstream_cache_requests", "true") or None
     request_cache_path = getattr(args, "downstream_request_cache_path", "") or None
     include_path = getattr(args, "downstream_include_path", "") or None
     log_samples = bool(getattr(args, "downstream_log_samples", False))
+    log_samples_limit = int(getattr(args, "downstream_log_samples_limit", 0))
     dtype = getattr(args, "downstream_dtype", "bfloat16")
     default_backend = getattr(args, "downstream_lm_eval_backend", "vllm")
     tensor_parallel_size = max(1, int(getattr(args, "downstream_tensor_parallel_size", 1)))
     data_parallel_size = max(1, int(getattr(args, "downstream_data_parallel_size", 1)))
-    gpu_memory_utilization = min(float(getattr(args, "downstream_gpu_memory_utilization", 0.7)), 0.7)
+    gpu_memory_utilization = min(float(getattr(args, "downstream_gpu_memory_utilization", 0.6)), 0.85)
     max_model_len = int(getattr(args, "downstream_max_model_len", 2048))
     max_num_batched_tokens = int(getattr(args, "downstream_max_num_batched_tokens", 8192))
     max_num_seqs = int(getattr(args, "downstream_max_num_seqs", 64))
@@ -415,20 +491,42 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
         gpu_ids = best_free_gpu_ids(tensor_parallel_size * data_parallel_size)
         if gpu_ids:
             env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    def score_metadata(benchmark, backend, shot_count, task_limit, benchmark_batch_size, cache_requests_value):
+        return {
+            "prune_method": args.prune_method,
+            "method_tag": compare_tag,
+            "prune_scope": getattr(args, "curvature_prune_scope", "global"),
+            "score_order": score_order,
+            "prune_ops": " ".join(getattr(args, "prune_ops", None) or []),
+            "benchmark": benchmark,
+            "lm_eval_backend": backend,
+            "dtype": dtype,
+            "num_fewshot": shot_count,
+            "apply_chat_template": apply_chat_template,
+            "fewshot_as_multiturn": fewshot_as_multiturn,
+            "gen_kwargs": gen_kwargs or "",
+            "limit": task_limit or "",
+            "batch_size": benchmark_batch_size,
+            "cache_requests": cache_requests_value or "",
+        }
+
     def run_one_benchmark(benchmark, tasks, backend, shot_count, task_limit, include_tasks=None):
         benchmark_output_path = output_path if benchmark == "single" else os.path.join(output_path, benchmark)
         lm_eval_python = vllm_python if backend == "vllm" else sys.executable
         model_args_extra = None
         benchmark_batch_size = batch_size
         if backend == "vllm":
-            model_args_extra = (
-                f"tensor_parallel_size={tensor_parallel_size},"
-                f"data_parallel_size={data_parallel_size},"
-                f"gpu_memory_utilization={gpu_memory_utilization},"
-                f"max_model_len={max_model_len},"
-                f"max_num_batched_tokens={max_num_batched_tokens},"
-                f"max_num_seqs={max_num_seqs}"
-            )
+            model_args = [
+                f"tensor_parallel_size={tensor_parallel_size}",
+                f"data_parallel_size={data_parallel_size}",
+                f"gpu_memory_utilization={gpu_memory_utilization}",
+                f"max_model_len={max_model_len}",
+                f"max_num_batched_tokens={max_num_batched_tokens}",
+                f"max_num_seqs={max_num_seqs}",
+            ]
+            if chat_template_args:
+                model_args.append(chat_template_args)
+            model_args_extra = ",".join(model_args)
         elif backend == "hf":
             benchmark_batch_size = hf_batch_size
             model_args = [f"max_batch_size={hf_max_batch_size}"]
@@ -438,7 +536,38 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
             )
             if hf_memory_cap is not None:
                 model_args.extend(["parallelize=True", f"max_memory_per_gpu={hf_memory_cap}"])
+            if chat_template_args:
+                model_args.append(chat_template_args)
             model_args_extra = ",".join(model_args)
+
+        if backend == "local_vllm":
+            metrics = run_local_vllm_downstream_eval(
+                args,
+                model_path,
+                benchmark_output_path,
+                vllm_python,
+                tensor_parallel_size,
+                gpu_memory_utilization,
+                dtype,
+                env,
+                max_examples=int(float(task_limit)) if task_limit else None,
+            )
+            score = metrics.get("accuracy", metrics.get("pass@1", metrics.get("mean_score")))
+            append_scores_to_csv(
+                [{"task": tasks[0] if tasks else benchmark, "metric": "accuracy", "score": score}],
+                args.model,
+                target_ratio,
+                summary_csv,
+                metadata=score_metadata(
+                    benchmark,
+                    backend,
+                    shot_count,
+                    task_limit,
+                    getattr(args, "downstream_local_batch_size", 1),
+                    "",
+                ),
+            )
+            return
 
         print(f"running downstream lm-eval {backend} final: benchmark={benchmark} tasks={','.join(tasks)}")
         print(f"downstream lm-eval python={lm_eval_python}")
@@ -459,7 +588,8 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
             "downstream lm-eval shared args: "
             f"dtype={dtype}, num_fewshot={shot_count}, "
             f"apply_chat_template={apply_chat_template}, fewshot_as_multiturn={fewshot_as_multiturn}, "
-            f"gen_kwargs={gen_kwargs}, limit={task_limit}, batch_size={benchmark_batch_size}, "
+            f"chat_template_args={chat_template_args}, gen_kwargs={gen_kwargs}, "
+            f"limit={task_limit}, batch_size={benchmark_batch_size}, "
             f"cache_requests={cache_requests}, request_cache_path={request_cache_path}"
         )
         run_lm_eval(
@@ -480,6 +610,7 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
             request_cache_path=request_cache_path,
             include_path=include_path,
             log_samples=log_samples,
+            log_samples_limit=log_samples_limit,
             python_bin=lm_eval_python,
             env=env,
         )
@@ -494,23 +625,14 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
             args.model,
             target_ratio,
             summary_csv,
-            metadata={
-                "prune_method": args.prune_method,
-                "method_tag": compare_tag,
-                "prune_scope": getattr(args, "curvature_prune_scope", "global"),
-                "score_order": score_order,
-                "prune_ops": " ".join(getattr(args, "prune_ops", None) or []),
-                "benchmark": benchmark,
-                "lm_eval_backend": backend,
-                "dtype": dtype,
-                "num_fewshot": shot_count,
-                "apply_chat_template": apply_chat_template,
-                "fewshot_as_multiturn": fewshot_as_multiturn,
-                "gen_kwargs": gen_kwargs or "",
-                "limit": task_limit or "",
-                "batch_size": benchmark_batch_size,
-                "cache_requests": cache_requests or "",
-            },
+            metadata=score_metadata(
+                benchmark,
+                backend,
+                shot_count,
+                task_limit,
+                benchmark_batch_size,
+                cache_requests,
+            ),
         )
 
     if benchmarks:

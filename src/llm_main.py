@@ -305,7 +305,7 @@ def _build_parser():
     parser.add_argument(
         "--run_downstream_eval",
         action="store_true",
-        help="Run lm-eval downstream accuracy after PPL for each pruned sparsity checkpoint.",
+        help="Run downstream accuracy after PPL for each pruned sparsity checkpoint.",
     )
     parser.add_argument(
         "--downstream_only",
@@ -334,11 +334,12 @@ def _build_parser():
     parser.add_argument("--downstream_num_fewshot", type=int, default=5)
     parser.add_argument("--downstream_apply_chat_template", action="store_true")
     parser.add_argument("--downstream_fewshot_as_multiturn", action="store_true")
+    parser.add_argument("--downstream_chat_template_args", type=str, default="")
     parser.add_argument("--downstream_gen_kwargs", type=str, default="")
     parser.add_argument("--downstream_limit", type=str, default="")
     parser.add_argument("--downstream_output_dir", type=str, default="")
     parser.add_argument("--downstream_model_dir", type=str, default="")
-    parser.add_argument("--downstream_lm_eval_backend", type=str, default="vllm", choices=["hf", "vllm"])
+    parser.add_argument("--downstream_lm_eval_backend", type=str, default="vllm", choices=["hf", "vllm", "local_vllm"])
     parser.add_argument("--downstream_vllm_python", type=str, default="")
     parser.add_argument("--downstream_batch_size", type=str, default="auto")
     parser.add_argument("--downstream_hf_batch_size", type=str, default="auto")
@@ -346,7 +347,7 @@ def _build_parser():
     parser.add_argument("--downstream_hf_gpu_memory_utilization", type=float, default=0.6)
     parser.add_argument("--downstream_tensor_parallel_size", type=int, default=1)
     parser.add_argument("--downstream_data_parallel_size", type=int, default=1)
-    parser.add_argument("--downstream_gpu_memory_utilization", type=float, default=0.7)
+    parser.add_argument("--downstream_gpu_memory_utilization", type=float, default=0.6)
     parser.add_argument("--downstream_dtype", type=str, default="bfloat16")
     parser.add_argument("--downstream_max_model_len", type=int, default=2048)
     parser.add_argument("--downstream_max_num_batched_tokens", type=int, default=8192)
@@ -356,6 +357,23 @@ def _build_parser():
     parser.add_argument("--downstream_request_cache_path", type=str, default="eval_results/lm_eval_request_cache")
     parser.add_argument("--downstream_include_path", type=str, default="")
     parser.add_argument("--downstream_log_samples", action="store_true")
+    parser.add_argument("--downstream_log_samples_limit", type=int, default=0)
+    parser.add_argument("--downstream_task_data", type=str, default="downstream_test/dataset/mathqa500/test.parquet")
+    parser.add_argument("--downstream_prompt_key", type=str, default="prompt")
+    parser.add_argument("--downstream_response_key", type=str, default="")
+    parser.add_argument("--downstream_reward_score_dir", type=str, default="")
+    parser.add_argument("--downstream_start_index", type=int, default=0)
+    parser.add_argument("--downstream_max_examples", type=int, default=500)
+    parser.add_argument("--downstream_shuffle", action="store_true")
+    parser.add_argument("--downstream_local_batch_size", type=int, default=1)
+    parser.add_argument("--downstream_generation_max_batch_tokens", type=int, default=32768)
+    parser.add_argument("--downstream_max_prompt_length", type=int, default=2048)
+    parser.add_argument("--downstream_max_new_tokens", type=int, default=2048)
+    parser.add_argument("--downstream_min_tokens", type=int, default=0)
+    parser.add_argument("--downstream_temperature", type=float, default=0.0)
+    parser.add_argument("--downstream_top_p", type=float, default=1.0)
+    parser.add_argument("--downstream_top_k", type=int, default=0)
+    parser.add_argument("--downstream_response_log_max", type=int, default=0)
     return parser
 
 

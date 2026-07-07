@@ -16,7 +16,7 @@ sample_edge_num="${SAMPLE_EDGE_NUM:--1}"
 pp_seqlen="${PP_SEQLEN:-$seq_len 1024}"
 calib_data="${CALIB_DATA:-c4_independent}"
 prune_ops="${PRUNE_OPS:-gate_proj up_proj}"
-skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63}"
+skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 top_k_seq="${TOP_K_SEQ:-10}"
 seq_select="${SEQ_SELECT:-top}"
@@ -33,30 +33,37 @@ downstream_hf_gpu_memory_utilization="${DOWNSTREAM_HF_GPU_MEMORY_UTILIZATION:-0.
 downstream_output_dir="${DOWNSTREAM_OUTPUT_DIR:-}"
 downstream_summary_csv="${DOWNSTREAM_SUMMARY_CSV:-eval_results/summary.csv}"
 downstream_suite="${DOWNSTREAM_SUITE:-core}"
-downstream_suite_benchmarks="${DOWNSTREAM_SUITE_BENCHMARKS:-mmlu;commonsense_qa;winogrande;boolq;truthfulqa;gsm8k;humaneval;math500}"
-downstream_suite_tasks="${DOWNSTREAM_SUITE_TASKS:-mmlu_stem,mmlu_social_sciences;commonsense_qa;winogrande;boolq;truthfulqa_mc1,truthfulqa_mc2;gsm8k;humaneval;minerva_math500}"
-downstream_suite_backends="${DOWNSTREAM_SUITE_BACKENDS:-hf;hf;hf;hf;hf;vllm;vllm;vllm}"
-downstream_suite_fewshots="${DOWNSTREAM_SUITE_FEWSHOTS:-5;7;5;0;0;5;0;4}"
-downstream_suite_limits="${DOWNSTREAM_SUITE_LIMITS:-0.25;1000;1000;1000;500;500;164;500}"
+downstream_suite_benchmarks="${DOWNSTREAM_SUITE_BENCHMARKS:-mmlu;winogrande;truthfulqa;gsm8k;ifeval}"
+downstream_suite_tasks="${DOWNSTREAM_SUITE_TASKS:-mmlu_stem,mmlu_social_sciences;winogrande;truthfulqa_mc1,truthfulqa_mc2;gsm8k;ifeval}"
+downstream_suite_backends="${DOWNSTREAM_SUITE_BACKENDS:-hf;hf;hf;vllm;vllm}"
+downstream_suite_fewshots="${DOWNSTREAM_SUITE_FEWSHOTS:-5;5;0;8;0}"
+downstream_suite_limits="${DOWNSTREAM_SUITE_LIMITS:-0.25;1000;500;500;500}"
 downstream_num_fewshot="${DOWNSTREAM_NUM_FEWSHOT:-5}"
 downstream_apply_chat_template="${DOWNSTREAM_APPLY_CHAT_TEMPLATE:-0}"
 downstream_fewshot_as_multiturn="${DOWNSTREAM_FEWSHOT_AS_MULTITURN:-0}"
+downstream_chat_template_args="${DOWNSTREAM_CHAT_TEMPLATE_ARGS:-}"
 downstream_gen_kwargs="${DOWNSTREAM_GEN_KWARGS:-max_gen_toks=2048}"
 downstream_limit="${DOWNSTREAM_LIMIT:-}"
 downstream_lm_eval_backend="${DOWNSTREAM_LM_EVAL_BACKEND:-vllm}"
 downstream_vllm_python="${DOWNSTREAM_VLLM_PYTHON:-/home/tans5/anaconda3/envs/vllm/bin/python}"
-downstream_gpu_memory_utilization="${DOWNSTREAM_GPU_MEMORY_UTILIZATION:-0.6}"
+downstream_gpu_memory_utilization="${DOWNSTREAM_GPU_MEMORY_UTILIZATION:-0.8}"
 downstream_tensor_parallel_size="${DOWNSTREAM_TENSOR_PARALLEL_SIZE:-1}"
 downstream_data_parallel_size="${DOWNSTREAM_DATA_PARALLEL_SIZE:-1}"
 downstream_dtype="${DOWNSTREAM_DTYPE:-bfloat16}"
-downstream_max_model_len="${DOWNSTREAM_MAX_MODEL_LEN:-2048}"
-downstream_max_num_batched_tokens="${DOWNSTREAM_MAX_NUM_BATCHED_TOKENS:-8192}"
-downstream_max_num_seqs="${DOWNSTREAM_MAX_NUM_SEQS:-64}"
+downstream_max_model_len="${DOWNSTREAM_MAX_MODEL_LEN:-16384}"
+downstream_max_num_batched_tokens="${DOWNSTREAM_MAX_NUM_BATCHED_TOKENS:-49152}"
+downstream_max_num_seqs="${DOWNSTREAM_MAX_NUM_SEQS:-24}"
 downstream_save_shard_size="${DOWNSTREAM_SAVE_SHARD_SIZE:-2GB}"
 downstream_cache_requests="${DOWNSTREAM_CACHE_REQUESTS:-true}"
 downstream_request_cache_path="${DOWNSTREAM_REQUEST_CACHE_PATH:-eval_results/lm_eval_request_cache}"
 downstream_include_path="${DOWNSTREAM_INCLUDE_PATH:-lm_eval_tasks}"
-downstream_log_samples="${DOWNSTREAM_LOG_SAMPLES:-0}"
+downstream_log_samples="${DOWNSTREAM_LOG_SAMPLES:-1}"
+downstream_log_samples_limit="${DOWNSTREAM_LOG_SAMPLES_LIMIT:-20}"
+downstream_task_data="${DOWNSTREAM_TASK_DATA:-downstream_test/dataset/mathqa500/test.parquet}"
+downstream_local_batch_size="${DOWNSTREAM_LOCAL_BATCH_SIZE:-1}"
+downstream_generation_max_batch_tokens="${DOWNSTREAM_GENERATION_MAX_BATCH_TOKENS:-65536}"
+downstream_max_prompt_length="${DOWNSTREAM_MAX_PROMPT_LENGTH:-2048}"
+downstream_max_new_tokens="${DOWNSTREAM_MAX_NEW_TOKENS:-2048}"
 
 curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_up/}"
 wanda_dir="${WANDA_DIR:-out/ibm_2b_instruct/unstructured/wanda/all_seq_compare/}"
@@ -145,6 +152,7 @@ run_python_command() {
         --downstream_suite_fewshots "$downstream_suite_fewshots" \
         --downstream_suite_limits "$downstream_suite_limits" \
         --downstream_num_fewshot "$downstream_num_fewshot" \
+        --downstream_chat_template_args "$downstream_chat_template_args" \
         --downstream_gen_kwargs "$downstream_gen_kwargs" \
         --downstream_limit "$downstream_limit" \
         --downstream_lm_eval_backend "$downstream_lm_eval_backend" \
@@ -160,6 +168,12 @@ run_python_command() {
         --downstream_cache_requests "$downstream_cache_requests" \
         --downstream_request_cache_path "$downstream_request_cache_path" \
         --downstream_include_path "$downstream_include_path" \
+        --downstream_log_samples_limit "$downstream_log_samples_limit" \
+        --downstream_task_data "$downstream_task_data" \
+        --downstream_local_batch_size "$downstream_local_batch_size" \
+        --downstream_generation_max_batch_tokens "$downstream_generation_max_batch_tokens" \
+        --downstream_max_prompt_length "$downstream_max_prompt_length" \
+        --downstream_max_new_tokens "$downstream_max_new_tokens" \
         $prune_ops_flag \
         $skip_prune_layer_flag \
         $downstream_log_samples_flag \
@@ -191,9 +205,9 @@ run_eval_for_prune_ops() {
     echo "Eval compare dir: $compare_dir"
 
     if [ "$run_all_layer_eval" = "1" ]; then
-        run_scope_all_methods "globally" "globally"
-        run_scope_all_methods "locally" "locally"
         run_scope_all_methods "per_op" "per-op"
+        run_scope_all_methods "locally" "locally"
+        run_scope_all_methods "globally" "globally"
     fi
 
     if [ "$run_per_layer_eval" = "1" ]; then
