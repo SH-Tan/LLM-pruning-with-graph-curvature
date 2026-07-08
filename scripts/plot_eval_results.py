@@ -355,6 +355,105 @@ def plot_compare_downstream_summaries(summary_csvs, output_dir, compare_name):
     return saved
 
 
+def plot_per_layer_op_method_summaries(summary_csv, output_dir):
+    required = ["sparsity", "prune_method", "prune_scope", "task", "score"]
+    df = pd.read_csv(summary_csv)
+    if df.empty or not set(required).issubset(df.columns):
+        return []
+
+    df = df[df["prune_scope"] == "per_layer_op"].copy()
+    if df.empty:
+        return []
+
+    df["plot_task"] = df["benchmark"] if "benchmark" in df.columns else df["task"]
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_name = Path(summary_csv).stem
+    saved = []
+
+    for method, method_df in df.groupby("prune_method", sort=True):
+        mean_df = (
+            method_df.groupby("sparsity", as_index=False)["score"]
+            .mean()
+            .sort_values("sparsity")
+        )
+        task_df = (
+            method_df.groupby(["plot_task", "sparsity"], as_index=False)["score"]
+            .mean()
+            .sort_values(["plot_task", "sparsity"])
+        )
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 9), dpi=120, sharex=True)
+        ax = axes[0]
+        ax.plot(mean_df["sparsity"], mean_df["score"], marker="o", linewidth=2, label=method)
+        ax.set_title(f"{method} per-op downstream mean accuracy")
+        ax.set_ylabel("Mean accuracy")
+        ax.grid(True, alpha=0.25)
+        ax.legend(title="Prune method")
+
+        ax = axes[1]
+        for task, sub in task_df.groupby("plot_task", sort=False):
+            sub = sub.sort_values("sparsity")
+            ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=1.5, label=task)
+        ax.set_title(f"{method} per-op downstream accuracy by benchmark")
+        ax.set_xlabel("Target sparsity")
+        ax.set_ylabel("Accuracy")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8, ncol=3)
+        fig.tight_layout()
+        method_path = output_dir / f"{summary_name}_per_layer_op_{method}_downstream_accuracy.png"
+        fig.savefig(method_path, dpi=200)
+        plt.close(fig)
+        saved.append(method_path)
+
+    mean_df = (
+        df.groupby(["prune_method", "sparsity"], as_index=False)["score"]
+        .mean()
+        .sort_values(["prune_method", "sparsity"])
+    )
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=120)
+    for method, sub in mean_df.groupby("prune_method", sort=True):
+        sub = sub.sort_values("sparsity")
+        ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=2, label=method)
+    ax.set_title("Per-op downstream mean accuracy")
+    ax.set_xlabel("Target sparsity")
+    ax.set_ylabel("Mean accuracy")
+    ax.grid(True, alpha=0.25)
+    ax.legend(title="Prune method")
+    fig.tight_layout()
+    compare_path = output_dir / f"{summary_name}_per_layer_op_three_methods_downstream_accuracy.png"
+    fig.savefig(compare_path, dpi=200)
+    plt.close(fig)
+    saved.append(compare_path)
+
+    task_dir = output_dir / f"{summary_name}_per_layer_op_three_methods_by_task"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    task_scores = df[["task", "prune_method", "sparsity", "score"]].sort_values(
+        ["task", "prune_method", "sparsity"]
+    )
+    scores_path = task_dir / "task_scores.csv"
+    task_scores.to_csv(scores_path, index=False)
+    saved.append(scores_path)
+
+    for task, task_df in task_scores.groupby("task", sort=True):
+        fig, ax = plt.subplots(figsize=(7, 4.5), dpi=120)
+        for method, sub in task_df.groupby("prune_method", sort=True):
+            sub = sub.sort_values("sparsity")
+            ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=2, label=method)
+        ax.set_title(f"{task} per-op downstream score")
+        ax.set_xlabel("Target sparsity")
+        ax.set_ylabel("Score")
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        task_path = task_dir / f"{task}.png"
+        fig.savefig(task_path, dpi=200)
+        plt.close(fig)
+        saved.append(task_path)
+
+    return saved
+
+
 def _method_label(method_tag):
     if "curvature" in method_tag:
         return "curvature"
@@ -441,6 +540,7 @@ def main():
     else:
         split_paths, run_labels = export_downstream_csvs(args.summary_csv, args.split_output_dir)
     explicit_plots = plot_explicit_downstream_summary(args.summary_csv, output_dir)
+    per_layer_op_plots = plot_per_layer_op_method_summaries(args.summary_csv, output_dir)
     if explicit_plots:
         downstream_plot, completed = None, []
     else:
@@ -459,6 +559,8 @@ def main():
     if split_paths:
         print(f"saved {len(split_paths)} split csvs under {args.split_output_dir}")
     for plot_path in explicit_plots:
+        print(f"saved {plot_path}")
+    for plot_path in per_layer_op_plots:
         print(f"saved {plot_path}")
     if downstream_plot:
         print(f"saved {downstream_plot}")

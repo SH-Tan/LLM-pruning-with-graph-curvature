@@ -224,14 +224,25 @@ def _curvature_seq_tag(shared_top_k=None, shared_seq_select="top", curvature_lpf
     return f"{tag}_pkl"
 
 
+CURVATURE_PRUNABLE_OPS = {
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+}
+
+
 def _filter_curvature_scores(layer_scores, prune_ops=None):
-    if not prune_ops:
-        return layer_scores
-    prune_ops = set(prune_ops)
+    allowed_ops = CURVATURE_PRUNABLE_OPS
+    if prune_ops:
+        allowed_ops = allowed_ops.intersection(prune_ops)
     return {
         op_name: curv
         for op_name, curv in layer_scores.items()
-        if op_name in prune_ops
+        if op_name in allowed_ops
     }
 
 

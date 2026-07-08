@@ -9,8 +9,6 @@ from pruning.prune_log_utils import (
 def _get_prunable_module(model, layer_idx, op_name):
     layer = model.model.layers[layer_idx]
 
-    if op_name == "lm_head":
-        return model.lm_head
     if op_name == "down_proj":
         return layer.mlp.down_proj
     if op_name in {"q_proj", "k_proj", "v_proj", "o_proj"}:

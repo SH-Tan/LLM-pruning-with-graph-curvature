@@ -107,7 +107,16 @@ def _all_cost_matrices(layer_cache, names, device):
 
 
 
-def build_layer_cache(model, operations, layer_id, cache=None, device="cuda", required_names=None):
+def build_layer_cache(
+    model,
+    operations,
+    layer_id,
+    cache=None,
+    device="cuda",
+    required_names=None,
+    l2_norm=False,
+    l2_norm_mode="per_example",
+):
     """
     Build or update the layer cache with distance matrices.
     Keep this once per layer/model state, then reuse across samples.
@@ -133,7 +142,15 @@ def build_layer_cache(model, operations, layer_id, cache=None, device="cuda", re
             if dist_matrix is None:
                 continue
         else:
-            dist_matrix = _operation_distance_matrix_torch(model, operations, name, layer_id, device)
+            dist_matrix = _operation_distance_matrix_torch(
+                model,
+                operations,
+                name,
+                layer_id,
+                device,
+                l2_norm=l2_norm,
+                l2_norm_mode=l2_norm_mode,
+            )
         cache[f"{name}__dist"] = dist_matrix.cpu().contiguous()
         del dist_matrix
         if str(device).startswith("cuda") and torch.cuda.is_available():

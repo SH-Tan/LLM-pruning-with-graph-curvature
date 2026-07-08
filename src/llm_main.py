@@ -285,7 +285,7 @@ def _build_parser():
         type=str,
         nargs="*",
         default=None,
-        choices=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"],
+        choices=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         help="Optional operation names to prune. If omitted, all available prunable ops are used.",
     )
     parser.add_argument(
