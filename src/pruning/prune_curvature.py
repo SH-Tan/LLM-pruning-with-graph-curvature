@@ -170,7 +170,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
     target_ops = ["gate_proj", "up_proj"]
     last_layer_idx = len(layers) - 1
-    layer_start = 15
+    layer_start = 0
     layer_end = min(last_layer_idx, last_layer_idx)
 
     model.curvature_scores = [{} for _ in range(len(layers))]
