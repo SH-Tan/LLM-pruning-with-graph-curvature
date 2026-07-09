@@ -6,6 +6,10 @@ import sys
 
 import torch
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 from utils.cuda_memory_utils import release_cuda_memory
 from pruning.curv_layer_prune_utils import (
     draw_method_comparison,
@@ -39,6 +43,7 @@ from pruning.per_layer_eval_utils import (
 from pruning.prune import check_sparsity
 from pruning.prune_magnitude import prune_magnitude
 from pruning.prune_wanda import prune_wanda
+from downstream_test.local_task_utils import resolve_local_task
 
 
 def l2_path_tag(args):
@@ -380,10 +385,14 @@ def run_local_vllm_downstream_eval(
     dtype,
     env,
     max_examples=None,
+    dataset_path=None,
+    prompt_key=None,
 ):
     os.makedirs(benchmark_output_path, exist_ok=True)
     output_path = os.path.join(benchmark_output_path, "responses.jsonl")
     metrics_path = os.path.join(benchmark_output_path, "metrics.json")
+    dataset_path = dataset_path or getattr(args, "downstream_task_data", "downstream_test/dataset/mathqa500/test.parquet")
+    prompt_key = prompt_key or getattr(args, "downstream_prompt_key", "prompt")
     cmd = [
         vllm_python,
         "-m",
@@ -391,13 +400,13 @@ def run_local_vllm_downstream_eval(
         "--model_path",
         model_path,
         "--dataset_path",
-        getattr(args, "downstream_task_data", "downstream_test/dataset/mathqa500/test.parquet"),
+        dataset_path,
         "--output_path",
         output_path,
         "--metrics_path",
         metrics_path,
         "--prompt_key",
-        getattr(args, "downstream_prompt_key", "prompt"),
+        prompt_key,
         "--start_index",
         str(getattr(args, "downstream_start_index", 0)),
         "--max_examples",
@@ -433,10 +442,12 @@ def run_local_vllm_downstream_eval(
     reward_score_dir = getattr(args, "downstream_reward_score_dir", "")
     if reward_score_dir:
         cmd.extend(["--reward_score_dir", reward_score_dir])
+    if getattr(args, "downstream_apply_chat_template", False):
+        cmd.append("--apply_chat_template")
     if getattr(args, "downstream_shuffle", False):
         cmd.append("--shuffle")
 
-    print(f"running local downstream vLLM eval: dataset={getattr(args, 'downstream_task_data', '')}")
+    print(f"running local downstream vLLM eval: dataset={dataset_path}")
     print(f"local downstream output={output_path}")
     subprocess.run(cmd, check=True, env=env)
     with open(metrics_path, "r", encoding="utf-8") as f:
@@ -512,6 +523,9 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
 
     def run_one_benchmark(benchmark, tasks, backend, shot_count, task_limit, include_tasks=None):
         benchmark_output_path = output_path if benchmark == "single" else os.path.join(output_path, benchmark)
+        local_task = resolve_local_task(benchmark, tasks)
+        if local_task is not None:
+            backend = "local_vllm"
         lm_eval_python = vllm_python if backend == "vllm" else sys.executable
         model_args_extra = None
         benchmark_batch_size = batch_size
@@ -551,6 +565,8 @@ def run_downstream_lm_eval(args, model_path, compare_dir, compare_tag, target_ra
                 dtype,
                 env,
                 max_examples=int(float(task_limit)) if task_limit else None,
+                dataset_path=local_task["dataset_path"] if local_task else None,
+                prompt_key=local_task["prompt_key"] if local_task else None,
             )
             score = metrics.get("accuracy", metrics.get("pass@1", metrics.get("mean_score")))
             append_scores_to_csv(

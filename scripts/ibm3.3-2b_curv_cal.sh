@@ -15,10 +15,11 @@ seq_len="${SEQ_LEN:-512}"
 sample_edge_ratio="${SAMPLE_EDGE_RATIO:-0.5}"
 sample_edge_num="${SAMPLE_EDGE_NUM:--1}"
 calib_data="${CALIB_DATA:-c4_independent}"
-curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_up/}"
+curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate/}"
 curvature_dtype="${CURVATURE_DTYPE:-float32}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 save_parameter_metric_logs="${SAVE_PARAMETER_METRIC_LOGS:-0}"
+draw_parameter_metric_plots="${DRAW_PARAMETER_METRIC_PLOTS:-0}"
 run_eval_after_curv="${RUN_EVAL_AFTER_CURV:-1}"
 run_all_layer_eval="${RUN_ALL_LAYER_EVAL:-${RUN_PP_EVAL:-1}}"
 run_per_layer_eval="${RUN_PER_LAYER_EVAL:-0}"
@@ -44,8 +45,12 @@ run_curvature_calculation() {
     if [ "$save_parameter_metric_logs" = "1" ]; then
         parameter_log_flag="--save_parameter_metric_logs"
     fi
+    parameter_plot_flag=""
+    if [ "$draw_parameter_metric_plots" = "1" ]; then
+        parameter_plot_flag="--draw_parameter_metric_plots"
+    fi
 
-    echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select, lpf_window=$curvature_lpf_window, mlp_activation=$mlp_activation"
+    echo "Running curvature calculation: use_l2_norm=$use_l2_norm, l2_norm_mode=$l2_mode, top_k_seq=$top_k_seq, seq_select=$seq_select, lpf_window=$curvature_lpf_window, mlp_activation=$mlp_activation, parameter_logs=$save_parameter_metric_logs, parameter_plots=$draw_parameter_metric_plots"
     "$python_bin" src/llm_main.py \
         --model $model \
         --prune_method curvature \
@@ -69,6 +74,7 @@ run_curvature_calculation() {
         --model_dtype $model_dtype \
         --mlp_activation $mlp_activation \
         $parameter_log_flag \
+        $parameter_plot_flag \
         $l2_flag
 }
 
@@ -95,10 +101,10 @@ run_curvature_calculation() {
 
 
 
-top_k_seq="${TOP_K_SEQ:-10}"
+top_k_seq="${TOP_K_SEQ:--1}"
 seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
-run_curvature_calculation 0 "per_example"
+run_curvature_calculation 1 "per_example"
 
 if [ "$run_eval_after_curv" = "1" ]; then
     echo "Curvature calculation finished; running eval script."
@@ -123,5 +129,5 @@ if [ "$run_eval_after_curv" = "1" ]; then
     RUN_PER_LAYER_EVAL="$run_per_layer_eval" \
     RUN_DOWNSTREAM_TEST="$run_downstream_test" \
     MLP_ACTIVATION="$mlp_activation" \
-    sh scripts/ibm3.3-2b_eval.sh
+    sh scripts/ibm3.3-2b_eval_ppl.sh
 fi

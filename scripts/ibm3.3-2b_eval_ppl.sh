@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-# PPL and lm-eval downstream eval from saved curvature PKLs for IBM Granite 3.3 2B.
+# PPL eval from saved curvature PKLs for IBM Granite 3.3 2B.
 model="${MODEL:-ibm-granite/granite-3.3-2b-instruct}"
 python_bin="${PYTHON_BIN:-python}"
 sparsity_ratios="${SPARSITY_RATIOS:-0 0.3 0.4 0.5 0.6 0.7 0.9 1}"
@@ -15,16 +15,17 @@ sample_edge_ratio="${SAMPLE_EDGE_RATIO:-0.5}"
 sample_edge_num="${SAMPLE_EDGE_NUM:--1}"
 pp_seqlen="${PP_SEQLEN:-$seq_len 1024}"
 calib_data="${CALIB_DATA:-c4_independent}"
-prune_ops="${PRUNE_OPS:-gate_proj up_proj}"
+prune_ops="${PRUNE_OPS:-gate_proj}"
 skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
+use_l2_norm="${USE_L2_NORM:-0}"
+l2_norm_mode="${L2_NORM_MODE:-per_example}"
 top_k_seq="${TOP_K_SEQ:-10}"
 seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
 run_all_layer_eval="${RUN_ALL_LAYER_EVAL:-${RUN_PP_EVAL:-1}}"
 run_per_layer_eval="${RUN_PER_LAYER_EVAL:-0}"
-run_downstream_test="${RUN_DOWNSTREAM_TEST:-1}"
-downstream_only="${DOWNSTREAM_ONLY:-1}"
+run_downstream_test="0"
 downstream_tasks="${DOWNSTREAM_TASKS:-gsm8k}"
 downstream_batch_size="${DOWNSTREAM_BATCH_SIZE:-auto}"
 downstream_hf_batch_size="${DOWNSTREAM_HF_BATCH_SIZE:-auto}"
@@ -33,11 +34,11 @@ downstream_hf_gpu_memory_utilization="${DOWNSTREAM_HF_GPU_MEMORY_UTILIZATION:-0.
 downstream_output_dir="${DOWNSTREAM_OUTPUT_DIR:-}"
 downstream_summary_csv="${DOWNSTREAM_SUMMARY_CSV:-eval_results/summary.csv}"
 downstream_suite="${DOWNSTREAM_SUITE:-core}"
-downstream_suite_benchmarks="${DOWNSTREAM_SUITE_BENCHMARKS:-mmlu;winogrande;truthfulqa;gsm8k;ifeval}"
-downstream_suite_tasks="${DOWNSTREAM_SUITE_TASKS:-mmlu_stem,mmlu_social_sciences;winogrande;truthfulqa_mc1,truthfulqa_mc2;gsm8k;ifeval}"
-downstream_suite_backends="${DOWNSTREAM_SUITE_BACKENDS:-hf;hf;hf;vllm;vllm}"
-downstream_suite_fewshots="${DOWNSTREAM_SUITE_FEWSHOTS:-5;5;0;8;0}"
-downstream_suite_limits="${DOWNSTREAM_SUITE_LIMITS:-0.25;1000;500;500;500}"
+downstream_suite_benchmarks="${DOWNSTREAM_SUITE_BENCHMARKS:-mmlu;winogrande;truthfulqa;gsm8k;math500;ifeval}"
+downstream_suite_tasks="${DOWNSTREAM_SUITE_TASKS:-mmlu_stem,mmlu_social_sciences;winogrande;truthfulqa_mc1,truthfulqa_mc2;gsm8k;math500;ifeval}"
+downstream_suite_backends="${DOWNSTREAM_SUITE_BACKENDS:-hf;hf;hf;local_vllm;local_vllm;vllm}"
+downstream_suite_fewshots="${DOWNSTREAM_SUITE_FEWSHOTS:-5;5;0;8;0;0}"
+downstream_suite_limits="${DOWNSTREAM_SUITE_LIMITS:-0.25;1000;500;500;500;500}"
 downstream_num_fewshot="${DOWNSTREAM_NUM_FEWSHOT:-5}"
 downstream_apply_chat_template="${DOWNSTREAM_APPLY_CHAT_TEMPLATE:-0}"
 downstream_fewshot_as_multiturn="${DOWNSTREAM_FEWSHOT_AS_MULTITURN:-0}"
@@ -59,7 +60,7 @@ downstream_request_cache_path="${DOWNSTREAM_REQUEST_CACHE_PATH:-eval_results/lm_
 downstream_include_path="${DOWNSTREAM_INCLUDE_PATH:-lm_eval_tasks}"
 downstream_log_samples="${DOWNSTREAM_LOG_SAMPLES:-1}"
 downstream_log_samples_limit="${DOWNSTREAM_LOG_SAMPLES_LIMIT:-20}"
-downstream_task_data="${DOWNSTREAM_TASK_DATA:-downstream_test/dataset/mathqa500/test.parquet}"
+downstream_task_data="${DOWNSTREAM_TASK_DATA:-downstream_test/dataset/gsm8k/test.parquet}"
 downstream_local_batch_size="${DOWNSTREAM_LOCAL_BATCH_SIZE:-1}"
 downstream_generation_max_batch_tokens="${DOWNSTREAM_GENERATION_MAX_BATCH_TOKENS:-65536}"
 downstream_max_prompt_length="${DOWNSTREAM_MAX_PROMPT_LENGTH:-2048}"
@@ -96,20 +97,12 @@ run_python_command() {
     if [ -n "$prune_ops" ]; then
         prune_ops_flag="--prune_ops $prune_ops"
     fi
+    l2_flag=""
+    if [ "$use_l2_norm" = "1" ]; then
+        l2_flag="--L2-norm --l2_norm_mode $l2_norm_mode"
+    fi
 
     downstream_flag=""
-    if [ "$run_downstream_test" = "1" ] && [ "$eval_flag" = "--run_pp_eval" ]; then
-        downstream_flag="--run_downstream_eval"
-        if [ "$downstream_only" = "1" ]; then
-            downstream_flag="$downstream_flag --downstream_only"
-        fi
-        if [ "$downstream_apply_chat_template" = "1" ]; then
-            downstream_flag="$downstream_flag --downstream_apply_chat_template"
-        fi
-        if [ "$downstream_fewshot_as_multiturn" = "1" ]; then
-            downstream_flag="$downstream_flag --downstream_fewshot_as_multiturn"
-        fi
-    fi
 
     "$python_bin" src/llm_main.py \
         --model $model \
@@ -138,6 +131,7 @@ run_python_command() {
         --per_layer_compare_dir $compare_dir \
         --model_dtype $model_dtype \
         --mlp_activation $mlp_activation \
+        $l2_flag \
         --downstream_tasks $downstream_tasks \
         --downstream_batch_size "$downstream_batch_size" \
         --downstream_hf_batch_size "$downstream_hf_batch_size" \
@@ -225,6 +219,6 @@ run_eval_for_prune_ops() {
     fi
 }
 
-run_eval_for_prune_ops "gate_proj up_proj" "$compare_dir_root/gate_up_resid/"
-run_eval_for_prune_ops "up_proj" "$compare_dir_root/up_resid/"
-run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_resid/"
+run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate/"
+# run_eval_for_prune_ops "gate_proj up_proj" "$compare_dir_root/gate_up/"
+# run_eval_for_prune_ops "up_proj" "$compare_dir_root/up/"
