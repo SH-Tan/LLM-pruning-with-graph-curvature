@@ -214,7 +214,7 @@ run_eval_for_prune_ops() {
     if [ "$run_all_layer_eval" = "1" ]; then
         run_scope_all_methods "per_op" "per-op"
         run_scope_all_methods "locally" "locally"
-        run_scope_all_methods "globally" "globally"
+        # run_scope_all_methods "globally" "globally"
     fi
 
     if [ "$run_per_layer_eval" = "1" ]; then
