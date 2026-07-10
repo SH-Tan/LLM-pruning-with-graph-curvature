@@ -355,6 +355,135 @@ def plot_compare_downstream_summaries(summary_csvs, output_dir, compare_name):
     return saved
 
 
+def _plot_group_comparison(df, group_column, output_path, title, legend_title, ylabel):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mean_df = (
+        df.groupby([group_column, "sparsity"], as_index=False)["score"]
+        .mean()
+        .sort_values([group_column, "sparsity"])
+    )
+
+    labels = list(mean_df[group_column].drop_duplicates())
+    if group_column == "scope_label":
+        labels = [scope for scope in ("global", "per_op", "local") if scope in set(labels)]
+        labels.extend(label for label in mean_df[group_column].drop_duplicates() if label not in labels)
+    line_styles = {
+        "global": {"marker": "o", "linestyle": "-"},
+        "per_op": {"marker": "^", "linestyle": "--"},
+        "local": {"marker": "s", "linestyle": ":"},
+    }
+
+    fig, ax = plt.subplots(figsize=(7, 4.5), dpi=120)
+    for label in labels:
+        sub = mean_df[mean_df[group_column] == label]
+        sub = sub.sort_values("sparsity")
+        ax.plot(
+            sub["sparsity"],
+            sub["score"],
+            linewidth=2,
+            label=label,
+            **line_styles.get(label, {"marker": "o", "linestyle": "-"}),
+        )
+    ax.set_title(title)
+    ax.set_xlabel("Target sparsity")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25)
+    ax.legend(title=legend_title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_methods_by_scope(df, output_path, title, ylabel):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    scopes = _scope_order(sorted(df["scope_label"].unique()))
+    fig, axes = plt.subplots(1, len(scopes), figsize=(5 * len(scopes), 4.5), dpi=120, sharey=True)
+    if len(scopes) == 1:
+        axes = [axes]
+
+    for ax, scope in zip(axes, scopes):
+        scope_df = df[df["scope_label"] == scope]
+        mean_df = (
+            scope_df.groupby(["prune_method", "sparsity"], as_index=False)["score"]
+            .mean()
+            .sort_values(["prune_method", "sparsity"])
+        )
+        for method, sub in mean_df.groupby("prune_method", sort=False):
+            sub = sub.sort_values("sparsity")
+            ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=2, label=method)
+        ax.set_title(scope)
+        ax.set_xlabel("Target sparsity")
+        ax.grid(True, alpha=0.25)
+
+    axes[0].set_ylabel(ylabel)
+    axes[-1].legend(title="Method")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
+def plot_summary_csv(summary_csv, output_dir):
+    required = ["sparsity", "prune_method", "prune_scope", "score_order", "task", "score"]
+    df = pd.read_csv(summary_csv)
+    if df.empty or not set(required).issubset(df.columns):
+        return []
+
+    df = df[required].copy()
+    df["scope_label"] = df["prune_scope"].map(_scope_label).fillna(df["prune_scope"])
+
+    saved = []
+    output_dir = Path(output_dir)
+
+    for method, method_df in df.groupby("prune_method", sort=True):
+        saved.append(
+            _plot_group_comparison(
+                method_df,
+                "scope_label",
+                output_dir / "by_method" / method / "mean.png",
+                f"{method} scope mean comparison",
+                "Prune scope",
+                "Mean downstream score",
+            )
+        )
+        for task, task_df in method_df.groupby("task", sort=True):
+            saved.append(
+                _plot_group_comparison(
+                    task_df,
+                    "scope_label",
+                    output_dir / "by_method" / method / f"{task}.png",
+                    f"{method} scope comparison: {task}",
+                    "Prune scope",
+                    "Score",
+                )
+            )
+
+    saved.append(
+        _plot_methods_by_scope(
+            df,
+            output_dir / "comparison" / "mean.png",
+            "Method mean comparison",
+            "Mean downstream score",
+        )
+    )
+    for task, task_df in df.groupby("task", sort=True):
+        saved.append(
+            _plot_methods_by_scope(
+                task_df,
+                output_dir / "comparison" / f"{task}.png",
+                f"Method comparison: {task}",
+                "Score",
+            )
+        )
+    return saved
+
+
 def _method_label(method_tag):
     if "curvature" in method_tag:
         return "curvature"
@@ -438,12 +567,13 @@ def main():
     )
     if has_explicit_schema:
         split_paths, run_labels = [], []
-    else:
-        split_paths, run_labels = export_downstream_csvs(args.summary_csv, args.split_output_dir)
-    explicit_plots = plot_explicit_downstream_summary(args.summary_csv, output_dir)
-    if explicit_plots:
+        summary_plots = plot_summary_csv(args.summary_csv, output_dir)
+        explicit_plots = []
         downstream_plot, completed = None, []
     else:
+        split_paths, run_labels = export_downstream_csvs(args.summary_csv, args.split_output_dir)
+        summary_plots = []
+        explicit_plots = plot_explicit_downstream_summary(args.summary_csv, output_dir)
         downstream_plot, completed = plot_downstream_summary(args.summary_csv, output_dir)
     pp_plot = plot_pp_records(args.compare_dir, args.pp_seqlen, output_dir) if args.plot_pp else None
 
@@ -459,6 +589,8 @@ def main():
     if split_paths:
         print(f"saved {len(split_paths)} split csvs under {args.split_output_dir}")
     for plot_path in explicit_plots:
+        print(f"saved {plot_path}")
+    for plot_path in summary_plots:
         print(f"saved {plot_path}")
     if downstream_plot:
         print(f"saved {downstream_plot}")
