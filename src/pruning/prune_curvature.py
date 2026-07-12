@@ -51,6 +51,49 @@ def _sync_cuda_device(device):
         torch.cuda.synchronize(device)
 
 
+def _add_l2_sumsq(stats, name, sumsq):
+    if name in stats:
+        stats[name].add_(sumsq)
+    else:
+        stats[name] = sumsq
+
+
+def _accumulate_l2_stat(stats, name, tensor):
+    if not torch.is_tensor(tensor) or name in {"A", "gate_beta"}:
+        return
+    values = tensor.detach().cpu().reshape(-1, tensor.shape[-1]).to(dtype=torch.float32)
+    _add_l2_sumsq(stats, name, values.square().sum(dim=0).double())
+
+
+def _accumulate_attention_l2_stats(stats, tensor, repeat):
+    if not torch.is_tensor(tensor) or tensor.dim() != 4 or tensor.shape[0] != 1:
+        return
+    values = tensor.detach().cpu().squeeze(0).to(dtype=torch.float32)
+    _add_l2_sumsq(stats, "q_proj:A", values.square().sum(dim=1).double())
+
+    repeat = max(int(repeat), 1)
+    if values.shape[0] % repeat != 0:
+        return
+    k_heads = values.shape[0] // repeat
+    seq_q = values.shape[1]
+    seq_k = values.shape[2]
+    k_sumsq = (
+        values.reshape(k_heads, repeat, seq_q, seq_k)
+        .square()
+        .sum(dim=3)
+        .reshape(k_heads, repeat * seq_q)
+    )
+    _add_l2_sumsq(stats, "k_proj:A", k_sumsq.double())
+
+
+def _finalize_l2_stats(stats, nsamples):
+    denom = max(int(nsamples), 1)
+    return {
+        name: torch.sqrt(sumsq / denom).to(dtype=curvature_torch_dtype())
+        for name, sumsq in stats.items()
+    }
+
+
 def _required_layer_cache_names(target_ops, operations, include_prev_down=False, include_lm_head=False):
     required = set()
     for short in target_ops:
@@ -306,7 +349,66 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         device="cpu",
                     )
 
-            for j in range(args.nsamples):
+            all_examples_l2 = (
+                args.l2_norm
+                and getattr(args, "l2_norm_mode", "per_example") == "all_examples"
+                and not collect_layer_data_only
+            )
+            l2_norm_stats = None
+            next_inps = None
+            next_prev_layer_outputs = None
+            if all_examples_l2:
+                l2_accum = {}
+                next_inps = torch.empty_like(inps, device="cpu")
+                next_prev_layer_outputs = [None] * args.nsamples if prev_layer_outputs is not None else None
+                print(f"Collecting all-example L2 stats for layer {i}")
+                for j in range(args.nsamples):
+                    x = inps[j:j + 1].to(model_device, non_blocking=True)
+                    prev_outputs = prev_layer_outputs[j] if prev_layer_outputs is not None else None
+                    next_layer = layers[i + 1] if i < last_layer_idx else None
+
+                    os.environ["CURV_GATE_PLOT_TAG"] = f"layer_{i:03d}/sample_{j:03d}"
+                    with torch.no_grad():
+                        x_out, operations, _, _, stat_repeat, _ = collect_layer_data(
+                            layer,
+                            x,
+                            attention_mask,
+                            position_ids,
+                            model,
+                            next_layer=next_layer,
+                            operation_dtype=curv_torch_dtype,
+                        )
+
+                    x_out = x_out.detach().cpu()
+                    if prev_outputs is not None:
+                        for name in ["o_proj", "gate_up_out", "down_proj", "qkv_residual"]:
+                            if name in prev_outputs:
+                                operations[f"prev_{name}"] = prev_outputs[name]
+
+                    if i == last_layer_idx:
+                        operations.update(_make_lm_head_op(model, x_out))
+
+                    if next_prev_layer_outputs is not None:
+                        next_prev_layer_outputs[j] = {
+                            name: operations[name]
+                            for name in ["o_proj", "gate_up_out", "down_proj", "qkv_residual"]
+                            if name in operations
+                        }
+
+                    for name, tensor in operations.items():
+                        _accumulate_l2_stat(l2_accum, name, tensor)
+                        if name == "A":
+                            _accumulate_attention_l2_stats(l2_accum, tensor, stat_repeat)
+
+                    next_inps[j].copy_(x_out.squeeze(0))
+                    del operations, x, x_out, prev_outputs
+                    if j % 8 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                l2_norm_stats = _finalize_l2_stats(l2_accum, args.nsamples)
+                del l2_accum
+
+            score_nsamples = 1 if all_examples_l2 else args.nsamples
+            for j in range(score_nsamples):
                 _sync_cuda_device(model_device)
                 _sync_cuda_device(compute_device)
                 sample_start_time = time.perf_counter()
@@ -340,14 +442,15 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                 if i == last_layer_idx:
                     operations.update(_make_lm_head_op(model, x_out))
 
-                if prev_layer_outputs is not None:
+                if prev_layer_outputs is not None and not all_examples_l2:
                     prev_layer_outputs[j] = {
                         name: operations[name]
                         for name in ["o_proj", "gate_up_out", "down_proj", "qkv_residual"]
                         if name in operations
                     }
 
-                inps[j].copy_(x_out.squeeze(0))
+                if not all_examples_l2:
+                    inps[j].copy_(x_out.squeeze(0))
                 del x_out
                 del prev_outputs
                 if collect_layer_data_only:
@@ -431,7 +534,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
                         l2_norm_mode=getattr(args, "l2_norm_mode", "per_example"),
-                        l2_norm_stats=None,
+                        l2_norm_stats=l2_norm_stats,
                         shared_top_k=getattr(args, "shared_top_k", 10),
                         shared_seq_select=getattr(args, "shared_seq_select", "top"),
                         curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
@@ -487,7 +590,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
                         l2_norm_mode=getattr(args, "l2_norm_mode", "per_example"),
-                        l2_norm_stats=None,
+                        l2_norm_stats=l2_norm_stats,
                         shared_top_k=getattr(args, "shared_top_k", 10),
                         shared_seq_select=getattr(args, "shared_seq_select", "top"),
                         curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
@@ -595,7 +698,7 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
                         dataset_name=args.calib_data,
                         l2_norm=args.l2_norm,
                         l2_norm_mode=getattr(args, "l2_norm_mode", "per_example"),
-                        l2_norm_stats=None,
+                        l2_norm_stats=l2_norm_stats,
                         shared_top_k=getattr(args, "shared_top_k", 10),
                         shared_seq_select=getattr(args, "shared_seq_select", "top"),
                         curvature_lpf_window=getattr(args, "curvature_lpf_window", 0),
@@ -641,6 +744,11 @@ def prune_curvature(args, model, tokenizer, device="cuda:0", prune_n=0, prune_m=
 
                 if j % 8 == 0:
                     torch.cuda.empty_cache()
+
+            if all_examples_l2:
+                inps = next_inps
+                prev_layer_outputs = next_prev_layer_outputs
+                del l2_norm_stats
 
             if collect_layer_data_only:
                 del layer_cache, sp_cache, layer_subset, op_modules, modules_items

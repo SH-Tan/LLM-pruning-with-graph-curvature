@@ -8,6 +8,7 @@ from curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch
 from curvature_utils.curv_filter_utils import sliding_median_low_pass
 from curvature_utils.curv_distribution_utils import (
     _build_node_distribution,
+    _build_distribution_node_values,
     _build_node_distribution_row_from_values,
     _build_qk_out_node_distribution,
     _edge_distribution,
@@ -1212,6 +1213,18 @@ def _source_node_tensor_for_op(operations, graph_data, short_name):
     return graph_data["prev_in"]
 
 
+def _source_node_name_for_op(operations, graph_data, short_name):
+    if short_name in {"q_proj", "k_proj", "v_proj"} and "layer_input" in operations:
+        return "layer_input"
+    if short_name == "o_proj" and "Att_out" in operations:
+        return "Att_out"
+    if short_name in {"gate_proj", "up_proj"} and "o_proj" in operations:
+        return "o_proj"
+    if short_name == "down_proj" and "gate_up_out" in operations:
+        return "gate_up_out"
+    return graph_data["prev_in_name"]
+
+
 def _reset_shared_state():
     global _SHARED_CURR_DIST, _SHARED_PREV_IN, _SHARED_NEXT_OUT
     global _SHARED_SP, _SHARED_ALPHA, _A, _Q_to_A, _V_COST, _SPK
@@ -1309,9 +1322,14 @@ def compute_op_curvature(
         return None
 
     def l2_reference(name):
-        if not l2_norm or l2_norm_mode != "all_examples" or l2_norm_stats is None:
+        if name is None or not l2_norm or l2_norm_mode != "all_examples" or l2_norm_stats is None:
             return None
-        return l2_norm_stats.get(name)
+        stat_name = name
+        if name == "A" and short_name in {"q_proj", "k_proj"}:
+            stat_name = f"{short_name}:A"
+        if stat_name not in l2_norm_stats:
+            raise ValueError(f"Missing all-example L2 stats for {stat_name}")
+        return l2_norm_stats[stat_name]
 
     _reset_shared_state()
     _SHARED_MODEL_META = {
@@ -1427,13 +1445,23 @@ def compute_op_curvature(
 
     _SHARED_PREV_IN = None if residual_names else prev_in_distribution
     _SHARED_NEXT_OUT = next_out_distribution
-    _SHARED_SOURCE_NODE_VALUES = _build_seq_node_values(
+    source_node_name = _source_node_name_for_op(operations, graph_data, short_name)
+    _SHARED_SOURCE_NODE_VALUES = _build_distribution_node_values(
         _source_node_tensor_for_op(operations, graph_data, short_name),
         seq_len,
+        l2_norm=l2_norm,
+        l2_norm_mode=l2_norm_mode,
+        l2_reference=l2_reference(source_node_name),
     )
-    _SHARED_TARGET_NODE_VALUES = _build_seq_node_values(operations.get(short_name), seq_len)
+    _SHARED_TARGET_NODE_VALUES = _build_distribution_node_values(
+        operations.get(short_name),
+        seq_len,
+        l2_norm=l2_norm,
+        l2_norm_mode=l2_norm_mode,
+        l2_reference=l2_reference(short_name),
+    )
     _SHARED_GATE_BETA_VALUES = (
-        _build_seq_node_values(operations.get("gate_beta"), seq_len)
+        np.ones_like(_SHARED_TARGET_NODE_VALUES, dtype=curvature_np_dtype())
         if short_name == "gate_proj"
         else None
     )

@@ -1,6 +1,7 @@
+import os
+
 import numpy as np
 import torch
-import os
 
 from curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 
@@ -40,8 +41,6 @@ def _resolve_node_name(operations, names):
             continue
         if name in operations:
             return name
-        # if name in {"q_proj", "k_proj", "v_proj"} and "layer_input" in operations:
-        #     return "layer_input"
     return None
 
 
@@ -114,8 +113,25 @@ def _reduce_distribution_to_top_quantile_torch(scaled, dist, alpha, eps):
 
     keep_mask = _quantile_keep_mask_torch(dist)
     reduced = _renormalize_dist_from_scaled_torch(scaled, keep_mask, alpha, eps)
-    row_has_positive = positive.reshape(-1, positive.shape[-1]).any(dim=-1).reshape(*positive.shape[:-1], 1)
+    row_has_positive = positive.reshape(-1, positive.shape[-1]).any(dim=-1).reshape(
+        *positive.shape[:-1],
+        1,
+    )
     return torch.where(row_has_positive, reduced, dist)
+
+
+def _distribution_from_scaled_torch(scaled, valid_mask, alpha, eps):
+    weights = torch.exp(-(scaled ** 2)) * valid_mask
+    sum_weights = weights.sum(dim=-1, keepdim=True)
+    dist = torch.where(
+        sum_weights > eps,
+        ((1.0 - alpha) * weights) / sum_weights,
+        torch.zeros_like(weights),
+    )
+    empty_mask = (sum_weights <= eps).expand_as(valid_mask)
+    dist = torch.where(empty_mask & valid_mask, torch.full_like(dist, -1.0), dist)
+    dist = dist * valid_mask
+    return _reduce_distribution_to_top_quantile_torch(scaled, dist, alpha, eps)
 
 
 def _renormalize_dist_from_scaled_np(scaled, keep, alpha, eps):
@@ -127,6 +143,21 @@ def _renormalize_dist_from_scaled_np(scaled, keep, alpha, eps):
     dist = np.zeros_like(weights, dtype=curvature_np_dtype())
     dist[keep] = -1.0
     return dist
+
+
+def _distribution_from_scaled_np(scaled, valid, alpha, eps, apply_neighbor_reduction=True):
+    weights = np.exp(-(scaled ** 2)) * valid
+    weight_sum = float(weights.sum())
+    if weight_sum > eps:
+        dist = ((1.0 - alpha) * weights) / weight_sum
+    else:
+        dist = np.zeros_like(weights, dtype=curvature_np_dtype())
+        dist[valid] = -1.0
+
+    if apply_neighbor_reduction:
+        dist = _reduce_distribution_to_top_quantile_np(scaled, dist, alpha, eps)
+
+    return dist.astype(curvature_np_dtype(), copy=False)
 
 
 def _reduce_distribution_to_top_quantile_np(scaled, dist, alpha, eps, keep_quantile=_NEIGHBOR_KEEP_QUANTILE):
@@ -144,6 +175,16 @@ def _reduce_distribution_to_top_quantile_np(scaled, dist, alpha, eps, keep_quant
     return _renormalize_dist_from_scaled_np(scaled, keep, alpha, eps)
 
 
+def _all_examples_l2_tensor(node_tensor, l2_reference, node_name):
+    ref_tensor = torch.as_tensor(l2_reference, dtype=curvature_torch_dtype()).reshape(1, -1)
+    if ref_tensor.shape[-1] != node_tensor.shape[-1]:
+        raise ValueError(
+            f"Invalid {node_name} all-example L2 reference width "
+            f"{ref_tensor.shape[-1]}, expected {node_tensor.shape[-1]}"
+        )
+    return ref_tensor
+
+
 def _build_node_distribution(
     node_tensor,
     node_name,
@@ -157,11 +198,7 @@ def _build_node_distribution(
         return None
 
     if l2_norm and l2_norm_mode == "all_examples" and l2_reference is not None:
-        ref_tensor = torch.as_tensor(l2_reference, dtype=curvature_torch_dtype()).reshape(1, -1)
-        if ref_tensor.shape[-1] == node_tensor.shape[-1]:
-            node_tensor = ref_tensor
-        else:
-            node_tensor = node_tensor.to(dtype=curvature_torch_dtype())
+        node_tensor = _all_examples_l2_tensor(node_tensor, l2_reference, node_name)
     else:
         node_tensor = node_tensor.to(dtype=curvature_torch_dtype())
 
@@ -174,27 +211,55 @@ def _build_node_distribution(
 
     if l2_norm and node_tensor.dim() == 2:
         node_tensor = torch.norm(node_tensor, p=2, dim=0, keepdim=True)
-        
+
     node_tensor = _normalize_node_value_per_sequence(node_tensor)
-    
+
     valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
-    # weights = torch.exp(-(node_tensor)) * valid_mask
-    weights = torch.exp(-(node_tensor ** 2)) * valid_mask
-
-    sum_weights = weights.sum(dim=-1, keepdim=True)
-    dist = torch.where(
-        sum_weights > eps,
-        ((1.0 - alpha) * weights) / sum_weights,
-        torch.zeros_like(weights),
-    )
-
-    empty_mask = (sum_weights <= eps).expand_as(valid_mask)
-    dist = torch.where(empty_mask & valid_mask, torch.full_like(dist, -1.0), dist)
-
-    dist = dist * valid_mask
-    dist = _reduce_distribution_to_top_quantile_torch(node_tensor, dist, alpha, eps)
+    dist = _distribution_from_scaled_torch(node_tensor, valid_mask, alpha, eps)
 
     return dist.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
+
+
+def _build_distribution_node_values(
+    node_tensor,
+    seq_len,
+    l2_norm=False,
+    l2_norm_mode="per_example",
+    l2_reference=None,
+):
+    if node_tensor is None:
+        return None
+
+    if l2_norm and l2_norm_mode == "all_examples" and l2_reference is not None:
+        tensor = _all_examples_l2_tensor(node_tensor, l2_reference, "node")
+    elif torch.is_tensor(node_tensor):
+        tensor = node_tensor.detach().cpu()
+        if torch.is_floating_point(tensor):
+            tensor = tensor.to(dtype=curvature_torch_dtype())
+    else:
+        tensor = torch.as_tensor(node_tensor, dtype=curvature_torch_dtype())
+
+    if tensor.numel() == 0:
+        return None
+
+    if tensor.dim() == 3:
+        if tensor.shape[0] != 1:
+            raise ValueError(
+                f"Expected batch size 1 for node values, got shape {tuple(tensor.shape)}"
+            )
+        tensor = tensor.squeeze(0)
+    elif tensor.dim() == 1:
+        tensor = tensor.reshape(1, -1)
+    elif tensor.dim() != 2:
+        return None
+
+    if l2_norm:
+        tensor = torch.norm(tensor, p=2, dim=0, keepdim=True)
+    else:
+        tensor = tensor[:int(seq_len)].contiguous()
+
+    values = tensor.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
+    return np.abs(values, out=values)
 
 
 def _build_node_distribution_row_from_values(values, alpha, eps=1e-7, apply_neighbor_reduction=True):
@@ -214,22 +279,13 @@ def _build_node_distribution_row_from_values(values, alpha, eps=1e-7, apply_neig
     scaled = np.zeros_like(node_values, dtype=curvature_np_dtype())
     scaled[valid_raw] = 1.0 / norm[valid_raw]
     valid = np.isfinite(scaled) & (scaled != 0)
-    weights = np.exp(-(scaled ** 2)) * valid
-    weight_sum = float(weights.sum())
-    if weight_sum > eps:
-        dist = ((1.0 - alpha) * weights) / weight_sum
-    else:
-        dist = np.zeros_like(weights, dtype=curvature_np_dtype())
-        dist[valid] = -1.0
-
-    if apply_neighbor_reduction:
-        dist = _reduce_distribution_to_top_quantile_np(scaled, dist, alpha, eps)
-
-    return dist.astype(curvature_np_dtype(), copy=False)
-
-
-
-
+    return _distribution_from_scaled_np(
+        scaled,
+        valid,
+        alpha,
+        eps,
+        apply_neighbor_reduction=apply_neighbor_reduction,
+    )
 
 
 def _build_block_row_node_distribution(
@@ -274,27 +330,7 @@ def _build_block_row_node_distribution(
     node_tensor = _normalize_node_value_per_sequence(node_tensor, dim=-1)
 
     valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
-
-    weights = torch.exp(-(node_tensor ** 2)) * valid_mask
-
-    # Distribution over the feature axis for each node row.
-    sum_weights = weights.sum(dim=-1, keepdim=True)
-
-    dist = torch.where(
-        sum_weights > eps,
-        ((1.0 - alpha) * weights) / sum_weights,
-        torch.zeros_like(weights),
-    )
-
-    empty_mask = (sum_weights <= eps).expand_as(valid_mask)
-    dist = torch.where(
-        empty_mask & valid_mask,
-        torch.full_like(dist, -1.0),
-        dist,
-    )
-
-    dist = dist * valid_mask
-    dist = _reduce_distribution_to_top_quantile_torch(node_tensor, dist, alpha, eps)
+    dist = _distribution_from_scaled_torch(node_tensor, valid_mask, alpha, eps)
 
     return dist.detach().cpu().numpy().astype(
         curvature_np_dtype(),
@@ -398,6 +434,7 @@ def _build_qk_out_node_distribution(
         l2_norm=l2_norm,
         l2_reference=l2_reference,
     )
+
 
 def draw_nonzero_distribution_curve(dist,
     node_name=None,
