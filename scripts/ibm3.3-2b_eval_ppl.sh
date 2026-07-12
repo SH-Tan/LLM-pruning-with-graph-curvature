@@ -19,7 +19,7 @@ prune_ops="${PRUNE_OPS:-gate_proj}"
 skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 use_l2_norm="${USE_L2_NORM:-1}"
-l2_norm_mode="${L2_NORM_MODE:-per_example}"
+l2_norm_mode="${L2_NORM_MODE:-all_examples}"
 top_k_seq="${TOP_K_SEQ:-10}"
 seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
@@ -66,7 +66,7 @@ downstream_generation_max_batch_tokens="${DOWNSTREAM_GENERATION_MAX_BATCH_TOKENS
 downstream_max_prompt_length="${DOWNSTREAM_MAX_PROMPT_LENGTH:-2048}"
 downstream_max_new_tokens="${DOWNSTREAM_MAX_NEW_TOKENS:-2048}"
 
-curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_edge_value_indis/}"
+curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_edge_value/}"
 wanda_dir="${WANDA_DIR:-out/ibm_2b_instruct/unstructured/wanda/all_seq_compare/}"
 magnitude_dir="${MAGNITUDE_DIR:-out/ibm_2b_instruct/unstructured/magnitude/all_seq_compare/}"
 compare_dir_root="${COMPARE_DIR_ROOT:-out/ibm_2b_instruct/unstructured/all_layer_compare}"
@@ -219,6 +219,6 @@ run_eval_for_prune_ops() {
     fi
 }
 
-run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_edge_value_indis/"
+run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_edge_value/"
 # run_eval_for_prune_ops "gate_proj up_proj" "$compare_dir_root/gate_up/"
 # run_eval_for_prune_ops "up_proj" "$compare_dir_root/up/"
