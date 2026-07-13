@@ -5,7 +5,7 @@ set -e
 model="${MODEL:-ibm-granite/granite-3.3-2b-instruct}"
 python_bin="${PYTHON_BIN:-python}"
 sparsity_ratios="${SPARSITY_RATIOS:-0 0.3 0.4 0.5 0.6 0.7 0.9 1}"
-nsamples="${NSAMPLES:-5}"
+nsamples="${NSAMPLES:-128}"
 seed="${SEED:-13}"
 alpha="${ALPHA:-0.9}"
 model_device="${MODEL_DEVICE:-cuda:0}"
@@ -19,7 +19,7 @@ prune_ops="${PRUNE_OPS:-gate_proj}"
 skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 use_l2_norm="${USE_L2_NORM:-0}"
-l2_norm_mode="${L2_NORM_MODE:-per_example}"
+l2_norm_mode="${L2_NORM_MODE:-all_examples}"
 top_k_seq="${TOP_K_SEQ:-10}"
 seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
@@ -232,4 +232,4 @@ run_eval_for_prune_ops() {
     fi
 }
 
-run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate/"
+run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_l2_allexamples/"

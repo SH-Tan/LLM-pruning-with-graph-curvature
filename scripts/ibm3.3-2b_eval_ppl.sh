@@ -19,7 +19,7 @@ prune_ops="${PRUNE_OPS:-gate_proj}"
 skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 use_l2_norm="${USE_L2_NORM:-1}"
-l2_norm_mode="${L2_NORM_MODE:-all_examples}"
+l2_norm_mode="${L2_NORM_MODE:-per_example}"
 top_k_seq="${TOP_K_SEQ:-10}"
 seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
@@ -219,6 +219,6 @@ run_eval_for_prune_ops() {
     fi
 }
 
-run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_edge_value/"
+run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_edge_value_l2_perexample/"
 # run_eval_for_prune_ops "gate_proj up_proj" "$compare_dir_root/gate_up/"
 # run_eval_for_prune_ops "up_proj" "$compare_dir_root/up/"
