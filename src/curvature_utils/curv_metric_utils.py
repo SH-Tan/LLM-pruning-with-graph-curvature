@@ -225,15 +225,18 @@ def _score_column(score, idx, other_idx=None):
 
 
 def top_seq_for_edge(edge):
-    metric, _, _ = score_components_for_edge(edge)
+    if _SHARED_SEQ_SELECT == "last":
+        return [int(_SHARED_SEQ_LEN - 1)]
 
-    np.nan_to_num(metric, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     total_count = _SHARED_SEQ_LEN if _SHARED_TOP_K == -1 else min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
     if total_count <= 0:
         return []
 
     if _SHARED_TOP_K == -1:
         return [int(seq_idx) for seq_idx in range(_SHARED_SEQ_LEN)]
+
+    metric, _, _ = score_components_for_edge(edge)
+    np.nan_to_num(metric, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     if _SHARED_SEQ_SELECT == "median":
         median_value = float(np.median(metric))
@@ -244,6 +247,8 @@ def top_seq_for_edge(edge):
 
 
 def selected_seq_count():
+    if _SHARED_SEQ_SELECT == "last":
+        return 1
     total_count = _SHARED_SEQ_LEN if _SHARED_TOP_K == -1 else min(_SHARED_TOP_K, _SHARED_SEQ_LEN)
     return max(int(total_count), 0)
 

@@ -15,7 +15,7 @@ seq_len="${SEQ_LEN:-512}"
 sample_edge_ratio="${SAMPLE_EDGE_RATIO:-0.5}"
 sample_edge_num="${SAMPLE_EDGE_NUM:--1}"
 calib_data="${CALIB_DATA:-c4_independent}"
-curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_up/}"
+curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_last1/}"
 curvature_dtype="${CURVATURE_DTYPE:-float32}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 save_parameter_metric_logs="${SAVE_PARAMETER_METRIC_LOGS:-0}"
@@ -95,8 +95,8 @@ run_curvature_calculation() {
 
 
 
-top_k_seq="${TOP_K_SEQ:-10}"
-seq_select="${SEQ_SELECT:-top}"
+top_k_seq="${TOP_K_SEQ:-1}"
+seq_select="${SEQ_SELECT:-last}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
 run_curvature_calculation 0 "per_example"
 
@@ -123,5 +123,5 @@ if [ "$run_eval_after_curv" = "1" ]; then
     RUN_PER_LAYER_EVAL="$run_per_layer_eval" \
     RUN_DOWNSTREAM_TEST="$run_downstream_test" \
     MLP_ACTIVATION="$mlp_activation" \
-    sh scripts/ibm3.3-2b_eval.sh
+    sh scripts/ibm3.3-2b_eval_ppl.sh
 fi

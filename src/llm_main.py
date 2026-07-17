@@ -230,7 +230,7 @@ def _build_parser():
         "--shared_seq_select",
         type=str,
         default="top",
-        help="Seq selection mode: top, median, or strideN such as stride10.",
+        help="Seq selection mode: top, median, last, or strideN such as stride10.",
     )
     parser.add_argument(
         "--curvature_lpf_window",
