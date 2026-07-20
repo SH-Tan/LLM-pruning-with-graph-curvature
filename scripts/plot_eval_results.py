@@ -283,6 +283,11 @@ def plot_compare_downstream_summaries(summary_csvs, output_dir, compare_name):
             continue
         keep_columns = required + (["benchmark"] if "benchmark" in df.columns else [])
         df = df[keep_columns].copy()
+        source_label = Path(summary_csv).stem
+        if source_label.startswith("summary_"):
+            source_label = source_label[len("summary_"):]
+        source_label = _short_compare_source_label(source_label)
+        df["source_label"] = source_label
         df["scope_label"] = df["prune_scope"].map(_scope_label).fillna(df["prune_scope"])
         df["plot_task"] = df["benchmark"] if "benchmark" in df.columns else df["task"]
         frames.append(df)
@@ -296,25 +301,29 @@ def plot_compare_downstream_summaries(summary_csvs, output_dir, compare_name):
     output_dir.mkdir(parents=True, exist_ok=True)
     title_name = compare_name.replace("_", " ")
     scopes = _scope_order(sorted(df["scope_label"].unique()))
+    show_method = df["prune_method"].nunique() > 1
+    df["compare_label"] = df["source_label"]
+    if show_method:
+        df["compare_label"] = df["source_label"] + "/" + df["prune_method"]
 
     mean_df = (
-        df.groupby(["prune_method", "scope_label", "sparsity"], as_index=False)["score"]
+        df.groupby(["compare_label", "scope_label", "sparsity"], as_index=False)["score"]
         .mean()
-        .sort_values(["prune_method", "scope_label", "sparsity"])
+        .sort_values(["compare_label", "scope_label", "sparsity"])
     )
-    fig, axes = plt.subplots(1, len(scopes), figsize=(5 * len(scopes), 4.5), dpi=120, sharey=True)
+    fig, axes = plt.subplots(1, len(scopes), figsize=(7 * len(scopes), 5.2), dpi=140, sharey=True)
     if len(scopes) == 1:
         axes = [axes]
     for ax, scope in zip(axes, scopes):
         scope_df = mean_df[mean_df["scope_label"] == scope]
-        for method, sub in scope_df.groupby("prune_method", sort=False):
+        for label, sub in scope_df.groupby("compare_label", sort=False):
             sub = sub.sort_values("sparsity")
-            ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=2, label=method)
+            ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=2, label=label)
         ax.set_title(scope)
         ax.set_xlabel("Target sparsity")
         ax.grid(True, alpha=0.25)
     axes[0].set_ylabel("Mean downstream score")
-    axes[-1].legend()
+    axes[-1].legend(title="Calibration", fontsize=10, title_fontsize=11)
     fig.suptitle(f"{title_name} downstream accuracy")
     fig.tight_layout()
     mean_path = output_dir / f"{compare_name}_downstream_accuracy.png"
@@ -325,26 +334,26 @@ def plot_compare_downstream_summaries(summary_csvs, output_dir, compare_name):
     task_dir = output_dir / f"{compare_name}_by_task"
     task_dir.mkdir(parents=True, exist_ok=True)
     task_scores = df[
-        ["task", "prune_method", "scope_label", "sparsity", "score"]
-    ].sort_values(["task", "prune_method", "scope_label", "sparsity"])
+        ["task", "source_label", "compare_label", "scope_label", "sparsity", "score"]
+    ].sort_values(["task", "compare_label", "scope_label", "sparsity"])
     scores_path = task_dir / "task_scores.csv"
     task_scores.to_csv(scores_path, index=False)
     saved.append(scores_path)
 
     for task, task_df in task_scores.groupby("task", sort=True):
-        fig, axes = plt.subplots(1, len(scopes), figsize=(5 * len(scopes), 4.5), dpi=120, sharey=True)
+        fig, axes = plt.subplots(1, len(scopes), figsize=(7 * len(scopes), 5.2), dpi=140, sharey=True)
         if len(scopes) == 1:
             axes = [axes]
         for ax, scope in zip(axes, scopes):
             scope_df = task_df[task_df["scope_label"] == scope]
-            for method, sub in scope_df.groupby("prune_method", sort=False):
+            for label, sub in scope_df.groupby("compare_label", sort=False):
                 sub = sub.sort_values("sparsity")
-                ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=2, label=method)
+                ax.plot(sub["sparsity"], sub["score"], marker="o", linewidth=2, label=label)
             ax.set_title(scope)
             ax.set_xlabel("Target sparsity")
             ax.grid(True, alpha=0.25)
         axes[0].set_ylabel("Score")
-        axes[-1].legend()
+        axes[-1].legend(title="Calibration", fontsize=10, title_fontsize=11)
         fig.suptitle(f"{task} downstream score")
         fig.tight_layout()
         task_path = task_dir / f"{task}.png"
@@ -353,6 +362,13 @@ def plot_compare_downstream_summaries(summary_csvs, output_dir, compare_name):
         saved.append(task_path)
 
     return saved
+
+
+def _short_compare_source_label(source_label):
+    known_suffix = "_up_proj_gate_proj_down_proj_wanda"
+    if source_label.endswith(known_suffix):
+        source_label = source_label[: -len(known_suffix)]
+    return source_label.replace("_prompt_answer_seq_len_650", "")
 
 
 def _plot_group_comparison(df, group_column, output_path, title, legend_title, ylabel):

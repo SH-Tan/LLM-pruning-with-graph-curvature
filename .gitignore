@@ -282,3 +282,4 @@ out/
 .codex
 eval_results/
 lm_eval_tasks/
+*.jsonl

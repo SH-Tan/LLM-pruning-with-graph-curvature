@@ -18,6 +18,7 @@ from utils.llm_main_utils import (
     resolve_sparsity_ratios,
     run_per_layer_eval,
     run_pp_eval,
+    run_prune_overlap_log,
 )
 from pruning.prune import load_curvature_pkls
 from pruning.prune_curvature import prune_curvature
@@ -205,8 +206,7 @@ def _build_parser():
         "--calib_data",
         type=str,
         default="c4_independent",
-        choices=["c4_independent", "c4_dependent"],
-        help="Calibration data for pruning [c4_dependent, c4_independent].",
+        help="Calibration data for pruning, e.g. c4_independent, c4_dependent, or generated_downstream.",
     )
     parser.add_argument("--sample_edge_num", type=int, default=-1, help="Number of edge samples for curvature calculation.")
     parser.add_argument("--sample_edge_ratio", type=float, default=1.0, help="Ratio of edge samples for curvature calculation.")
@@ -292,6 +292,11 @@ def _build_parser():
         "--run_pp_eval",
         action="store_true",
         help="Run perplexity evaluation after score/curvature calculation.",
+    )
+    parser.add_argument(
+        "--run_prune_overlap_log",
+        action="store_true",
+        help="Log curvature/WANDA and curvature/magnitude pruning-mask overlap without running eval.",
     )
     parser.add_argument("--seqlen", type=int, default=32, help="Input seq len.")
     parser.add_argument(
@@ -400,6 +405,10 @@ def main():
         args.curvature_prune_scope = "per_layer_op"
     if args.run_per_layer_eval and args.curvature_prune_scope == "global":
         parser.error("--run_per_layer_eval supports --prunescore_order locally or per_op, not globally")
+    if args.run_prune_overlap_log and args.prune_method != "curvature":
+        parser.error("--run_prune_overlap_log requires --prune_method curvature")
+    if args.run_prune_overlap_log and args.sparsity_type != "unstructured":
+        parser.error("--run_prune_overlap_log supports only unstructured sparsity")
 
     sparsity_ratios = resolve_sparsity_ratios(args)
     prune_score_orders = resolve_prune_score_orders(args)
@@ -470,6 +479,10 @@ def main():
         print(f"loading llm model {args.model} for curvature precomputation")
         model = load_llm(args.model, args.cache_dir, model_device, args.seqlen)
         model.eval()
+        if args.run_prune_overlap_log and needs_pruning and prune_n == 0:
+            print(f"precomputing WANDA scores for curvature overlap logs with seqlen={args.seqlen}")
+            model.seqlen = args.seqlen
+            base_wanda_scores = compute_wanda_scores(args, model, tokenizer, model_device)
         if args.load_curvature_dir is not None:
             print(f"loading curvature scores from {args.load_curvature_dir}")
             model.curvature_scores = load_curvature_pkls(
@@ -492,6 +505,18 @@ def main():
             args.curvature_timing_log_path = save_filepath
             prune_curvature(args, model, tokenizer, compute_device, prune_n, prune_m)
         base_curvature_scores = model.curvature_scores
+        if args.run_prune_overlap_log:
+            run_prune_overlap_log(
+                args,
+                model,
+                sparsity_ratios,
+                prune_score_orders,
+                save_filepath,
+                base_wanda_scores,
+            )
+            del model
+            release_cuda_memory()
+            return
         del model
         release_cuda_memory()
 

@@ -11,17 +11,19 @@ alpha="${ALPHA:-0.9}"
 model_device="${MODEL_DEVICE:-cuda:0}"
 compute_device="${COMPUTE_DEVICE:-cuda:1}"
 seq_len="${SEQ_LEN:-512}"
-sample_edge_ratio="${SAMPLE_EDGE_RATIO:-0.5}"
+sample_edge_ratio="${SAMPLE_EDGE_RATIO:-0.8}"
 sample_edge_num="${SAMPLE_EDGE_NUM:--1}"
 pp_seqlen="${PP_SEQLEN:-$seq_len 1024}"
-calib_data="${CALIB_DATA:-c4_independent}"
+calib_data="${CALIB_DATA:-generated_downstream}"
+generated_calib_data_path="${GENERATED_CALIB_DATA_PATH:-downstream_calib_data/generated/gsm8k.jsonl}"
+generated_calib_text_mode="${GENERATED_CALIB_TEXT_MODE:-prompt_answer}"
 prune_ops="${PRUNE_OPS:-gate_proj}"
 skip_prune_layer_ids="${SKIP_PRUNE_LAYER_IDS:-}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 use_l2_norm="${USE_L2_NORM:-0}"
 l2_norm_mode="${L2_NORM_MODE:-per_example}"
 top_k_seq="${TOP_K_SEQ:-1}"
-seq_select="${SEQ_SELECT:-last}"
+seq_select="${SEQ_SELECT:-top}"
 curvature_lpf_window="${CURVATURE_LPF_WINDOW:-0}"
 run_all_layer_eval="${RUN_ALL_LAYER_EVAL:-${RUN_PP_EVAL:-1}}"
 run_per_layer_eval="${RUN_PER_LAYER_EVAL:-0}"
@@ -66,7 +68,7 @@ downstream_generation_max_batch_tokens="${DOWNSTREAM_GENERATION_MAX_BATCH_TOKENS
 downstream_max_prompt_length="${DOWNSTREAM_MAX_PROMPT_LENGTH:-2048}"
 downstream_max_new_tokens="${DOWNSTREAM_MAX_NEW_TOKENS:-2048}"
 
-curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_last1/}"
+curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_gsm8k/}"
 wanda_dir="${WANDA_DIR:-out/ibm_2b_instruct/unstructured/wanda/all_seq_compare/}"
 magnitude_dir="${MAGNITUDE_DIR:-out/ibm_2b_instruct/unstructured/magnitude/all_seq_compare/}"
 compare_dir_root="${COMPARE_DIR_ROOT:-out/ibm_2b_instruct/unstructured/all_layer_compare}"
@@ -75,6 +77,8 @@ echo "Eval MLP activation: $mlp_activation"
 
 cuda_device=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd "," -)
 export CUDA_VISIBLE_DEVICES=$cuda_device
+export GENERATED_CALIB_DATA_PATH="$generated_calib_data_path"
+export GENERATED_CALIB_TEXT_MODE="$generated_calib_text_mode"
 
 skip_prune_layer_flag=""
 if [ -n "$skip_prune_layer_ids" ]; then
@@ -219,6 +223,6 @@ run_eval_for_prune_ops() {
     fi
 }
 
-run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_last1/"
+run_eval_for_prune_ops "gate_proj" "$compare_dir_root/gate_gsm8k/"
 # run_eval_for_prune_ops "gate_proj up_proj" "$compare_dir_root/gate_up/"
 # run_eval_for_prune_ops "up_proj" "$compare_dir_root/up/"

@@ -38,6 +38,7 @@ from pruning.per_layer_eval_utils import (
 )
 from pruning.prune import check_sparsity
 from pruning.prune_magnitude import prune_magnitude
+from pruning.prune_overlap_utils import append_prune_overlap_log
 from pruning.prune_wanda import prune_wanda
 
 
@@ -1099,3 +1100,42 @@ def run_pp_eval(
                     print(f"Saved all-layer method comparison plot: {plot_path}")
             else:
                 print(f"Saved all-layer method comparison plot: {compare_plot}")
+
+
+def run_prune_overlap_log(
+    args,
+    model,
+    sparsity_ratios,
+    prune_score_orders,
+    save_filepath,
+    wanda_scores,
+):
+    if wanda_scores is None:
+        raise ValueError("Prune overlap logging requires WANDA scores")
+
+    result_dir = os.path.dirname(save_filepath)
+    compare_dir = args.per_layer_compare_dir or result_dir
+    compare_tag = pp_result_tag(args)
+    overlap_log_path = os.path.join(compare_dir, f"prune_overlap_{compare_tag}.txt")
+    os.makedirs(compare_dir, exist_ok=True)
+
+    with open(overlap_log_path, "w", encoding="utf-8") as f:
+        print("Prune overlap log", file=f, flush=True)
+        print("Compared methods: curvature, wanda, magnitude", file=f, flush=True)
+
+    print("Computing pruning overlap against WANDA and magnitude masks")
+
+    for score_order in prune_score_orders:
+        args.prune_score_order = score_order
+        for target_ratio in sparsity_ratios:
+            args.sparsity_ratio = target_ratio
+            append_eval_run_header(overlap_log_path, args, target_ratio, score_order)
+            append_prune_overlap_log(
+                overlap_log_path,
+                args,
+                model,
+                wanda_scores,
+            )
+
+    print(f"Saved prune overlap log: {overlap_log_path}")
+    return overlap_log_path

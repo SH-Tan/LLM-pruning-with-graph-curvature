@@ -1,3 +1,5 @@
+import json
+import os
 import random
 import torch
 from datasets import load_dataset
@@ -62,6 +64,85 @@ def _sample_independent_examples(dataset, nsamples, seqlen, tokenizer, seed):
     return valid_examples
 
 
+def get_generated_downstream(nsamples, seed, seqlen, tokenizer):
+    data_path = os.environ.get(
+        "GENERATED_CALIB_DATA_PATH",
+        "downstream_calib_data/generated",
+    )
+    text_mode = os.environ.get("GENERATED_CALIB_TEXT_MODE", "prompt_answer")
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    rng = random.Random(seed)
+
+    data_files = []
+    if os.path.isdir(data_path):
+        for filename in sorted(os.listdir(data_path)):
+            if filename.endswith(".jsonl"):
+                data_files.append(os.path.join(data_path, filename))
+    else:
+        data_files.append(data_path)
+
+    trainloader = []
+    seen_valid = 0
+    for data_file in data_files:
+        with open(data_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                text = _generated_record_text(json.loads(line), text_mode)
+                if not text:
+                    continue
+
+                input_ids = tokenizer(text, return_tensors="pt", truncation=False).input_ids
+                if input_ids.shape[1] < seqlen:
+                    pad_len = seqlen - input_ids.shape[1]
+                    pad = torch.full(
+                        (1, pad_len),
+                        int(pad_token_id),
+                        dtype=input_ids.dtype,
+                    )
+                    inp = torch.cat((input_ids, pad), dim=1)
+                else:
+                    max_start = input_ids.shape[1] - seqlen
+                    start = 0 if max_start == 0 else rng.randint(0, max_start)
+                    inp = input_ids[:, start:start + seqlen]
+                item = _make_lm_calib_item(inp)
+
+                seen_valid += 1
+                if len(trainloader) < nsamples:
+                    trainloader.append(item)
+                else:
+                    replace_idx = rng.randint(0, seen_valid - 1)
+                    if replace_idx < nsamples:
+                        trainloader[replace_idx] = item
+
+    if len(trainloader) < nsamples:
+        raise ValueError(
+            f"Could only build {len(trainloader)} generated downstream examples "
+            f"from {data_path}, but nsamples={nsamples} was requested. "
+            "Generate more correct examples or reduce NSAMPLES."
+        )
+
+    return trainloader, None
+
+
+def _generated_record_text(record, text_mode):
+    prompt = str(record.get("prompt", ""))
+    answer = str(record.get("generated_answer", ""))
+    if text_mode == "answer":
+        return answer
+    if text_mode == "prompt":
+        return prompt
+    if text_mode == "prompt_answer":
+        return f"{prompt}\n{answer}"
+    raise ValueError(f"Unsupported GENERATED_CALIB_TEXT_MODE: {text_mode}")
+
+
+def _make_lm_calib_item(inp):
+    tar = inp.clone()
+    tar[:, :-1] = -100
+    return inp, tar
 
 
 def get_c4_dependent(nsamples, seed, seqlen, tokenizer, stride=1):
@@ -140,6 +221,8 @@ def _sample_overlapping_source_text(dataset, tokenizer, nsamples, seqlen, stride
 
 # Function to select the appropriate loader based on dataset name
 def get_loaders_c4(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
+    if "generated_downstream" in name:
+        return get_generated_downstream(nsamples, seed, seqlen, tokenizer)
     if "c4_independent" in name:
         return get_c4_independent(nsamples, seed, seqlen, tokenizer)
     if "c4_dependent" in name:
