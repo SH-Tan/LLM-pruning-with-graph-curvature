@@ -283,3 +283,6 @@ out/
 eval_results/
 lm_eval_tasks/
 *.jsonl
+*.eval
+inspect_evals/runtime_checkpoints/
+inspect_evals/logs/

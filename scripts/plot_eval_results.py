@@ -283,6 +283,7 @@ def plot_compare_downstream_summaries(summary_csvs, output_dir, compare_name):
             continue
         keep_columns = required + (["benchmark"] if "benchmark" in df.columns else [])
         df = df[keep_columns].copy()
+        df = df.dropna(subset=required)
         source_label = Path(summary_csv).stem
         if source_label.startswith("summary_"):
             source_label = source_label[len("summary_"):]
@@ -368,7 +369,7 @@ def _short_compare_source_label(source_label):
     known_suffix = "_up_proj_gate_proj_down_proj_wanda"
     if source_label.endswith(known_suffix):
         source_label = source_label[: -len(known_suffix)]
-    return source_label.replace("_prompt_answer_seq_len_650", "")
+    return source_label.replace("_seq_len_650", "")
 
 
 def _plot_group_comparison(df, group_column, output_path, title, legend_title, ylabel):
@@ -451,7 +452,9 @@ def plot_summary_csv(summary_csv, output_dir):
     if df.empty or not set(required).issubset(df.columns):
         return []
 
-    df = df[required].copy()
+    df = df[required].copy().dropna(subset=required)
+    if df.empty:
+        return []
     df["scope_label"] = df["prune_scope"].map(_scope_label).fillna(df["prune_scope"])
 
     saved = []

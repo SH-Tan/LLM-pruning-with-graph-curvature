@@ -448,7 +448,7 @@ def main():
         )
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     save_filepath = log_path(args)
 
     needs_pruning = any(ratio != 0 for ratio in sparsity_ratios)

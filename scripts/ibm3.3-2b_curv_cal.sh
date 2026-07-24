@@ -12,12 +12,12 @@ alpha="${ALPHA:-0.9}"
 model_device="${MODEL_DEVICE:-cuda:0}"
 compute_device="${COMPUTE_DEVICE:-cuda:1}"
 seq_len="${SEQ_LEN:-512}"
-sample_edge_ratio="${SAMPLE_EDGE_RATIO:-0.8}"
+sample_edge_ratio="${SAMPLE_EDGE_RATIO:-1}"
 sample_edge_num="${SAMPLE_EDGE_NUM:--1}"
 calib_data="${CALIB_DATA:-generated_downstream}"
-generated_calib_data_path="${GENERATED_CALIB_DATA_PATH:-downstream_calib_data/generated/gsm8k.jsonl}"
+generated_calib_data_path="${GENERATED_CALIB_DATA_PATH:-downstream_calib_data/generated/mmlu_stem.jsonl}"
 generated_calib_text_mode="${GENERATED_CALIB_TEXT_MODE:-prompt_answer}"
-curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_gsm8k/}"
+curvature_dir="${CURVATURE_DIR:-out/ibm_2b_instruct/unstructured/curvature/gate_mmlu/}"
 curvature_dtype="${CURVATURE_DTYPE:-float32}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 save_parameter_metric_logs="${SAVE_PARAMETER_METRIC_LOGS:-0}"
@@ -127,5 +127,5 @@ if [ "$run_eval_after_curv" = "1" ]; then
     RUN_PER_LAYER_EVAL="$run_per_layer_eval" \
     RUN_DOWNSTREAM_TEST="$run_downstream_test" \
     MLP_ACTIVATION="$mlp_activation" \
-    sh scripts/ibm3.3-2b_eval.sh
+    sh scripts/ibm3.3-2b_eval_ppl.sh
 fi
