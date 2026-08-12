@@ -7,7 +7,9 @@ TARGET_DIR="$PROJECT_DIR/inspect_evals/src/inspect_evals"
 TEMP_DIR="$(mktemp -d)"
 TASKS=(
     agieval
+    gsm8k
     ifeval
+    math500
     mgsm
     mmlu
     onet

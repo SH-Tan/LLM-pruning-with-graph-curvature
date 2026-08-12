@@ -316,15 +316,14 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, next_layer
         o = layer.self_attn.o_proj(attn_context)
         x_res1 = x_in + o
         x_norm2 = layer.post_attention_layernorm(x_res1)
-        _print_finite_stats("attn_context", attn_context)
-        _print_finite_stats("x_norm2", x_norm2)
         
         # ---- residual value for qkv output ----
         # _store_operation(operations, "qkv_residual", x_res1, operation_dtype)
-        _store_operation(operations, "o_residual", x_in, operation_dtype)
+        # _store_operation(operations, "o_residual", x_in, operation_dtype)
         
         # ---- attention output ----
-        _store_operation(operations, "o_proj", x_norm2, operation_dtype)
+        _store_operation(operations, "o_proj", o, operation_dtype)
+        _store_operation(operations, "x_norm2", x_norm2, operation_dtype)
 
         # ===== MLP =====
         gate = layer.mlp.gate_proj(x_norm2)

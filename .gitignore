@@ -286,3 +286,4 @@ lm_eval_tasks/
 *.eval
 inspect_evals/runtime_checkpoints/
 inspect_evals/logs/
+inspect_evals/plots/
